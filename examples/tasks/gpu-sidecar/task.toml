@@ -1,0 +1,36 @@
+schema_version = "1.3"
+
+[task]
+name = "harbor/gpu-sidecar"
+description = "Verifies that a GPU-requesting Compose service still gets a working GPU after being routed into the DinD plane by a port collision."
+authors = []
+keywords = ["gpu", "sidecar", "port-collision", "dind", "gke"]
+
+[metadata]
+difficulty = "easy"
+category = "infrastructure"
+tags = ["gpu", "sidecar", "port-collision", "dind", "gke"]
+
+[environment]
+network_mode = "no-network"
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+gpus = 1
+gpu_types = ["L4"]
+mcp_servers = []
+
+[agent]
+timeout_sec = 180.0
+network_mode = "no-network"
+
+[verifier]
+timeout_sec = 60.0
+network_mode = "no-network"
+
+[verifier.env]
+
+[environment.env]
+
+[solution.env]

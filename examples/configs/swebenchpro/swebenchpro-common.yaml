@@ -1,0 +1,24 @@
+# Shared settings for scale-ai/swe-bench-pro on GKE. Layer with one group file:
+#
+#   uv run harbor run -c swebenchpro-common.yaml -c swebenchpro-teleport.yaml \
+#     --plugin harbor_gke_ext:CloudBuildPlugin \
+#     --ek project_id="${PROJECT_ID}" --ek location="${LOCATION}" \
+#     --ek cluster_name="${CLUSTER_NAME}"
+#
+# Cluster identity stays on the command line (--ek merges into environment.kwargs).
+# Plugins must be passed with --plugin; job config files cannot declare them.
+# Datasets are not declared here: `datasets` lists are appended across -c layers,
+# so each group file carries its own complete dataset entry.
+n_concurrent_trials: 500
+retry:
+  max_retries: 2
+agents:
+  - name: oracle
+environment:
+  import_path: harbor_gke_ext:GKEEnvironment
+  # Capped: requests == limits == declared budget (Guaranteed QoS).
+  cpu_enforcement_policy: guarantee
+  memory_enforcement_policy: guarantee
+  kwargs:
+    # Static CPU manager: each 1-CPU trial gets an exclusive core, so nproc == 1.
+    compute_class: harbor-static-cpu

@@ -1,0 +1,845 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from harbor.environments.definition import COMPOSE_FILE_NAME, DOCKERFILE_NAME
+from harbor_gke_ext.image_plan import ImageSpec, TaskImagePlan
+from harbor_gke_ext.prebuild import (
+    CloudBuildPlugin,
+    _DiscoveredTask,
+    _extract_task_docker_image,
+    _resolve_task_dir,
+    _resolve_task_environment_dir,
+    _resolve_task_name,
+    main,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers and Parsing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_resolve_task_environment_dir_with_path_attribute(tmp_path: Path):
+    task_dir1 = tmp_path / "task1"
+    task_dir1.mkdir()
+    env_dir1 = task_dir1 / "environment"
+    env_dir1.mkdir()
+
+    class TaskWithPath:
+        def __init__(self, path: Path):
+            self.path = path
+
+    assert _resolve_task_environment_dir(TaskWithPath(task_dir1)) == env_dir1
+
+    task_dir2 = tmp_path / "task2"
+    task_dir2.mkdir()
+    (task_dir2 / "Dockerfile").write_text("FROM alpine")
+    assert _resolve_task_environment_dir(TaskWithPath(task_dir2)) == task_dir2
+
+    task_dir3 = tmp_path / "task3"
+    task_dir3.mkdir()
+    (task_dir3 / "docker-compose.yaml").write_text("services: {}")
+    assert _resolve_task_environment_dir(TaskWithPath(task_dir3)) == task_dir3
+
+    task_dir4 = tmp_path / "task4"
+    task_dir4.mkdir()
+    assert _resolve_task_environment_dir(TaskWithPath(task_dir4)) is None
+
+    assert _resolve_task_environment_dir(str(task_dir1)) == env_dir1
+    assert _resolve_task_environment_dir(task_dir2) == task_dir2
+
+
+@pytest.mark.unit
+def test_extract_task_docker_image():
+    class ObjWithEnv:
+        class environment:
+            docker_image = " gcr.io/my-proj/img1 "
+
+    assert _extract_task_docker_image(ObjWithEnv()) == "gcr.io/my-proj/img1"
+
+    class ObjWithCfg:
+        class config:
+            class environment:
+                docker_image = "gcr.io/my-proj/img2"
+
+    assert _extract_task_docker_image(ObjWithCfg()) == "gcr.io/my-proj/img2"
+    assert _extract_task_docker_image(object()) is None
+
+
+@pytest.mark.unit
+def test_resolve_task_dir(tmp_path: Path):
+    assert _resolve_task_dir(None) is None
+
+    class DummyPaths:
+        task_dir = tmp_path / "from_paths"
+
+    DummyPaths.task_dir.mkdir()
+
+    class DummyTask:
+        paths = DummyPaths()
+
+    assert _resolve_task_dir(DummyTask()) == DummyPaths.task_dir
+
+    d1 = tmp_path / "d1"
+    d1.mkdir()
+    (d1 / "task.toml").write_text("")
+    assert _resolve_task_dir(d1) == d1
+
+    d2 = tmp_path / "d2"
+    d2.mkdir()
+    (d2 / "environment").mkdir()
+    assert _resolve_task_dir(d2) == d2
+
+    d3 = tmp_path / "d3"
+    d3.mkdir()
+    (d3 / DOCKERFILE_NAME).write_text("")
+    assert _resolve_task_dir(d3) == d3
+
+    d4 = tmp_path / "d4"
+    d4.mkdir()
+    (d4 / COMPOSE_FILE_NAME).write_text("")
+    assert _resolve_task_dir(d4) == d4
+
+    assert _resolve_task_dir(tmp_path / "non_existent") is None
+    d5 = tmp_path / "d5"
+    d5.mkdir()
+    assert _resolve_task_dir(d5) is None
+    assert _resolve_task_dir(12345) is None
+
+
+@pytest.mark.unit
+def test_resolve_task_name(tmp_path: Path):
+    task_dir = tmp_path / "fallback_name"
+
+    class WithGetName:
+        def get_name(self):
+            return "custom_name"
+
+    assert _resolve_task_name(WithGetName(), None, task_dir) == "custom_name"
+
+    class FaultyGetName:
+        def get_name(self):
+            raise RuntimeError("fail")
+
+        name = "fallback_attr"
+
+    assert _resolve_task_name(FaultyGetName(), None, task_dir) == "fallback_attr"
+
+    class WithName:
+        name = "task_attr_name"
+
+    assert _resolve_task_name(None, WithName(), task_dir) == "task_attr_name"
+    assert _resolve_task_name(None, None, task_dir) == "fallback_name"
+
+
+# ---------------------------------------------------------------------------
+# CloudBuildPlugin Initialization and Options Resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_plugin_init():
+    plugin = CloudBuildPlugin(
+        concurrency="30",
+        timeout_sec="3600",
+        project_id="test-proj",
+        location="us-central1",
+        registry_name="custom-reg",
+        registry_location="us-central1",
+        force_build="true",
+        cloud_build_machine_type="E2_HIGHCPU_8",
+        cloud_build_disk_size_gb="200",
+        fail_on_incomplete="true",
+        build_attempts="5",
+    )
+    assert plugin.concurrency == 30
+    assert plugin.timeout_sec == 3600
+    assert plugin.project_id == "test-proj"
+    assert plugin.location == "us-central1"
+    assert plugin.registry_name == "custom-reg"
+    assert plugin.registry_location == "us-central1"
+    assert plugin.force_build is True
+    assert plugin.cloud_build_machine_type == "E2_HIGHCPU_8"
+    assert plugin.cloud_build_disk_size_gb == 200
+    assert plugin.fail_on_incomplete is True
+    assert plugin.build_attempts == 5
+
+    plugin_alias = CloudBuildPlugin(
+        private_pool="projects/p/locations/l/workerPools/wp"
+    )
+    assert (
+        plugin_alias.cloud_build_worker_pool == "projects/p/locations/l/workerPools/wp"
+    )
+
+    with pytest.raises(ValueError, match="Cannot specify cloud_build_machine_type"):
+        CloudBuildPlugin(
+            cloud_build_worker_pool="projects/p/locations/l/workerPools/wp",
+            cloud_build_machine_type="E2_HIGHCPU_8",
+        )
+
+
+@pytest.mark.unit
+def test_plugin_init_warns_on_unknown_kwargs():
+    with patch("harbor_gke_ext.prebuild.logger") as mock_logger:
+        CloudBuildPlugin(concurency="5", timeout="60", _internal="x")
+    mock_logger.warning.assert_called_once()
+    args = mock_logger.warning.call_args.args
+    assert "--pk" in args[0]
+    assert args[1] == "concurency, timeout"
+
+    with patch("harbor_gke_ext.prebuild.logger") as mock_logger:
+        CloudBuildPlugin(concurrency="5", timeout_sec="60")
+    mock_logger.warning.assert_not_called()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_prebuild_gcloud_and_kubeconfig(monkeypatch):
+    monkeypatch.setattr("harbor_gke_ext.prebuild.get_active_gke_context", lambda: None)
+    monkeypatch.setattr("harbor_gke_ext.prebuild.ensure_gcloud_ready", lambda: None)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("CLOUDSDK_CORE_PROJECT", raising=False)
+    monkeypatch.delenv("GCP_PROJECT", raising=False)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_resolve_project_id(monkeypatch):
+    job = MagicMock()
+    plugin = CloudBuildPlugin(project_id="my-proj-direct")
+    assert await plugin._resolve_project_id(job) == "my-proj-direct"
+
+    plugin = CloudBuildPlugin(project_id=None)
+    job.config.environment.kwargs = {"project_id": "my-proj-kwargs"}
+    assert await plugin._resolve_project_id(job) == "my-proj-kwargs"
+
+    job.config.environment.kwargs = {}
+    monkeypatch.setattr(
+        "harbor_gke_ext.prebuild.get_active_gke_context",
+        lambda: ("ctx-project", "us-east4-a", "ctx-cluster"),
+    )
+    assert await plugin._resolve_project_id(job) == "ctx-project"
+    assert plugin._resolve_region(job) == "us-east4"
+
+    monkeypatch.setattr("harbor_gke_ext.prebuild.get_active_gke_context", lambda: None)
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"gcloud-active-project\n", b"")
+        mock_exec.return_value = mock_proc
+        assert await plugin._resolve_project_id(job) == "gcloud-active-project"
+
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"\n", b"")
+        mock_exec.return_value = mock_proc
+        with pytest.raises(ValueError, match="CloudBuildPlugin requires project_id"):
+            await plugin._resolve_project_id(job)
+
+
+@pytest.mark.unit
+def test_plugin_option_resolution():
+    job = MagicMock()
+    job.config.environment.force_build = True
+    job.config.environment.kwargs = {
+        "location": "us-central1-a",
+        "registry_location": "us-west1",
+        "registry_name": "custom-tasks",
+        "cloud_build_worker_pool": "pool-from-kwargs",
+        "cloud_build_machine_type": "type-from-kwargs",
+        "cloud_build_disk_size_gb": "150",
+        "prebuild_fail_on_incomplete": "true",
+    }
+    job.config.environment.extra_docker_compose = ["compose1.yaml", "compose2.yaml"]
+
+    plugin = CloudBuildPlugin()
+    assert plugin._resolve_force_build(job) is True
+    assert plugin._resolve_region(job) == "us-central1"
+    assert plugin._resolve_registry_name(job) == "custom-tasks"
+    assert plugin._resolve_registry_location(job) == "us-west1"
+    assert plugin._resolve_worker_pool(job) == "pool-from-kwargs"
+    assert plugin._resolve_machine_type(job) == "type-from-kwargs"
+    assert plugin._resolve_disk_size_gb(job) == 150
+    assert plugin._resolve_extra_compose_paths(job) == [
+        Path("compose1.yaml"),
+        Path("compose2.yaml"),
+    ]
+    assert plugin._resolve_fail_on_incomplete(job) is True
+
+    # Missing location/region without active GKE context must raise ValueError
+    job.config.environment.kwargs = {}
+    with pytest.raises(
+        ValueError, match="CloudBuildPlugin requires location or region"
+    ):
+        plugin._resolve_region(job)
+
+    # Plugin overrides and defaults
+    plugin_custom = CloudBuildPlugin(
+        force_build=True,
+        registry_name="my-reg",
+        registry_location="europe-west1",
+        cloud_build_worker_pool="explicit-pool",
+        cloud_build_disk_size_gb=300,
+        fail_on_incomplete=False,
+    )
+    job.config.environment.force_build = False
+    job.config.environment.kwargs = {"private_pool": "private-pool-1"}
+    job.config.environment.extra_docker_compose = None
+    assert plugin_custom._resolve_force_build(job) is True
+    assert plugin_custom._resolve_registry_name(job) == "my-reg"
+    assert plugin_custom._resolve_registry_location(job) == "europe-west1"
+    assert plugin_custom._resolve_worker_pool(job) == "explicit-pool"
+    assert plugin_custom._resolve_disk_size_gb(job) == 300
+    assert plugin_custom._resolve_fail_on_incomplete(job) is False
+    assert plugin._resolve_worker_pool(job) == "private-pool-1"
+    assert plugin._resolve_extra_compose_paths(job) == []
+
+
+# ---------------------------------------------------------------------------
+# Task Discovery
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_discover_tasks_tier2_trial_configs(tmp_path: Path):
+    job = MagicMock()
+    job._task_download_results = {}
+
+    task_dir = tmp_path / "t2"
+    task_dir.mkdir()
+    (task_dir / "task.toml").write_text("")
+
+    mock_trial = MagicMock()
+    mock_trial.task.path = task_dir
+    mock_trial.task.name = "task-t2"
+    mock_trial.task.paths = None
+
+    job._trial_configs = [mock_trial]
+    job._task_configs = []
+    job.config.datasets = []
+
+    plugin = CloudBuildPlugin()
+    discovered = plugin._discover_tasks(job)
+    assert len(discovered) == 1
+    assert discovered[0].name == "task-t2"
+    assert discovered[0].task_dir == task_dir
+
+
+@pytest.mark.unit
+def test_discover_tasks_tier3_task_configs(tmp_path: Path):
+    job = MagicMock()
+    job._task_download_results = {}
+    job._trial_configs = []
+
+    task_dir = tmp_path / "t3"
+    task_dir.mkdir()
+    (task_dir / "task.toml").write_text("")
+
+    mock_task_cfg = MagicMock()
+    mock_task_cfg.path = task_dir
+    mock_task_cfg.name = "task-t3"
+    mock_task_cfg.paths = None
+
+    job._task_configs = [mock_task_cfg]
+    job.config.datasets = []
+
+    plugin = CloudBuildPlugin()
+    discovered = plugin._discover_tasks(job)
+    assert len(discovered) == 1
+    assert discovered[0].name == "task-t3"
+
+
+@pytest.mark.unit
+def test_discover_tasks_tier4_datasets(tmp_path: Path):
+    job = MagicMock()
+    job._task_download_results = {}
+    job._trial_configs = []
+    job._task_configs = []
+
+    # Dataset 1: dataset is a directory containing task subdirectories
+    ds_dir = tmp_path / "ds1"
+    ds_dir.mkdir()
+    sub_task1 = ds_dir / "sub1"
+    sub_task1.mkdir()
+    (sub_task1 / "task.toml").write_text("")
+    sub_task2 = ds_dir / "sub2"
+    sub_task2.mkdir()
+    (sub_task2 / "task.toml").write_text("")
+
+    # Dataset 2: dataset is a task directory itself
+    ds_task = tmp_path / "ds_task"
+    ds_task.mkdir()
+    (ds_task / "task.toml").write_text("")
+
+    # Dataset 3: non-existent directory
+    ds_invalid = tmp_path / "non_existent"
+
+    mock_ds1 = MagicMock()
+    mock_ds1.path = ds_dir
+    mock_ds2 = MagicMock()
+    mock_ds2.path = ds_task
+    mock_ds3 = MagicMock()
+    mock_ds3.path = ds_invalid
+    mock_ds4 = MagicMock()
+    mock_ds4.path = 12345  # Not str or Path
+
+    job.config.datasets = [mock_ds1, mock_ds2, mock_ds3, mock_ds4]
+
+    plugin = CloudBuildPlugin()
+    discovered = plugin._discover_tasks(job)
+    discovered_names = {t.name for t in discovered}
+    assert "sub1" in discovered_names
+    assert "sub2" in discovered_names
+    assert "ds_task" in discovered_names
+
+
+@pytest.mark.unit
+def test_discover_tasks_environment_dir_fallback(tmp_path: Path):
+    job = MagicMock()
+    # Task 1: has environment_dir named 'environment', no task_dir
+    task_dir1 = tmp_path / "custom_task1"
+    task_dir1.mkdir()
+    env_dir1 = task_dir1 / "environment"
+    env_dir1.mkdir()
+
+    mock_task1 = MagicMock()
+    mock_task1.paths.task_dir = None
+    mock_task1.paths.environment_dir = env_dir1
+    mock_task1.path = None
+    mock_task1.name = "env-fallback-task1"
+
+    # Task 2: has environment_dir not named 'environment'
+    env_dir2 = tmp_path / "other_env"
+    env_dir2.mkdir()
+    mock_task2 = MagicMock()
+    mock_task2.paths.task_dir = None
+    mock_task2.paths.environment_dir = env_dir2
+    mock_task2.path = None
+    mock_task2.name = "env-fallback-task2"
+
+    # Task 3: Duplicate of task 1
+    mock_task3 = MagicMock()
+    mock_task3.paths.task_dir = task_dir1
+    mock_task3.paths.environment_dir = env_dir1
+    mock_task3.path = None
+    mock_task3.name = "duplicate-task"
+
+    # Task 4: Completely invalid (task_dir and environment_dir resolve to None)
+    mock_task4 = MagicMock()
+    mock_task4.paths = None
+    mock_task4.path = None
+
+    job._task_download_results = {
+        "task1": mock_task1,
+        "task2": mock_task2,
+        "task3": mock_task3,
+        "task4": mock_task4,
+    }
+
+    plugin = CloudBuildPlugin()
+    discovered = plugin._discover_tasks(job)
+    assert len(discovered) == 2
+    discovered_dirs = {t.task_dir for t in discovered}
+    assert task_dir1 in discovered_dirs
+    assert env_dir2 in discovered_dirs
+
+
+# ---------------------------------------------------------------------------
+# on_job_start Execution and Error Handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_job_start_conflict_raises(tmp_path: Path):
+    job = MagicMock()
+    job.config.environment.kwargs = {
+        "project_id": "test-proj",
+        "cloud_build_worker_pool": "pool-xyz",
+        "cloud_build_machine_type": "type-abc",
+    }
+    plugin = CloudBuildPlugin()
+    with pytest.raises(ValueError, match="Cannot specify machine_type"):
+        await plugin.on_job_start(job)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_job_start_no_tasks(caplog):
+    job = MagicMock()
+    job.config.environment.kwargs = {"project_id": "test-proj"}
+    plugin = CloudBuildPlugin()
+    with patch.object(plugin, "_discover_tasks", return_value=[]):
+        await plugin.on_job_start(job)
+        assert "No local task directories found" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_job_start_no_specs_needed(tmp_path: Path, caplog):
+    job = MagicMock()
+    job.config.environment.kwargs = {
+        "project_id": "test-proj",
+        "location": "us-central1",
+    }
+    plugin = CloudBuildPlugin()
+
+    dummy_task = _DiscoveredTask(
+        name="task-1",
+        task_dir=tmp_path / "t1",
+        environment_dir=None,
+        docker_image=None,
+    )
+    with (
+        patch.object(plugin, "_discover_tasks", return_value=[dummy_task]),
+        patch("harbor_gke_ext.prebuild.plan_task_images") as mock_plan,
+        patch("harbor_gke_ext.prebuild.dedupe_specs", return_value=[]),
+    ):
+        mock_plan.return_value = TaskImagePlan(
+            task_name="task-1",
+            task_dir=tmp_path / "t1",
+            specs=[],
+            skipped=["prebuilt docker_image present"],
+        )
+        await plugin.on_job_start(job)
+        assert "No build contexts require a pre-build" in caplog.text
+        assert "skipped prebuilt docker_image present" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_job_start_successful_builds(tmp_path: Path):
+    job = MagicMock()
+    job.config.environment.kwargs = {
+        "project_id": "test-proj",
+        "location": "us-central1",
+    }
+    plugin = CloudBuildPlugin(concurrency=2)
+
+    spec1 = ImageSpec(
+        kind="agent_env",
+        task_name="task-1",
+        build_context=tmp_path / "t1",
+        digest="d1",
+        image_url="gcr.io/proj/img1:d1",
+    )
+    spec2 = ImageSpec(
+        kind="verifier",
+        task_name="task-2",
+        build_context=tmp_path / "t2",
+        digest="d2",
+        image_url="gcr.io/proj/img2:d2",
+    )
+
+    dummy_task = _DiscoveredTask(
+        name="task-1",
+        task_dir=tmp_path / "t1",
+        environment_dir=None,
+        docker_image=None,
+    )
+
+    with (
+        patch.object(plugin, "_discover_tasks", return_value=[dummy_task]),
+        patch("harbor_gke_ext.prebuild.plan_task_images") as mock_plan,
+        patch("harbor_gke_ext.prebuild.dedupe_specs", return_value=[spec1, spec2]),
+        patch("harbor_gke_ext.prebuild.record_planned_images") as mock_record,
+        patch.object(
+            plugin, "_build_image_with_retry", AsyncMock(return_value=True)
+        ) as mock_build,
+    ):
+        mock_plan.return_value = TaskImagePlan(
+            task_name="task-1", task_dir=tmp_path / "t1", specs=[spec1, spec2]
+        )
+        await plugin.on_job_start(job)
+
+        mock_record.assert_called_once()
+        assert mock_build.call_count == 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_job_start_build_failures(tmp_path: Path):
+    job = MagicMock()
+    job.config.environment.kwargs = {
+        "project_id": "test-proj",
+        "location": "us-central1",
+        "prebuild_fail_on_incomplete": "false",
+    }
+    plugin = CloudBuildPlugin()
+
+    spec_success = ImageSpec(
+        kind="agent_env",
+        task_name="task-1",
+        build_context=tmp_path / "t1",
+        digest="d1",
+        image_url="gcr.io/proj/img1:d1",
+    )
+    spec_exc = ImageSpec(
+        kind="verifier",
+        task_name="task-2",
+        build_context=tmp_path / "t2",
+        digest="d2",
+        image_url="gcr.io/proj/img2:d2",
+    )
+    spec_fail_bool = ImageSpec(
+        kind="compose_sidecar",
+        task_name="task-3",
+        build_context=tmp_path / "t3",
+        digest="d3",
+        image_url="gcr.io/proj/img3:d3",
+    )
+
+    async def fake_build(spec, **kwargs):
+        if spec == spec_success:
+            return True
+        elif spec == spec_exc:
+            raise RuntimeError("Build submission error")
+        else:
+            return False
+
+    dummy_task = _DiscoveredTask("t", tmp_path, None, None)
+    with (
+        patch.object(plugin, "_discover_tasks", return_value=[dummy_task]),
+        patch("harbor_gke_ext.prebuild.plan_task_images"),
+        patch(
+            "harbor_gke_ext.prebuild.dedupe_specs",
+            return_value=[spec_success, spec_exc, spec_fail_bool],
+        ),
+        patch("harbor_gke_ext.prebuild.record_planned_images"),
+        patch.object(plugin, "_build_image_with_retry", side_effect=fake_build),
+    ):
+        await plugin.on_job_start(job)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_on_job_start_fail_on_incomplete_raises(tmp_path: Path):
+    job = MagicMock()
+    job.config.environment.kwargs = {
+        "project_id": "test-proj",
+        "location": "us-central1",
+        "prebuild_fail_on_incomplete": "true",
+    }
+    plugin = CloudBuildPlugin()
+
+    spec = ImageSpec(
+        kind="agent_env",
+        task_name="task-1",
+        build_context=tmp_path / "t1",
+        digest="d1",
+        image_url="gcr.io/proj/img1:d1",
+    )
+
+    dummy_task = _DiscoveredTask("t", tmp_path, None, None)
+    with (
+        patch.object(plugin, "_discover_tasks", return_value=[dummy_task]),
+        patch("harbor_gke_ext.prebuild.plan_task_images"),
+        patch("harbor_gke_ext.prebuild.dedupe_specs", return_value=[spec]),
+        patch("harbor_gke_ext.prebuild.record_planned_images"),
+        patch.object(plugin, "_build_image_with_retry", AsyncMock(return_value=False)),
+    ):
+        with pytest.raises(RuntimeError, match=r"image\(s\) could not be pre-built"):
+            await plugin.on_job_start(job)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_build_image_with_retry(tmp_path: Path):
+    plugin = CloudBuildPlugin(build_attempts=2)
+    spec = ImageSpec(
+        kind="agent_env",
+        task_name="task-1",
+        build_context=tmp_path / "t1",
+        digest="d1",
+        image_url="gcr.io/proj/img1:d1",
+    )
+    semaphore = asyncio.Semaphore(1)
+
+    # 1. Successful build on first try
+    with patch(
+        "harbor_gke_ext.prebuild.build_task_image_if_missing",
+        AsyncMock(return_value=True),
+    ) as mock_b:
+        res = await plugin._build_image_with_retry(
+            spec,
+            project_id="p",
+            region="r",
+            force_build=False,
+            semaphore=semaphore,
+            machine_type=None,
+            disk_size_gb=None,
+            worker_pool=None,
+        )
+        assert res is True
+        assert mock_b.call_count == 1
+
+    # 2. Retry on failure
+    mock_b2 = AsyncMock(side_effect=[RuntimeError("transient"), True])
+    with patch("harbor_gke_ext.prebuild.build_task_image_if_missing", mock_b2):
+        with patch("asyncio.sleep", AsyncMock()):  # Speed up tenacity wait
+            res = await plugin._build_image_with_retry(
+                spec,
+                project_id="p",
+                region="r",
+                force_build=False,
+                semaphore=semaphore,
+                machine_type=None,
+                disk_size_gb=None,
+                worker_pool=None,
+            )
+            assert res is True
+            assert mock_b2.call_count == 2
+
+
+@pytest.mark.unit
+def test_main_execution(monkeypatch, tmp_path: Path):
+    task_dir = tmp_path / "t1"
+    task_dir.mkdir()
+    (task_dir / "task.toml").write_text("")
+
+    # Without --location and without an active GKE context, main() must exit(1)
+    with patch("sys.argv", ["prebuild", str(tmp_path), "--project-id", "test-proj"]):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 1
+
+    # With --location explicitly supplied
+    test_args = [
+        "prebuild",
+        str(tmp_path),
+        "--project-id",
+        "test-proj",
+        "--location",
+        "us-central1",
+    ]
+    with (
+        patch("sys.argv", test_args),
+        patch("harbor_gke_ext.prebuild.dedupe_specs", return_value=[]),
+    ):
+        main()
+
+    # With neither --project-id nor --location, inferred from active GKE context
+    monkeypatch.setattr(
+        "harbor_gke_ext.prebuild.get_active_gke_context",
+        lambda: ("ctx-proj", "us-east4-a", "ctx-cluster"),
+    )
+    with (
+        patch("sys.argv", ["prebuild", str(tmp_path)]),
+        patch("harbor_gke_ext.prebuild.dedupe_specs", return_value=[]),
+    ):
+        main()
+
+
+@pytest.mark.unit
+def test_cloud_build_plugin_alias_and_external_image_planning(tmp_path: Path):
+    from harbor_gke_ext import CloudBuildPlugin as ExportedCloudBuildPlugin
+    from harbor_gke_ext.image_plan import plan_task_images
+
+    assert ExportedCloudBuildPlugin is CloudBuildPlugin
+
+    # 1. An external base image in the Dockerfile plans exactly one build.
+    #    Cloud Build pulls the base itself; nothing is copied into Artifact
+    #    Registry ahead of time.
+    task_dir = tmp_path / "aws-dockerfile-task"
+    env_dir = task_dir / "environment"
+    env_dir.mkdir(parents=True)
+    (task_dir / "task.toml").write_text("")
+    (env_dir / "Dockerfile").write_text(
+        "FROM public.ecr.aws/docker/library/python:3.12-slim\nRUN echo ok\n"
+    )
+
+    plan = plan_task_images(
+        task_dir,
+        project_id="my-proj",
+        registry_name="harbor-tasks",
+        registry_location="us-central1",
+    )
+    assert [s.kind for s in plan.specs] == ["agent_env"]
+
+    # 2. A task that supplies its own image needs no build at all, so the
+    #    pre-build pass never touches Cloud Build or Artifact Registry for it.
+    task_dir_direct = tmp_path / "aws-direct-task"
+    task_dir_direct.mkdir(parents=True)
+    aws_direct = "123456789012.dkr.ecr.us-west-2.amazonaws.com/bench/app:v1"
+    (task_dir_direct / "task.toml").write_text(
+        f'[environment]\ndocker_image = "{aws_direct}"\n'
+    )
+    plan_direct = plan_task_images(
+        task_dir_direct,
+        project_id="my-proj",
+        registry_name="harbor-tasks",
+        registry_location="us-central1",
+    )
+    assert plan_direct.specs == []
+    assert any("externally supplied image" in r for r in plan_direct.skipped)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_build_spec_image_requires_a_build_context(tmp_path: Path):
+    """Every planned spec is a build; a context-less spec is a programming error."""
+    from harbor_gke_ext.prebuild import _build_spec_image
+
+    spec = ImageSpec(
+        kind="agent_env",
+        task_name="task-broken",
+        build_context=None,
+        digest="d",
+        image_url="us-central1-docker.pkg.dev/test-proj/harbor-tasks/task:d",
+    )
+    with pytest.raises(ValueError, match="missing build_context"):
+        await _build_spec_image(
+            spec,
+            project_id="test-proj",
+            region="us-central1",
+            force_build=False,
+            timeout_sec=600,
+            semaphore=asyncio.Semaphore(1),
+            machine_type=None,
+            disk_size_gb=None,
+            worker_pool=None,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_build_spec_image_propagates_registry_failures(tmp_path: Path):
+    """``reraise=True`` is what makes a failed repository creation fail the build.
+
+    Repository creation happens lazily inside ``build_task_image_if_missing``,
+    only once a build is actually required. If it fails there is no usable
+    push target, so the error must surface rather than degrade silently.
+    """
+    from harbor_gke_ext.prebuild import _build_spec_image
+
+    spec = ImageSpec(
+        kind="agent_env",
+        task_name="task-local",
+        build_context=tmp_path / "ctx",
+        digest="d-ctx",
+        image_url="us-central1-docker.pkg.dev/test-proj/harbor-tasks/task-local:d-ctx",
+    )
+    with patch(
+        "harbor_gke_ext.prebuild.build_task_image_if_missing",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as mock_build:
+        assert (
+            await _build_spec_image(
+                spec,
+                project_id="test-proj",
+                region="us-central1",
+                force_build=False,
+                timeout_sec=600,
+                semaphore=asyncio.Semaphore(1),
+                machine_type=None,
+                disk_size_gb=None,
+                worker_pool=None,
+            )
+            is True
+        )
+    assert mock_build.await_args.kwargs["reraise"] is True

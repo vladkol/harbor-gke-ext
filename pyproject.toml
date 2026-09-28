@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "harbor-gke-ext"
+version = "0.1.0"
+description = "Google Kubernetes Engine (GKE) execution environment and Cloud Build pre-caching plugin for Harbor"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "harbor",
+    "kubernetes>=32.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.8.0",
+    "ty",
+]
+
+[project.scripts]
+harbor-gke-ext-prebuild = "harbor_gke_ext.prebuild:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harbor_gke_ext"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["harbor", "harbor_gke_ext"]
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.src]
+include = ["src/harbor_gke_ext"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests/unit"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = ["-v", "--tb=short", "--strict-markers", "--strict-config"]
+markers = [
+    "asyncio: marks tests as async tests",
+    "runtime: marks tests as runtime tests (may need docker)",
+    "unit: marks tests as unit tests (fast, no external dependencies)",
+    "integration: marks tests as integration tests (requires external services, could be mocked)",
+]
+asyncio_mode = "auto"
+
+
