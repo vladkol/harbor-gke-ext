@@ -56,7 +56,7 @@ In Shape B and Shape C, the inner `dockerd` (`dind-engine`) must acquire the ima
 - Attempting `docker pull` first inside `dind-cache-<service>` init containers (using short-lived GCP metadata access tokens for Artifact Registry / GCR images when reachable) and falling back to `tar -cf - / | docker import` when registry egress is unavailable.
 
 **Decision**:
-Each DinD-delegated service gets a `dind-cache-<service>` init container running that service's image. `dind-cache-<service>` first attempts `docker pull -q "$IMG"` against `dind-engine` (`DOCKER_CONFIG=/harbor/dind-images/.docker`, populated by `dind-engine`'s background `harbor_refresh_gcr_auth` loop querying `169.254.169.254` every 900s). If `docker pull` fails (for example, when the Pod's `NetworkPolicy` blocks registry egress or metadata server access), `dind-cache-<service>` falls back to streaming its own mounted root filesystem via `tar -cf - / ... | docker-cli import --change ... "$IMG"`, reconstructing `WORKDIR`, `USER`, `ENV`, and manifest-resolved `ENTRYPOINT`, `CMD`, `EXPOSE`, `LABEL`, `STOPSIGNAL`, and `HEALTHCHECK`. Inside `dind-engine`, `/var/lib/docker` is backed by the `harbor-dind-storage` volume (an ext4 node-disk `emptyDir` by default, or a generic ephemeral PVC when `scratch_volume_size` is set), where `dockerd` automatically selects the `overlay2` storage driver.
+Each DinD-delegated service gets a `dind-cache-<service>` init container running that service's image. `dind-cache-<service>` first attempts `docker pull -q "$IMG"` against `dind-engine` (`DOCKER_CONFIG=/harbor/dind-images/.docker`, populated by `dind-engine`'s background `harbor_refresh_gcr_auth` loop querying `169.254.169.254` every 900s during Pod initialization). At the start of `compose-up-gate`—after all `dind-cache-<service>` init containers have completed and before `docker compose up --pull never` starts any service or `main` container—`compose-up-gate` touches `/harbor/dind-images/.auth-scrubbed` (stopping `dind-engine`'s background refresh loop) and deletes `/harbor/dind-images/.docker` so no cached OAuth token remains on the shared volume while any Compose service or agent container runs, while `dind-engine` installs `unreachable` routes for `169.254.169.254/32` and `169.254.169.252/32` when `allow_metadata_server=False`. If `docker pull` fails (for example, local-only tags), `dind-cache-<service>` falls back to streaming its own mounted root filesystem via `tar -cf - / ... | docker-cli import --change ... "$IMG"`, reconstructing `WORKDIR`, `USER`, `ENV`, and manifest-resolved `ENTRYPOINT`, `CMD`, `EXPOSE`, `LABEL`, `STOPSIGNAL`, and `HEALTHCHECK`. Inside `dind-engine`, `/var/lib/docker` is backed by the `harbor-dind-storage` volume (an ext4 node-disk `emptyDir` by default, or a generic ephemeral PVC when `scratch_volume_size` is set), where `dockerd` automatically selects the `overlay2` storage driver.
 
 **Evidence**:
 - **`ctr images export` fails on GKE**: GKE configures `containerd` with `discard_unpacked_layers = true` in `/etc/containerd/config.toml`. Once `containerd` unpacks an image, compressed blobs are deleted from the content store and `ctr images export` fails with `content digest ... not found`.
@@ -64,7 +64,7 @@ Each DinD-delegated service gets a `dind-cache-<service>` init container running
 - **`docker pull` preserves layer tarballs, hardlinks, and OCI config**: Pulling the compressed manifest layers directly into `dind-engine` preserves hardlinks across layers (~55 GiB unpacked on disk) and keeps native OCI image metadata (`ENTRYPOINT`, `CMD`, `ENV`, `USER`, `WORKDIR`) without synthetic `--change` reconstruction. When network policy rules block registry or metadata access, the `tar | docker import` fallback ensures offline and `no-network` tasks still materialize their pre-pulled kubelet rootfs into `dind-engine`.
 
 **Consequences**:
-When registry egress is permitted, DinD images materialize at their true hardlink-deduplicated size with verbatim OCI metadata. When network egress is locked down (`no-network` or strict `allowlist`), `dind-cache-<service>` seamlessly falls back to importing the local kubelet-mounted rootfs.
+When registry egress is permitted, DinD images materialize at their true hardlink-deduplicated size with verbatim OCI metadata, and temporary registry tokens are scrubbed before `main` starts. When network egress is locked down (`no-network` or strict `allowlist`), `dind-cache-<service>` seamlessly falls back to importing the local kubelet-mounted rootfs.
 
 ## GPU driver library discovery via `ldconfig` prelude
 
@@ -170,22 +170,24 @@ There are zero `hostPath` volumes in `harbor-gke-ext`. By default, Pod volumes u
 **Consequences**:
 Avoiding `hostPath` eliminates host-filesystem escape vectors and satisfies Autopilot and gVisor admission policies. `scratch_volume_size` moves DinD image layers and Compose named-volume writes onto per-Pod Persistent Disks, but it doesn't reduce the node `ephemeral-storage` reservation, so the node still needs enough allocatable storage for the `dind-engine` request.
 
-## Network policy timing and `public` mode
+## Network policy timing, cluster enforcement verification, and `public` mode
 
 **Context**:
-Trial network access is controlled by three modes (`no-network`, `allowlist`, and `public`) and an orthogonal metadata-server flag (`allow_metadata_server`, default `False`).
+Trial network access is controlled by three modes (`no-network`, `allowlist`, and `public`), an orthogonal metadata-server flag (`allow_metadata_server`, default `False`), and an ingress isolation flag (`allow_pod_ingress`, default `False`). However, Kubernetes `NetworkPolicy` is a passive API object that is silently ignored on GKE Standard clusters unless GKE Dataplane V2 (`--enable-dataplane-v2`) or Legacy Datapath + Calico (`--enable-network-policy`) is enabled.
 
 **Options considered**:
-- Applying `NetworkPolicy` after Pod creation.
-- Applying `NetworkPolicy` before Job/Pod creation, and only omitting the policy when both `network_mode="public"` and `allow_metadata_server=True`.
+- Applying `NetworkPolicy` after Pod creation without verifying cluster CNI enforcement.
+- Verifying active cluster `NetworkPolicy` enforcement (`detect_network_enforcement()`) before Job creation, failing closed if the cluster has no active policy controller (or if Calico is missing `projectcalico.org/ds-ready=true` on any schedulable node), applying `NetworkPolicy` before Job/Pod creation, and only omitting the policy when both `network_mode="public"` and `allow_metadata_server=True`.
 
 **Decision**:
-- `_apply_network_policy()` runs **before** the Job/Pod is created so that init containers (`dind-engine`, `dind-cache-<service>`, `compose-up-gate`) and the `main` container are governed by the policy from the moment the Pod starts. Because `pod_uid` does not exist prior to Pod creation, start-time policies have no `ownerReferences` and are explicitly deleted during `stop()` via `delete_network_policies()` (whereas policies applied during mid-trial updates attach `ownerReferences` to the running Pod).
-- In `public` mode with `allow_metadata_server=False` (the default), `_apply_network_policy()` creates a Pod-scoped `NetworkPolicy` allowing egress to `0.0.0.0/0` except `169.254.169.254/32` and `::/0` except `fd00:170::2/128` (plus UDP/TCP port 53 for DNS).
+- `GKEEnvironment.capabilities` and `_verify_network_enforcement()` probe the cluster's actual dataplane enforcer (`DATAPLANE_V2`, `CALICO`, or `NONE`) and fail closed in `start()` whenever `network_mode != PUBLIC` or `allow_metadata_server=False` on an unenforced or partially-ready cluster.
+- For Direct Pods and Shape A native Compose Pods, `_apply_network_policy()` runs **before** the Job/Pod is created; for DinD Pods (`Shape B` and `Shape C`), `dind-engine` locks down metadata server routes right before `compose-up-gate` runs `docker compose up` and `_apply_network_policy()` applies the Pod `NetworkPolicy` right after Pod initialization completes. Start-time policies are explicitly deleted during `stop()` via `delete_network_policies()` (whereas policies applied during mid-trial updates attach `ownerReferences` to the running Pod).
+- Every generated `NetworkPolicy` sets `policyTypes: ["Ingress", "Egress"]` with `ingress: []` by default (`allow_pod_ingress=False`) to block cross-trial Pod-to-Pod traffic.
+- In `public` mode with `allow_metadata_server=False` (the default), `_apply_network_policy()` creates a Pod-scoped `NetworkPolicy` allowing egress to `0.0.0.0/0` except `169.254.169.254/32` and `169.254.169.252/32` (Workload Identity Calico DNAT target), plus UDP/TCP port 53 for GKE cluster/VPC DNS.
 - In `public` mode with `allow_metadata_server=True`, `_apply_network_policy()` is skipped at start time (creating no `NetworkPolicy` resource) and calls `delete_network_policies()` if invoked during a mid-trial policy update.
 
 **Consequences**:
-Every trial is protected against GKE metadata server token theft (`169.254.169.254` / `fd00:170::2`) from its very first init container by default, while setting `allow_metadata_server=True` in `public` mode removes `NetworkPolicy` overhead completely.
+Every trial is protected against GKE metadata server token theft (`169.254.169.254`, `169.254.169.252`) and cross-trial Pod probing on both Dataplane V2 and Calico clusters, while DinD Pods still automatically pull their `main` and sidecar images during initialization, and misconfigured clusters without an active `NetworkPolicy` controller fail closed at startup rather than running trials with silently unenforced policies.
 
 ## Where the task budget lives: the Pod, not the containers
 

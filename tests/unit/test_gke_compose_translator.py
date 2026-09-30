@@ -1,7 +1,7 @@
 """Unit tests for src/harbor/environments/gke/compose_translator.py."""
 
-from contextlib import contextmanager
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -563,6 +563,8 @@ services:
     assert "--host=unix:///var/run/harbor-dind/docker.sock" in dind_cmd
     assert "tcp://" not in dind_cmd
     assert "--dns" not in dind_cmd
+    assert "/harbor/dind-images/.auth-scrubbed" in dind_cmd
+    assert "rm -rf /harbor/dind-images/.docker" in gate_cmd
 
     sh = shutil.which("sh")
     if sh is not None:
@@ -964,6 +966,7 @@ def test_translate_compose_dind_tmpfs_not_double_mounted_in_inner_compose(tmp_pa
     """End-to-end: decode inner compose YAML from compose-up-gate and verify no duplicate /tmp mount."""
     import base64
     import re
+
     import yaml
 
     compose_file = tmp_path / "docker-compose.yaml"
@@ -1688,6 +1691,7 @@ services:
     gate_script = (gate.command or ["", "", ""])[2]
     import base64
     import re
+
     import yaml
 
     m = re.search(
@@ -2051,3 +2055,63 @@ services:
     assert "us-central1-docker.pkg.dev" in dind_script
     assert "ghcr.io" not in dind_script
     assert "public.ecr.aws" not in dind_script
+
+
+@pytest.mark.unit
+def test_dind_pre_main_metadata_lockdown_and_token_scrub(
+    tmp_path: Path,
+) -> None:
+    """Verify DinD scrubs temporary registry token and locks down metadata routes before compose up when allow_metadata_server=False."""
+    compose_path = tmp_path / "docker-compose.yaml"
+    compose_path.write_text(
+        """
+services:
+  main:
+    image: us-central1-docker.pkg.dev/proj/harbor-tasks/main:latest
+    privileged: true
+"""
+    )
+
+    pod_locked = translate_compose(
+        compose_paths=[compose_path],
+        compose_env={},
+        pod_name="dind-locked-pod",
+        namespace="default",
+        labels={},
+        main_image="us-central1-docker.pkg.dev/proj/harbor-tasks/main:latest",
+        is_autopilot=False,
+        image_resolver=ImageResolver(),
+        task_dir=tmp_path,
+        allow_metadata_server=False,
+    )
+    inits_locked = {c.name: c for c in (pod_locked.spec.init_containers or [])}
+    dind_locked = inits_locked["dind-engine"].command[2]
+    gate_locked = inits_locked["compose-up-gate"].command[2]
+
+    assert "ip route replace unreachable 169.254.169.254/32" in dind_locked
+    assert "ip route replace unreachable 169.254.169.252/32" in dind_locked
+    assert "/harbor/dind-images/.metadata-blocked" in dind_locked
+    assert "/harbor/dind-images/.metadata-blocked" in gate_locked
+    assert gate_locked.index(".metadata-blocked") < gate_locked.index(
+        "docker compose -f /harbor/dind-compose.yaml --project-name harbor up"
+    )
+
+    pod_allowed = translate_compose(
+        compose_paths=[compose_path],
+        compose_env={},
+        pod_name="dind-allowed-pod",
+        namespace="default",
+        labels={},
+        main_image="us-central1-docker.pkg.dev/proj/harbor-tasks/main:latest",
+        is_autopilot=False,
+        image_resolver=ImageResolver(),
+        task_dir=tmp_path,
+        allow_metadata_server=True,
+    )
+    inits_allowed = {c.name: c for c in (pod_allowed.spec.init_containers or [])}
+    dind_allowed = inits_allowed["dind-engine"].command[2]
+    gate_allowed = inits_allowed["compose-up-gate"].command[2]
+
+    assert "ip route replace unreachable" not in dind_allowed
+    assert ".metadata-blocked" not in gate_allowed
+    assert "rm -rf /harbor/dind-images/.docker" in gate_allowed

@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from harbor_gke_ext.constants import _sanitize_kubernetes_resource_name
 from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor.utils.logger import logger
+from harbor_gke_ext.constants import _sanitize_kubernetes_resource_name
 
 try:
     from kubernetes import client as k8s_client
@@ -17,8 +17,13 @@ try:
 except ImportError:
     _HAS_KUBERNETES = False
 
-if TYPE_CHECKING:
-    from kubernetes import client as k8s_client
+
+METADATA_SERVER_CIDR = "169.254.169.254/32"
+GKE_METADATA_PROXY_CIDR = "169.254.169.252/32"
+METADATA_IPV4_CIDRS: tuple[str, ...] = (
+    METADATA_SERVER_CIDR,
+    GKE_METADATA_PROXY_CIDR,
+)
 
 
 def _normalize_cidr(entry: str) -> str:
@@ -68,6 +73,7 @@ async def apply_network_policy(
     pod_labels: dict[str, str] | None = None,
     policy_key: str | None = None,
     dns_egress_extra_cidrs: Sequence[str] | None = None,
+    allow_pod_ingress: bool = False,
 ) -> None:
     """Apply network policy using native Kubernetes NetworkPolicy and GKE FQDNNetworkPolicy.
 
@@ -103,6 +109,13 @@ async def apply_network_policy(
     async def _create_or_replace_egress_policy(
         egress_rules: list[k8s_client.V1NetworkPolicyEgressRule],
     ) -> None:
+        if allow_pod_ingress:
+            policy_types = ["Egress"]
+            ingress_rules: list[k8s_client.V1NetworkPolicyIngressRule] | None = None
+        else:
+            policy_types = ["Ingress", "Egress"]
+            ingress_rules = []
+
         body = k8s_client.V1NetworkPolicy(
             metadata=k8s_client.V1ObjectMeta(
                 name=policy_name,
@@ -117,7 +130,8 @@ async def apply_network_policy(
                 pod_selector=k8s_client.V1LabelSelector(
                     match_labels={"session": session_label}
                 ),
-                policy_types=["Egress"],
+                policy_types=policy_types,
+                ingress=ingress_rules,
                 egress=egress_rules,
             ),
         )
@@ -193,15 +207,13 @@ async def apply_network_policy(
             k8s_client.V1NetworkPolicyPort(protocol="UDP", port=53),
             k8s_client.V1NetworkPolicyPort(protocol="TCP", port=53),
         ]
-        default_dns_cidrs = (
+        default_dns_cidrs: tuple[str, ...] = (
             "10.0.0.0/8",  # RFC 1918 Class A private VPC / cluster network
             "172.16.0.0/12",  # RFC 1918 Class B private VPC / Docker bridge networks
             "192.168.0.0/16",  # RFC 1918 Class C private VPC / cluster network
             "169.254.0.0/16",  # Link-local: GKE NodeLocal DNSCache (169.254.20.10) & Cloud DNS / metadata DNS (169.254.169.254)
             "100.64.0.0/10",  # RFC 6598 Shared / Carrier-Grade NAT (CGNAT) range used in GKE non-RFC1918 Pod/Service IP allocations
             "34.118.224.0/20",  # GKE default reserved ClusterIP Service CIDR (where kube-dns ClusterIP e.g. 34.118.224.10 lives)
-            "8.8.8.8/32",  # Google Public DNS primary: hardcoded fallback injected by Docker Engine (libnetwork) inside DinD nested containers
-            "8.8.4.4/32",  # Google Public DNS secondary: hardcoded fallback injected by Docker Engine (libnetwork) inside DinD nested containers
         )
         peers: list[k8s_client.V1NetworkPolicyPeer] = [
             k8s_client.V1NetworkPolicyPeer(
@@ -239,7 +251,7 @@ async def apply_network_policy(
                 else:
                     try:
                         ipaddress.ip_address(host)
-                        cidrs.append(f"{host}/32")
+                        cidrs.append(_normalize_cidr(host))
                     except ValueError:
                         hostnames.append(host)
 
@@ -308,11 +320,27 @@ async def apply_network_policy(
                     k8s_client.V1NetworkPolicyEgressRule(
                         to=[
                             k8s_client.V1NetworkPolicyPeer(
-                                ip_block=k8s_client.V1IPBlock(cidr="169.254.169.254/32")
+                                ip_block=k8s_client.V1IPBlock(cidr=METADATA_SERVER_CIDR)
                             )
                         ],
                         ports=[
                             k8s_client.V1NetworkPolicyPort(protocol="TCP", port=80),
+                            k8s_client.V1NetworkPolicyPort(protocol="TCP", port=8080),
+                        ],
+                    )
+                )
+                egress_rules.append(
+                    k8s_client.V1NetworkPolicyEgressRule(
+                        to=[
+                            k8s_client.V1NetworkPolicyPeer(
+                                ip_block=k8s_client.V1IPBlock(
+                                    cidr=GKE_METADATA_PROXY_CIDR
+                                )
+                            )
+                        ],
+                        ports=[
+                            k8s_client.V1NetworkPolicyPort(protocol="TCP", port=988),
+                            k8s_client.V1NetworkPolicyPort(protocol="TCP", port=987),
                         ],
                     )
                 )
@@ -332,13 +360,7 @@ async def apply_network_policy(
                                 k8s_client.V1NetworkPolicyPeer(
                                     ip_block=k8s_client.V1IPBlock(
                                         cidr="0.0.0.0/0",
-                                        _except=["169.254.169.254/32"],
-                                    )
-                                ),
-                                k8s_client.V1NetworkPolicyPeer(
-                                    ip_block=k8s_client.V1IPBlock(
-                                        cidr="::/0",
-                                        _except=["fd00:170::2/128"],
+                                        _except=list(METADATA_IPV4_CIDRS),
                                     )
                                 ),
                             ]

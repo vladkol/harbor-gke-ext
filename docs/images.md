@@ -71,7 +71,7 @@ You can execute the pre-build process as a Harbor plugin or using the standalone
 **As a plugin:**
 ```bash
 harbor run --dataset my-tasks \
-  -e gke \
+  -e harbor_gke_ext:GKEEnvironment \
   --plugin harbor_gke_ext:CloudBuildPlugin \
   --pk concurrency=50 \
   --pk fail_on_incomplete=true \

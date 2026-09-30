@@ -3,11 +3,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from kubernetes.client.rest import ApiException
 
+from harbor.models.task.config import NetworkMode, NetworkPolicy
 from harbor_gke_ext.network_policy import (
     apply_network_policy,
     delete_network_policies,
 )
-from harbor.models.task.config import NetworkMode, NetworkPolicy
 
 
 @pytest.mark.unit
@@ -145,7 +145,12 @@ class TestApplyNetworkPolicyAllowlist:
         networking_api = MagicMock()
         policy = NetworkPolicy(
             network_mode=NetworkMode.ALLOWLIST,
-            allowed_hosts=["192.168.1.0/24", "10.0.0.1", "storage.googleapis.com"],
+            allowed_hosts=[
+                "192.168.1.0/24",
+                "10.0.0.1",
+                "2001:db8::1",
+                "storage.googleapis.com",
+            ],
         )
 
         await apply_network_policy(
@@ -162,23 +167,30 @@ class TestApplyNetworkPolicyAllowlist:
         netpol_body = networking_api.create_namespaced_network_policy.call_args.kwargs[
             "body"
         ]
-        # Should have 3 egress rules:
-        # 1. CIDRs ("192.168.1.0/24" and "10.0.0.1/32")
-        # 2. Metadata Server ("169.254.169.254/32" port 80)
-        # 3. DNS (port 53)
-        assert len(netpol_body.spec.egress) == 3
+        # Should have 4 egress rules:
+        # 1. CIDRs ("192.168.1.0/24", "10.0.0.1/32", and "2001:db8::1/128")
+        # 2. GCE Metadata Server ("169.254.169.254/32" ports 80, 8080)
+        # 3. GKE Metadata Proxy ("169.254.169.252/32" ports 988, 987)
+        # 4. DNS (port 53)
+        assert len(netpol_body.spec.egress) == 4
 
         cidr_rule = netpol_body.spec.egress[0]
         cidrs = [peer.ip_block.cidr for peer in cidr_rule.to]
         assert "192.168.1.0/24" in cidrs
         assert "10.0.0.1/32" in cidrs
+        assert "2001:db8::1/128" in cidrs
 
         metadata_rule = netpol_body.spec.egress[1]
         assert metadata_rule.to[0].ip_block.cidr == "169.254.169.254/32"
-        assert metadata_rule.ports[0].port == 80
-        assert metadata_rule.ports[0].protocol == "TCP"
+        assert [p.port for p in metadata_rule.ports] == [80, 8080]
+        assert all(p.protocol == "TCP" for p in metadata_rule.ports)
 
-        dns_rule = netpol_body.spec.egress[2]
+        proxy_rule = netpol_body.spec.egress[2]
+        assert proxy_rule.to[0].ip_block.cidr == "169.254.169.252/32"
+        assert [p.port for p in proxy_rule.ports] == [988, 987]
+        assert all(p.protocol == "TCP" for p in proxy_rule.ports)
+
+        dns_rule = netpol_body.spec.egress[3]
         assert all(p.port == 53 for p in dns_rule.ports)
 
 
@@ -353,9 +365,9 @@ class TestDeleteNetworkPolicies:
 @pytest.mark.asyncio
 class TestGKEEnvironmentApplyNetworkPolicy:
     async def test_apply_network_policy_settlement_when_pod_ready(self, tmp_path):
-        from harbor_gke_ext.environment import GKEEnvironment
         from harbor.models.task.config import EnvironmentConfig
         from harbor.models.trial.paths import TrialPaths
+        from harbor_gke_ext.environment import GKEEnvironment
 
         env = GKEEnvironment(
             environment_dir=tmp_path,
@@ -460,6 +472,7 @@ async def test_dns_egress_rule_default_and_extra_cidrs():
         )
         return created[0].spec.egress[-1]
 
+    # Default: cluster/VPC DNS ranges only, never 8.8.8.8/8.8.4.4
     rule = await _run_policy()
     assert rule.to[0].namespace_selector.match_labels == {
         "kubernetes.io/metadata.name": "kube-system"
@@ -472,11 +485,73 @@ async def test_dns_egress_rule_default_and_extra_cidrs():
         "169.254.0.0/16",
         "100.64.0.0/10",
         "34.118.224.0/20",
-        "8.8.8.8/32",
-        "8.8.4.4/32",
-    } <= cidrs
+    } == cidrs
+    assert "8.8.8.8/32" not in cidrs
+    assert "8.8.4.4/32" not in cidrs
     assert all(p.port == 53 for p in rule.ports)
 
     r_extra = await _run_policy(extra_cidrs=["198.18.0.10/32"])
     extra_cidrs = {peer.ip_block.cidr for peer in r_extra.to if peer.ip_block}
     assert "198.18.0.10/32" in extra_cidrs
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_public_metadata_block_and_pod_ingress_isolation():
+    networking_api = MagicMock()
+    created = []
+    networking_api.create_namespaced_network_policy.side_effect = (
+        lambda namespace, body: created.append(body)
+    )
+
+    # 1. Default (allow_metadata_server=False, allow_pod_ingress=False)
+    await apply_network_policy(
+        networking_api=networking_api,
+        custom_api=None,
+        namespace="default",
+        session_id="sess-1",
+        pod_name="job-abc-pod",
+        network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC),
+        allow_metadata_server=False,
+        allow_pod_ingress=False,
+    )
+    pol = created[-1]
+    assert pol.spec.policy_types == ["Ingress", "Egress"]
+    assert pol.spec.ingress == []
+    assert len(pol.spec.egress[0].to) == 1
+    assert pol.spec.egress[0].to[0].ip_block.cidr == "0.0.0.0/0"
+    assert pol.spec.egress[0].to[0].ip_block._except == [
+        "169.254.169.254/32",
+        "169.254.169.252/32",
+    ]
+
+    # 2. With allow_pod_ingress=True: Egress-only policy
+    await apply_network_policy(
+        networking_api=networking_api,
+        custom_api=None,
+        namespace="default",
+        session_id="sess-1",
+        pod_name="job-abc-pod",
+        network_policy=NetworkPolicy(network_mode=NetworkMode.PUBLIC),
+        allow_metadata_server=False,
+        allow_pod_ingress=True,
+    )
+    pol_ingress = created[-1]
+    assert pol_ingress.spec.policy_types == ["Egress"]
+    assert pol_ingress.spec.ingress is None
+
+    # 3. NO_NETWORK with allow_pod_ingress=False: blocks both Ingress and Egress
+    await apply_network_policy(
+        networking_api=networking_api,
+        custom_api=None,
+        namespace="default",
+        session_id="sess-1",
+        pod_name="job-abc-pod",
+        network_policy=NetworkPolicy(network_mode=NetworkMode.NO_NETWORK),
+        allow_metadata_server=False,
+        allow_pod_ingress=False,
+    )
+    pol_no_net = created[-1]
+    assert pol_no_net.spec.policy_types == ["Ingress", "Egress"]
+    assert pol_no_net.spec.ingress == []
+    assert pol_no_net.spec.egress == []

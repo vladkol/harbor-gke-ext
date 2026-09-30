@@ -48,21 +48,21 @@ by :class:`harbor_gke_ext.image_ref.ImageResolver`.
 from __future__ import annotations
 
 import base64
-from collections.abc import Mapping, Sequence
 import hashlib
 import io
 import json
 import math
 import os
-from pathlib import Path
 import posixpath
 import re
 import shlex
 import subprocess
 import tarfile
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
-import yaml
 
+import yaml
 from kubernetes import client as k8s_client
 
 from harbor.constants import MAIN_SERVICE_NAME
@@ -73,6 +73,8 @@ from harbor.environments.docker.compose_env import (
     legacy_log_mount_env_vars,
     merge_compose_env,
 )
+from harbor.utils.env import resolve_env_vars
+from harbor.utils.logger import logger
 from harbor_gke_ext.cluster_probe import ClusterCapabilities
 from harbor_gke_ext.compose_spec import (
     discover_compose_build_services,
@@ -97,13 +99,11 @@ from harbor_gke_ext.placement import (
     PlacementPlan,
     classify_compose_placement,
 )
-from harbor.utils.env import resolve_env_vars
-from harbor.utils.logger import logger
 
 if TYPE_CHECKING:
-    from harbor_gke_ext.environment import GKEEnvironment
     from harbor.models.task.config import TpuSpec
     from harbor.models.trial.config import ServiceVolumeConfig
+    from harbor_gke_ext.environment import GKEEnvironment
 
 _HARBOR_SHARED_LOG_PATHS: dict[str, str] = {
     "/logs/verifier": "verifier-logs",
@@ -624,7 +624,7 @@ def resolve_compose_infra_env(
     )
 
 
-def _parse_cpu_millicores(val: str | int | float | None, default_m: int) -> int:
+def _parse_cpu_millicores(val: str | float | None, default_m: int) -> int:
     if val is None:
         return default_m
     raw = str(val).strip()
@@ -694,7 +694,7 @@ def _normalize_dind_tmpfs_entries(
     return normalized
 
 
-def _parse_memory_mb(val: str | int | float | None, default_mb: int) -> int:
+def _parse_memory_mb(val: str | float | None, default_mb: int) -> int:
     if val is None:
         return default_mb
     if isinstance(val, (int, float)):
@@ -728,7 +728,7 @@ def _parse_memory_mb(val: str | int | float | None, default_mb: int) -> int:
 _PARSE_FAILED = -1
 
 
-def _parse_cpu_millicores_opt(val: str | int | float | None) -> int | None:
+def _parse_cpu_millicores_opt(val: str | float | None) -> int | None:
     """Parse a CPU quantity, or ``None`` if absent or unparseable.
 
     The non-optional form requires a caller-supplied default, which is how
@@ -739,7 +739,7 @@ def _parse_cpu_millicores_opt(val: str | int | float | None) -> int | None:
     return None if parsed == _PARSE_FAILED else parsed
 
 
-def _parse_memory_mb_opt(val: str | int | float | None) -> int | None:
+def _parse_memory_mb_opt(val: str | float | None) -> int | None:
     """Parse a memory quantity, or ``None`` if absent or unparseable."""
     parsed = _parse_memory_mb(val, _PARSE_FAILED)
     return None if parsed == _PARSE_FAILED else parsed
@@ -759,7 +759,7 @@ def _quantity_to_mib(val: str | None) -> int:
     return _parse_memory_mb_opt(val) or 0
 
 
-def _is_zero_quantity(val: str | int | float | None) -> bool:
+def _is_zero_quantity(val: str | float | None) -> bool:
     """True for a quantity that is explicitly zero (``0``, ``0Mi``, ``0m``).
 
     Needed because the underlying parsers clamp to a floor -- ``max(10, ...)``
@@ -2112,6 +2112,7 @@ def _build_shape_b_dind_containers(
     compose_up_timeout_sec: int = _GKE_DEFAULT_COMPOSE_UP_TIMEOUT_SEC,
     startup_env: dict[str, str] | None = None,
     main_workdir: str | None = None,
+    allow_metadata_server: bool = False,
 ) -> tuple[
     list[k8s_client.V1Container],
     k8s_client.V1Container,
@@ -2542,17 +2543,27 @@ def _build_shape_b_dind_containers(
         "fi; "
         "touch /harbor/dind-images/.main-layers-ready) >/dev/null 2>&1 & "
     )
+    metadata_lockdown_watcher = (
+        "(while [ ! -f /harbor/dind-images/.auth-scrubbed ]; do sleep 0.1; done; "
+        "ip route replace unreachable 169.254.169.254/32 2>/dev/null || true; "
+        "ip route replace unreachable 169.254.169.252/32 2>/dev/null || true; "
+        "touch /harbor/dind-images/.metadata-blocked) >/dev/null 2>&1 & "
+        if not allow_metadata_server
+        else ""
+    )
     stage_cli_cmd = (
         "mkdir -p /harbor/dind-images /harbor/dind-images/.docker; "
         "cp /usr/local/bin/docker /harbor/dind-images/docker-cli; "
         "chmod 0755 /harbor/dind-images/docker-cli; "
         f"{symlink_cmds}"
         f"{main_layers_watcher}"
+        f"{metadata_lockdown_watcher}"
         "harbor_refresh_gcr_auth() { "
+        "[ -f /harbor/dind-images/.auth-scrubbed ] && return 0; "
         'TOK=$(wget -qO- -T 3 --header="Metadata-Flavor: Google" '
         '"http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token" '
         '2>/dev/null | sed -n \'s/.*"access_token":"\\([^"]*\\)".*/\\1/p\'); '
-        'if [ -n "$TOK" ]; then '
+        'if [ -n "$TOK" ] && [ ! -f /harbor/dind-images/.auth-scrubbed ]; then '
         'B64=$(printf "oauth2accesstoken:%s" "$TOK" | base64 | tr -d "\\n\\r "); '
         'SEP=""; ENTRIES=""; '
         f"for H in {hosts_joined}; do "
@@ -2566,7 +2577,7 @@ def _build_shape_b_dind_containers(
         "fi; "
         "}; "
         "harbor_refresh_gcr_auth; "
-        "(while sleep 900; do harbor_refresh_gcr_auth; done) >/dev/null 2>&1 & "
+        "(while sleep 900; do [ -f /harbor/dind-images/.auth-scrubbed ] && break; harbor_refresh_gcr_auth; done) >/dev/null 2>&1 & "
     )
     dockerd_argv = (
         "dockerd --host=unix:///var/run/harbor-dind/docker.sock --iptables=false --ip6tables=false"
@@ -2780,7 +2791,14 @@ def _build_shape_b_dind_containers(
     # Without a bound here the gate blocks until `pod_ready_timeout` (1200s) and
     # the failure reaches the operator as "pod not ready", with no hint that the
     # inner Compose project was the cause.
+    metadata_lockdown_wait = (
+        "while [ ! -f /harbor/dind-images/.metadata-blocked ]; do sleep 0.1; done && "
+        if not allow_metadata_server
+        else ""
+    )
     gate_script = (
+        f"touch /harbor/dind-images/.auth-scrubbed && rm -rf /harbor/dind-images/.docker && "
+        f"{metadata_lockdown_wait}"
         f"mkdir -p /harbor && "
         f"echo {shlex.quote(b64_compose)} | base64 -d > /harbor/dind-compose.yaml && "
         f"{gpu_step}"
@@ -2873,6 +2891,7 @@ def translate_compose(
     main_image: str | None = None,
     sidecar_images: dict[str, str] | None = None,
     compute_class: str | None = None,
+    allow_metadata_server: bool = False,
     logger: Any | None = None,
     **_extra_kwargs: Any,
 ) -> k8s_client.V1Pod:
@@ -3041,6 +3060,7 @@ def translate_compose(
             compose_up_timeout_sec=compose_up_timeout_sec,
             startup_env=startup_env,
             main_workdir=main_workdir,
+            allow_metadata_server=bool(allow_metadata_server),
         )
         init_containers.append(dind_engine)
         init_containers.extend(dind_cache_containers)

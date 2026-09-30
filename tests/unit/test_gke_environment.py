@@ -18,6 +18,13 @@ from kubernetes.client.rest import ApiException
 
 import harbor_gke_ext.environment as env_mod
 from harbor.environments.base import ExecResult, HealthcheckError
+from harbor.models.task.config import (
+    EnvironmentConfig,
+    HealthcheckConfig,
+    TpuSpec,
+)
+from harbor.models.trial.paths import TrialPaths
+from harbor.utils.optional_import import MissingExtraError
 from harbor_gke_ext.cluster_probe import ClusterCapabilities
 from harbor_gke_ext.compose_translator import (
     DIND_STORAGE_FLOOR_MB,
@@ -30,20 +37,13 @@ from harbor_gke_ext.constants import (
     TrialContainerLostError,
     UnsatisfiableMachineTypeError,
 )
-from harbor_gke_ext.exec_stream import ExecOutputAccumulator
 from harbor_gke_ext.environment import (
     GKEEnvironment,
     _get_cluster_autopilot_lock,
     _parse_bool,
     reset_cluster_autopilot_cache,
 )
-from harbor.models.task.config import (
-    EnvironmentConfig,
-    HealthcheckConfig,
-    TpuSpec,
-)
-from harbor.models.trial.paths import TrialPaths
-from harbor.utils.optional_import import MissingExtraError
+from harbor_gke_ext.exec_stream import ExecOutputAccumulator
 
 
 @pytest.fixture(autouse=True)
@@ -1084,15 +1084,15 @@ async def test_create_pod_batch_api_409_delete_timeout(tmp_path, mock_k8s_manage
     mock_pod.metadata.labels = {}
     mock_pod.spec = MagicMock()
 
-    with patch(
-        "harbor_gke_ext.environment.time.monotonic",
-        side_effect=mock_monotonic_sequence(0.0, 100.0, 101.0),
+    with (
+        patch(
+            "harbor_gke_ext.environment.time.monotonic",
+            side_effect=mock_monotonic_sequence(0.0, 100.0, 101.0),
+        ),
+        patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()),
+        pytest.raises(RuntimeError, match="Timed out waiting for existing Job"),
     ):
-        with patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()):
-            with pytest.raises(
-                RuntimeError, match="Timed out waiting for existing Job"
-            ):
-                await env._create_pod(mock_pod)
+        await env._create_pod(mock_pod)
 
 
 @pytest.mark.unit
@@ -1141,16 +1141,18 @@ async def test_create_pod_batch_api_spawn_timeout(tmp_path, mock_k8s_manager):
     mock_pod.metadata.labels = {}
     mock_pod.spec = MagicMock()
 
-    with patch(
-        "harbor_gke_ext.environment.time.monotonic",
-        side_effect=mock_monotonic_sequence(0.0, 1000.0, 1001.0),
+    with (
+        patch(
+            "harbor_gke_ext.environment.time.monotonic",
+            side_effect=mock_monotonic_sequence(0.0, 1000.0, 1001.0),
+        ),
+        patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()),
+        pytest.raises(
+            TimeoutError,
+            match="Timed out after .* waiting for Kubernetes Job controller",
+        ),
     ):
-        with patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()):
-            with pytest.raises(
-                TimeoutError,
-                match="Timed out after .* waiting for Kubernetes Job controller",
-            ):
-                await env._create_pod(mock_pod)
+        await env._create_pod(mock_pod)
 
 
 @pytest.mark.unit
@@ -1329,9 +1331,7 @@ async def test_create_job_resolves_pod_by_controller_uid_and_skips_terminating(
     mock_k8s_manager["batch_api"].create_namespaced_job.return_value = _created_job(
         "uid-new"
     )
-    stale = _listed_pod(
-        "old-attempt-pod", deletion_timestamp=dt.datetime.now(dt.timezone.utc)
-    )
+    stale = _listed_pod("old-attempt-pod", deletion_timestamp=dt.datetime.now(dt.UTC))
     mock_k8s_manager["core_api"].list_namespaced_pod.side_effect = [
         SimpleNamespace(items=[stale]),
         SimpleNamespace(items=[stale, _listed_pod("new-attempt-pod")]),
@@ -1552,45 +1552,39 @@ async def test_start_compose_native_success(tmp_path):
         compose_yaml="services:\n  worker:\n    image: redis\n",
         compose_mode="native",
     )
-    with patch.object(env, "_ensure_client", AsyncMock()):
-        with patch(
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch(
             "harbor_gke_ext.environment.discover_compose_build_services",
             return_value={"worker": (tmp_path / "env", "Dockerfile")},
-        ):
-            with patch.object(env, "_image_exists", AsyncMock(return_value=True)):
-                with patch(
-                    "harbor_gke_ext.environment.check_image_exists_in_registry",
-                    AsyncMock(return_value=True),
-                ):
-                    with patch.object(
-                        env, "_build_compose_pod", return_value=MagicMock()
-                    ):
-                        with patch.object(env, "_create_pod", AsyncMock()):
-                            with patch.object(
-                                env, "_apply_network_policy", AsyncMock()
-                            ):
-                                with patch.object(
-                                    env, "_wait_for_pod_ready", AsyncMock()
-                                ):
-                                    with patch.object(
-                                        env,
-                                        "_wait_for_container_exec_ready",
-                                        AsyncMock(),
-                                    ):
-                                        with patch.object(
-                                            env,
-                                            "ensure_dirs",
-                                            AsyncMock(
-                                                return_value=ExecResult(return_code=0)
-                                            ),
-                                        ):
-                                            with patch.object(
-                                                env,
-                                                "_upload_environment_dir_after_start",
-                                                AsyncMock(),
-                                            ):
-                                                await env.start(force_build=False)
-                                                assert env._active_strategy == "native"
+        ),
+        patch.object(env, "_image_exists", AsyncMock(return_value=True)),
+        patch(
+            "harbor_gke_ext.environment.check_image_exists_in_registry",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(env, "_build_compose_pod", return_value=MagicMock()),
+        patch.object(env, "_create_pod", AsyncMock()),
+        patch.object(env, "_apply_network_policy", AsyncMock()),
+        patch.object(env, "_wait_for_pod_ready", AsyncMock()),
+        patch.object(
+            env,
+            "_wait_for_container_exec_ready",
+            AsyncMock(),
+        ),
+        patch.object(
+            env,
+            "ensure_dirs",
+            AsyncMock(return_value=ExecResult(return_code=0)),
+        ),
+        patch.object(
+            env,
+            "_upload_environment_dir_after_start",
+            AsyncMock(),
+        ),
+    ):
+        await env.start(force_build=False)
+        assert env._active_strategy == "native"
 
 
 @pytest.mark.unit
@@ -1601,45 +1595,35 @@ async def test_start_compose_native_builds_sidecars(tmp_path):
         compose_yaml="services:\n  worker:\n    image: redis\n",
         compose_mode="native",
     )
-    with patch.object(env, "_ensure_client", AsyncMock()):
-        with patch(
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch(
             "harbor_gke_ext.environment.discover_compose_build_services",
             return_value={"worker": (tmp_path / "env", "Dockerfile")},
-        ):
-            with patch.object(env, "_image_exists", AsyncMock(return_value=False)):
-                with patch(
-                    "harbor_gke_ext.environment.check_image_exists_in_registry",
-                    AsyncMock(return_value=False),
-                ):
-                    with patch.object(
-                        env, "_build_and_push_image", AsyncMock()
-                    ) as mock_build:
-                        with patch.object(
-                            env, "_build_compose_pod", return_value=MagicMock()
-                        ):
-                            with patch.object(env, "_create_pod", AsyncMock()):
-                                with patch.object(
-                                    env, "_apply_network_policy", AsyncMock()
-                                ):
-                                    with patch.object(
-                                        env, "_wait_for_pod_ready", AsyncMock()
-                                    ):
-                                        with patch.object(
-                                            env,
-                                            "_wait_for_container_exec_ready",
-                                            AsyncMock(),
-                                        ):
-                                            with patch.object(
-                                                env,
-                                                "ensure_dirs",
-                                                AsyncMock(
-                                                    return_value=ExecResult(
-                                                        return_code=0
-                                                    )
-                                                ),
-                                            ):
-                                                await env.start(force_build=True)
-                                                assert mock_build.await_count == 2
+        ),
+        patch.object(env, "_image_exists", AsyncMock(return_value=False)),
+        patch(
+            "harbor_gke_ext.environment.check_image_exists_in_registry",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(env, "_build_and_push_image", AsyncMock()) as mock_build,
+        patch.object(env, "_build_compose_pod", return_value=MagicMock()),
+        patch.object(env, "_create_pod", AsyncMock()),
+        patch.object(env, "_apply_network_policy", AsyncMock()),
+        patch.object(env, "_wait_for_pod_ready", AsyncMock()),
+        patch.object(
+            env,
+            "_wait_for_container_exec_ready",
+            AsyncMock(),
+        ),
+        patch.object(
+            env,
+            "ensure_dirs",
+            AsyncMock(return_value=ExecResult(return_code=0)),
+        ),
+    ):
+        await env.start(force_build=True)
+        assert mock_build.await_count == 2
 
 
 @pytest.mark.unit
@@ -2010,24 +1994,24 @@ async def test_download_file_container_lost_raises_without_local_retry(tmp_path)
     env = make_gke_env(tmp_path)
     env._core_api = MagicMock()
     env.pod_name = "test-pod"
-    with patch.object(env, "_ensure_client", AsyncMock()):
-        with (
-            patch(
-                "harbor_gke_ext.environment.ft_download_file",
-                new=AsyncMock(side_effect=RuntimeError("exec stream failed")),
-            ) as mock_down,
-            patch(
-                "harbor_gke_ext.environment.check_pod_terminated",
-                new=AsyncMock(
-                    side_effect=TrialContainerLostError(
-                        "Pod test-pod does not exist in cluster."
-                    )
-                ),
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch(
+            "harbor_gke_ext.environment.ft_download_file",
+            new=AsyncMock(side_effect=RuntimeError("exec stream failed")),
+        ) as mock_down,
+        patch(
+            "harbor_gke_ext.environment.check_pod_terminated",
+            new=AsyncMock(
+                side_effect=TrialContainerLostError(
+                    "Pod test-pod does not exist in cluster."
+                )
             ),
-        ):
-            with pytest.raises(TrialContainerLostError, match="does not exist"):
-                await env.download_file("/remote/test.txt", tmp_path / "out.txt")
-            mock_down.assert_awaited_once()
+        ),
+    ):
+        with pytest.raises(TrialContainerLostError, match="does not exist"):
+            await env.download_file("/remote/test.txt", tmp_path / "out.txt")
+        mock_down.assert_awaited_once()
 
 
 @pytest.mark.unit
@@ -2036,19 +2020,19 @@ async def test_download_file_other_error_raises(tmp_path):
     env = make_gke_env(tmp_path)
     env._core_api = MagicMock()
     env.pod_name = "test-pod"
-    with patch.object(env, "_ensure_client", AsyncMock()):
-        with (
-            patch(
-                "harbor_gke_ext.environment.ft_download_file",
-                side_effect=RuntimeError("unexpected disk failure"),
-            ),
-            patch(
-                "harbor_gke_ext.environment.check_pod_terminated",
-                new=AsyncMock(return_value=None),
-            ),
-        ):
-            with pytest.raises(RuntimeError, match="unexpected disk failure"):
-                await env.download_file("/remote/test.txt", tmp_path / "out.txt")
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch(
+            "harbor_gke_ext.environment.ft_download_file",
+            side_effect=RuntimeError("unexpected disk failure"),
+        ),
+        patch(
+            "harbor_gke_ext.environment.check_pod_terminated",
+            new=AsyncMock(return_value=None),
+        ),
+        pytest.raises(RuntimeError, match="unexpected disk failure"),
+    ):
+        await env.download_file("/remote/test.txt", tmp_path / "out.txt")
 
 
 @pytest.mark.unit
@@ -2057,25 +2041,25 @@ async def test_download_dir_container_lost_raises_without_local_retry(tmp_path):
     env = make_gke_env(tmp_path)
     env._core_api = MagicMock()
     env.pod_name = "test-pod"
-    with patch.object(env, "_ensure_client", AsyncMock()):
-        with (
-            patch(
-                "harbor_gke_ext.environment.ft_download_dir",
-                new=AsyncMock(side_effect=ApiException(status=404, reason="Not Found")),
-            ) as mock_down,
-            patch(
-                "harbor_gke_ext.environment.check_pod_terminated",
-                new=AsyncMock(
-                    side_effect=TrialContainerLostError(
-                        "Container 'main' in pod test-pod has terminated "
-                        "(reason='OOMKilled', exit_code=137)."
-                    )
-                ),
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch(
+            "harbor_gke_ext.environment.ft_download_dir",
+            new=AsyncMock(side_effect=ApiException(status=404, reason="Not Found")),
+        ) as mock_down,
+        patch(
+            "harbor_gke_ext.environment.check_pod_terminated",
+            new=AsyncMock(
+                side_effect=TrialContainerLostError(
+                    "Container 'main' in pod test-pod has terminated "
+                    "(reason='OOMKilled', exit_code=137)."
+                )
             ),
-        ):
-            with pytest.raises(TrialContainerLostError, match="OOMKilled"):
-                await env.download_dir("/remote/dir", tmp_path / "out_dir")
-            mock_down.assert_awaited_once()
+        ),
+    ):
+        with pytest.raises(TrialContainerLostError, match="OOMKilled"):
+            await env.download_dir("/remote/dir", tmp_path / "out_dir")
+        mock_down.assert_awaited_once()
 
 
 @pytest.mark.unit
@@ -2084,19 +2068,19 @@ async def test_download_dir_other_error_raises(tmp_path):
     env = make_gke_env(tmp_path)
     env._core_api = MagicMock()
     env.pod_name = "test-pod"
-    with patch.object(env, "_ensure_client", AsyncMock()):
-        with (
-            patch(
-                "harbor_gke_ext.environment.ft_download_dir",
-                side_effect=ApiException(status=500, reason="Internal Server Error"),
-            ),
-            patch(
-                "harbor_gke_ext.environment.check_pod_terminated",
-                new=AsyncMock(return_value=None),
-            ),
-        ):
-            with pytest.raises(ApiException):
-                await env.download_dir("/remote/dir", tmp_path / "out_dir")
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch(
+            "harbor_gke_ext.environment.ft_download_dir",
+            side_effect=ApiException(status=500, reason="Internal Server Error"),
+        ),
+        patch(
+            "harbor_gke_ext.environment.check_pod_terminated",
+            new=AsyncMock(return_value=None),
+        ),
+        pytest.raises(ApiException),
+    ):
+        await env.download_dir("/remote/dir", tmp_path / "out_dir")
 
 
 @pytest.mark.unit
@@ -2106,17 +2090,19 @@ async def test_exec_nonzero_exit_on_dead_container_raises_lost(
     local_exec_env, tmp_path, return_code
 ):
     """An exec that ends because its container died is an infra failure, not an exit code."""
-    with patch(
-        "harbor_gke_ext.environment.check_pod_terminated",
-        new=AsyncMock(
-            side_effect=TrialContainerLostError(
-                "Container 'main' in pod p has terminated "
-                "(reason='OOMKilled', exit_code=137)."
-            )
+    with (
+        patch(
+            "harbor_gke_ext.environment.check_pod_terminated",
+            new=AsyncMock(
+                side_effect=TrialContainerLostError(
+                    "Container 'main' in pod p has terminated "
+                    "(reason='OOMKilled', exit_code=137)."
+                )
+            ),
         ),
+        pytest.raises(TrialContainerLostError),
     ):
-        with pytest.raises(TrialContainerLostError):
-            await local_exec_env.exec(f"exit {return_code}", cwd=str(tmp_path))
+        await local_exec_env.exec(f"exit {return_code}", cwd=str(tmp_path))
 
 
 @pytest.mark.unit
@@ -2919,3 +2905,21 @@ def test_ephemeral_storage_gate_stays_out_of_the_way(tmp_path, caps):
     pod = _pod_with_storage(one_shot_init_mb=[82_838])
 
     env._assert_ephemeral_storage_schedulable(pod, caps)
+
+
+@pytest.mark.unit
+def test_network_policy_enforcement_capabilities_and_fail_closed(tmp_path):
+    env = make_gke_env(tmp_path, allow_metadata_server=False)
+    unforced_caps = _standard_caps(network_policy_enforced=False)
+    env_mod._CLUSTER_CAPABILITIES_CACHE[
+        (env.project_id, env.location, env.cluster_name)
+    ] = unforced_caps
+    assert env.capabilities.disable_internet is False
+    assert env.capabilities.network_allowlist is False
+    with pytest.raises(
+        RuntimeError, match="active Kubernetes NetworkPolicy enforcement is required"
+    ):
+        env._verify_network_enforcement(unforced_caps)
+    # Opting into allow_metadata_server=True in PUBLIC mode succeeds without enforcement
+    env_opt_out = make_gke_env(tmp_path, allow_metadata_server=True)
+    env_opt_out._verify_network_enforcement(unforced_caps)

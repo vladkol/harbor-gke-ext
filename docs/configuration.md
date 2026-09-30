@@ -351,9 +351,10 @@ type is unrecognized.
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `allow_metadata_server` | boolean | `false` | Controls egress to the GCE metadata server (`169.254.169.254/32` and `fd00:170::2/128`). When `false` (default), metadata egress is blocked in all network modes. When `true`, `public` mode creates no `NetworkPolicy` (and deletes any existing policy on update), while `allowlist` mode adds an explicit TCP port 80 egress rule for `169.254.169.254/32`. |
-| `enable_fqdn_network_policy` | boolean | Auto-detected | Forces or disables `FQDNNetworkPolicy` support instead of probing the cluster. |
-| `dns_egress_extra_cidrs` | string or list | `[]` | Comma-separated or list of additional CIDRs allowed on UDP/TCP port 53 alongside the default GKE DNS egress rule. |
+| `allow_metadata_server` | boolean | `false` | Controls egress to the GCE metadata server (`169.254.169.254/32`) and GKE Workload Identity metadata proxy (`169.254.169.252/32`). When `false` (default), metadata egress is blocked in all network modes and `start()` verifies that the cluster enforces `NetworkPolicy`. When `true`, `public` mode creates no `NetworkPolicy` (and deletes any existing policy on update), while `allowlist` mode adds explicit TCP egress rules for `169.254.169.254/32` (ports `80`, `8080`) and `169.254.169.252/32` (ports `988`, `987`). |
+| `allow_pod_ingress` | boolean | `false` | Controls inbound Pod-to-Pod traffic. When `false` (default), every `NetworkPolicy` sets `policyTypes: ["Ingress", "Egress"]` with `ingress: []`, isolating concurrent trial Pods in the same namespace from one another. Set to `true` to emit `policyTypes: ["Egress"]` only. |
+| `enable_fqdn_network_policy` | boolean | Auto-detected | Forces or disables `FQDNNetworkPolicy` support instead of probing `/apis/networking.gke.io/v1alpha1`. |
+| `dns_egress_extra_cidrs` | string or list | `[]` | Comma-separated or list of additional CIDRs allowed on UDP/TCP port 53 alongside the default GKE cluster/VPC DNS egress rule. |
 | `network_policy_settlement_sec` | float | `2.0` | Pause after updating or deleting a `NetworkPolicy` on an already-running Pod (`_pod_ready=True`) so dataplane rules take effect before commands run. Not applied when creating the initial policy before the Job/Pod starts. Set to `0` to skip. |
 
 See [Networking and security](networking-and-security.md) for the full policy model.

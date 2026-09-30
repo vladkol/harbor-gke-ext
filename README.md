@@ -42,13 +42,16 @@ elevated container capabilities.
 See [Networking and security](docs/networking-and-security.md).
 
 **Harbor-controlled network policies and metadata server protection.** Beyond
-container sandboxing, the environment enforces Harbor's per-task network modes
-(`no-network`, `allowlist`, and `public`) by leveraging Kubernetes
-`NetworkPolicy` and GKE Dataplane V2's `FQDNNetworkPolicy` for IP, CIDR, exact
-hostname, and wildcard domain filtering. Access to the GKE metadata server is
-blocked by default to protect node and Workload Identity credentials, with
-explicit opt-in so agents can authenticate to Google Cloud APIs and resources
-while remaining blocked from accessing the rest of the internet.
+container sandboxing, the environment verifies that the cluster actively enforces
+Kubernetes `NetworkPolicy` (GKE Dataplane V2 or Calico, failing closed if
+unenforced) and applies Harbor's per-task network modes (`no-network`,
+`allowlist`, and `public`) with default cross-trial ingress isolation and GKE
+Dataplane V2's `FQDNNetworkPolicy` for IP, CIDR, exact hostname, and wildcard
+domain filtering. Access to the GCE and GKE metadata servers is blocked by
+default to protect node and Workload Identity credentials (and temporary
+Docker-in-Docker registry tokens are scrubbed before the agent container
+starts), with explicit opt-in when tasks need to authenticate to Google Cloud
+APIs.
 See [Networking and security](docs/networking-and-security.md).
 
 **Docker-in-Docker (DinD) support.** Tasks or sidecars that require a live
@@ -288,7 +291,7 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" \
 ```
 
 > [!NOTE]
-> - Because `default-pool` is tainted with `CriticalAddonsOnly=true:NoSchedule`, `kube-system` runs on a single `100 GB` `e2-standard-4` node (approximately `$97/mo` at list price in `us-central1`), while `harbor-workers` and the GPU pool scale to **`0` nodes (`$0/hr` for both VMs and boot disks) when no evaluations are running**.
+> - Because `default-pool` is tainted with `CriticalAddonsOnly=true:NoSchedule`, `kube-system` runs on a single `100 GB` `e2-standard-4` node, while `harbor-workers` and the GPU pool scale to **`0` nodes when no evaluations are running**.
 > - Ensure your project's regional **`SSD_TOTAL_GB`** (`Persistent Disk SSD (GB)`) quota in `${REGION}` can cover your peak active worker nodes (`500 GB` per active node).
 > - **Why step 4 binds `principalSet://.../workloadIdentityPools/${PROJECT_ID}.svc.id.goog/*` after cluster creation:** Creating the cluster with `--workload-pool="${PROJECT_ID}.svc.id.goog"` (or creating an Autopilot cluster) provisions the project's Workload Identity pool and enables `GKE_METADATA` on worker nodes. Under `GKE_METADATA`, `kubelet` on the host still uses `${NODE_SA}`, but `dind-engine` inside a Pod receives a Workload Identity token when querying `169.254.169.254`. Binding `roles/artifactregistry.reader` on the `harbor-tasks` repository to the Workload Identity pool lets `dind-cache-<service>` pull built task and sidecar images directly via `docker pull` instead of falling back to slow rootfs streaming (`tar -cf - / | docker import`). See [Docker-in-Docker](docs/docker-in-docker.md).
 
@@ -363,15 +366,8 @@ cores, or to scale limits above requests in `auto` mode:
 only. Compose Pods always carry a Pod-level limit of at least the declared
 budget, with an `8192 MiB` memory floor when `dind-engine` is present.
 
-**Request a GPU (or override A100 tasks to L4).** Declare it in `task.toml`:
-
-```toml
-[environment]
-gpus = 1
-gpu_types = ["L4"]
-```
-
-Only the first entry in `gpu_types` is used. When running a dataset whose tasks declare
+**Request a GPU or override GPU.** When running a dataset whose tasks declare
+`gpu_types` that yiou don't have capacity for, such as
 `gpu_types = ["A100"]` (or `a100-80gb`) on a cluster equipped with L4 GPUs (`l4-gpu-pool`),
 override the accelerator selector at runtime with the full GKE label:
 

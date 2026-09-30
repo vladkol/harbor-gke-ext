@@ -220,6 +220,12 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" \
 > unrelated Pods on the same node (see
 > [Task sizing and placement](task-sizing-and-placement.md#recommendations)).
 
+> [!IMPORTANT]
+> If using Network Policies, **always create GKE Standard clusters with `--enable-dataplane-v2 --enable-fqdn-network-policy` (step 2).**
+> On GKE Standard, the default Legacy Datapath without `--enable-dataplane-v2` or `--enable-network-policy` (Calico) accepts `NetworkPolicy` objects into the Kubernetes API server while **silently ignoring them in the dataplane**. `harbor-gke-ext` probes the cluster for an active `NetworkPolicy` controller at startup and fails closed if none is active.
+> - **GKE Dataplane V2 (`--enable-dataplane-v2 --enable-fqdn-network-policy`)** is strongly recommended: it enforces `NetworkPolicy` in-kernel via eBPF before a Pod's network interface is attached, supports `FQDNNetworkPolicy` for domain and wildcard allowlists, and is compatible with GKE Sandbox (`gVisor`). Note that `--enable-dataplane-v2` must be set **at cluster creation time**.
+> - **Legacy Datapath + Calico (`--enable-network-policy`)** can be enabled on an existing Legacy Datapath cluster (`gcloud container clusters update "${CLUSTER_NAME}" --update-addons=NetworkPolicy=ENABLED && gcloud container clusters update "${CLUSTER_NAME}" --enable-network-policy`) and enforces `no-network`, IP/CIDR `allowlist`, and metadata server blocking (`169.254.169.254` and `169.254.169.252`), but does **not** support `FQDNNetworkPolicy`, and requires `calico-node` (`projectcalico.org/ds-ready=true`) to be healthy on every schedulable node. See [Networking and security](networking-and-security.md#cluster-enforcement-detection-dataplane-v2-vs-calico).
+
 ### Path B: Autopilot cluster
 
 Create a GKE Autopilot cluster. Autopilot automatically configures Dataplane V2, Workload Identity, and enforces the Pod Security Standards (PSS) baseline.
@@ -383,10 +389,10 @@ Understanding how GKE manages boot disk storage and I/O throughput is essential 
 
 ### Standard cluster storage arithmetic and vCPU bin-packing
 
-On GKE Standard, a node's boot disk (`--disk-size` / `diskSizeGb`, specified in binary GiB, $2^{30}$ bytes) is shared between Pod ephemeral storage (`emptyDir` and writable container layers), the GKE Image Streaming (`gcfs`) block cache, and the underlying container runtime (`imagefs`). On `COS_CONTAINERD` nodes, the boot disk reserves ~`4.2 GiB` for fixed OS partitions (`rootA`, `rootB`, `OEM`, `EFI`) and ~`1.56%` ($1/64$) for `ext4` metadata on the stateful partition, so the node's filesystem capacity (`.status.capacity.ephemeral-storage`) is $C_{\text{GiB}} \approx \frac{63}{64} \times D - 4.184\text{ GiB}$. GKE then deducts two reservations from $C_{\text{GiB}}$:
+On GKE Standard, a node's boot disk (`--disk-size` / `diskSizeGb`, specified in binary GiB, `2^30` bytes) is shared between Pod ephemeral storage (`emptyDir` and writable container layers), the GKE Image Streaming (`gcfs`) block cache, and the underlying container runtime (`imagefs`). On `COS_CONTAINERD` nodes, the boot disk reserves ~`4.2 GiB` for fixed OS partitions (`rootA`, `rootB`, `OEM`, `EFI`) and ~`1.56%` (`1/64`) for `ext4` metadata on the stateful partition, so the node's filesystem capacity (`.status.capacity.ephemeral-storage`) is `C_GiB ≈ (63 / 64) * D - 4.184 GiB`. GKE then deducts two reservations from `C_GiB`:
 
-1. **System Reservation**: $\min(50\% \times D,\; 35\% \times D + 6\text{ GiB},\; 100\text{ GiB})$ — **caps at `100 GiB` once the disk reaches `269 GB`**.
-2. **Eviction Threshold**: $10\%$ of filesystem capacity ($0.10 \times C_{\text{GiB}}$).
+1. **System Reservation**: `MIN(50% * D, 35% * D + 6 GiB, 100 GiB)` — **caps at `100 GiB` once the disk reaches `269 GB`**.
+2. **Eviction Threshold**: `10%` of filesystem capacity (`0.10 * C_GiB`).
 
 When sizing node boot disks, account for three runtime effects:
 - **DinD `overlay2` layer expansion**: Tasks that use `dind-engine` (Shapes B and C) unpack compressed OCI layers into `/var/lib/docker`, expanding roughly `3.0×` over compressed manifest size (plus a `10 GiB` floor per Pod).

@@ -461,3 +461,57 @@ def test_estimate_allocatable_boot_disk_formula() -> None:
     )
     assert estimate_gke_allocatable_ephemeral_storage_mb(None) is None
     assert estimate_gke_allocatable_ephemeral_storage_mb(0) is None
+
+
+@pytest.mark.unit
+def test_parse_gcloud_cluster_describe_network_policy_enforced() -> None:
+    # 1. Autopilot -> True
+    assert (
+        parse_gcloud_cluster_describe(
+            {"autopilot": {"enabled": True}}
+        ).network_policy_enforced
+        is True
+    )
+    # 2. Standard with ADVANCED_DATAPATH (Dataplane V2) -> True
+    assert (
+        parse_gcloud_cluster_describe(
+            {
+                "autopilot": {"enabled": False},
+                "networkConfig": {"datapathProvider": "ADVANCED_DATAPATH"},
+            }
+        ).network_policy_enforced
+        is True
+    )
+    # 3. Standard with Calico enabled and addon not disabled -> True
+    assert (
+        parse_gcloud_cluster_describe(
+            {
+                "autopilot": {"enabled": False},
+                "networkPolicy": {"enabled": True},
+                "addonsConfig": {"networkPolicyConfig": {"disabled": False}},
+            }
+        ).network_policy_enforced
+        is True
+    )
+    # 4. Standard with networkPolicy.enabled=True but addon disabled -> False
+    assert (
+        parse_gcloud_cluster_describe(
+            {
+                "autopilot": {"enabled": False},
+                "networkPolicy": {"enabled": True},
+                "addonsConfig": {"networkPolicyConfig": {"disabled": True}},
+            }
+        ).network_policy_enforced
+        is False
+    )
+    # 5. Standard with Legacy Datapath and no Calico -> False
+    assert (
+        parse_gcloud_cluster_describe(
+            {
+                "autopilot": {"enabled": False},
+                "networkConfig": {"datapathProvider": "LEGACY_DATAPATH"},
+            }
+        ).network_policy_enforced
+        is False
+    )
+

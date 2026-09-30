@@ -608,3 +608,38 @@ def test_is_fqdn_network_policy_supported_per_cluster_context_and_cache():
             is True
         )
         mock_api_a.call_api.assert_not_called()
+
+    # Transient API error does not poison the cache; subsequent call succeeds
+    KubernetesClientManager.reset_fqdn_cache()
+    flaky_client = MagicMock()
+    flaky_client.call_api.side_effect = [
+        RuntimeError("transient timeout"),
+        ({"resources": [{"name": "fqdnnetworkpolicies"}]}, 200, {}),
+    ]
+    assert (
+        KubernetesClientManager.is_fqdn_network_policy_supported(
+            flaky_client,
+            cluster_name="flaky-cluster",
+            region="us-central1",
+            project_id="test-proj",
+        )
+        is False
+    )
+    assert (
+        KubernetesClientManager.is_fqdn_network_policy_supported(
+            flaky_client,
+            cluster_name="flaky-cluster",
+            region="us-central1",
+            project_id="test-proj",
+        )
+        is True
+    )
+
+    # reset_fqdn_cache also clears _CLUSTER_CAPABILITIES_CACHE
+    from harbor_gke_ext.cluster_probe import ClusterCapabilities
+    from harbor_gke_ext.environment import _CLUSTER_CAPABILITIES_CACHE
+
+    _CLUSTER_CAPABILITIES_CACHE[("p", "r", "c")] = ClusterCapabilities()
+    KubernetesClientManager.reset_fqdn_cache()
+    assert ("p", "r", "c") not in _CLUSTER_CAPABILITIES_CACHE
+

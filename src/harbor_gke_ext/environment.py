@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 import datetime
 import inspect
 import json
@@ -12,11 +11,12 @@ import threading
 import time
 import tomllib
 import uuid
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, override
+from typing import TYPE_CHECKING, Any, ClassVar, override
 
 import yaml
-
 from tenacity import (
     retry,
     retry_if_not_exception_type,
@@ -30,19 +30,28 @@ from harbor.environments.base import (
     ExecResult,
     HealthcheckError,
 )
-from harbor.models.task.config import HealthcheckConfig
 from harbor.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
-)
-from harbor.environments.definition import (
-    require_agent_environment_definition,
-    should_use_prebuilt_docker_image,
 )
 from harbor.environments.compose_service_ops import (
     ComposeServiceOpsMixin,
     ComposeServiceTransport,
 )
+from harbor.environments.definition import (
+    require_agent_environment_definition,
+    should_use_prebuilt_docker_image,
+)
+from harbor.models.task.config import (
+    EnvironmentConfig,
+    HealthcheckConfig,
+    NetworkMode,
+    NetworkPolicy,
+)
+from harbor.models.trial.config import ResourceMode
+from harbor.models.trial.paths import TrialPaths
+from harbor.utils.logger import logger
+from harbor.utils.optional_import import MissingExtraError
 from harbor_gke_ext.client import (
     KubernetesClientManager,
     _ensure_file_descriptor_limit,
@@ -52,13 +61,18 @@ from harbor_gke_ext.client import (
     reset_gcloud_cache,
     resolve_gke_target,
 )
+from harbor_gke_ext.cloud_build import (
+    check_image_exists_in_registry,
+    resolve_task_image_url,
+    submit_cloud_build,
+)
 from harbor_gke_ext.cluster_probe import (
     ClusterAdmissionController,
     ClusterCapabilities,
     DindAvailability,
+    _parse_machine_type_vcpus,
     parse_quantity_to_mib,
     probe_cluster_via_gcloud,
-    _parse_machine_type_vcpus,
     probe_max_node_ephemeral_storage_mb,
     probe_pod_level_resources_support,
 )
@@ -69,37 +83,26 @@ from harbor_gke_ext.compose_translator import (
     resolve_compose_infra_env,
     translate_compose,
 )
-from harbor_gke_ext.cloud_build import (
-    check_image_exists_in_registry,
-    resolve_task_image_url,
-    submit_cloud_build,
-)
-from harbor_gke_ext.image_plan import (
-    is_plan_published,
-    was_image_planned,
-)
-from harbor_gke_ext.image_ref import ImageResolver
-from harbor_gke_ext.placement import ComposePlacementMode
 from harbor_gke_ext.constants import (
+    _GKE_AUTOPILOT_DEFAULT_CONTAINER_STORAGE_MB,
+    _GKE_AUTOPILOT_MAX_GENERAL_PURPOSE_STORAGE_MB,
+    _GKE_CONTROL_PLANE_WRITE_MAX_ATTEMPTS,
     _GKE_DECOUPLED_LAUNCH_TIMEOUT_SEC,
-    _GKE_EXEC_KILL_TIMEOUT_SEC,
     _GKE_DEFAULT_AGENT_SETUP_TIMEOUT_SEC,
     _GKE_DEFAULT_AGENT_TIMEOUT_MINUTES,
     _GKE_DEFAULT_COMPOSE_UP_TIMEOUT_SEC,
     _GKE_DEFAULT_DEADLINE_BUFFER_MINUTES,
     _GKE_DEFAULT_VERIFIER_TIMEOUT_SEC,
     _GKE_EXEC_CONNECT_MAX_ATTEMPTS,
-    _GKE_CONTROL_PLANE_WRITE_MAX_ATTEMPTS,
+    _GKE_EXEC_KILL_TIMEOUT_SEC,
     _GKE_JOB_POD_SPAWN_TIMEOUT_SEC,
-    _GKE_AUTOPILOT_DEFAULT_CONTAINER_STORAGE_MB,
-    _GKE_AUTOPILOT_MAX_GENERAL_PURPOSE_STORAGE_MB,
     _GKE_WEBHOOK_CALL_FAILURE_MARKER,
     GKE_GPU_TYPE_MAP,
+    EphemeralStorageUnschedulableError,
     GKEExecStreamClosedError,
     PlacementConflictError,
     TrialContainerLostError,
     UnsatisfiableMachineTypeError,
-    EphemeralStorageUnschedulableError,
     _parse_bool,
     _sanitize_kubernetes_resource_name,
     resolve_gpu_accelerator_label,
@@ -116,33 +119,38 @@ from harbor_gke_ext.exec_engine import (
     build_supervised_script,
     check_pod_terminated,
     connect_exec_stream,
-    download_dir as ft_download_dir,
-    download_file as ft_download_file,
     poll_decoupled_exec,
     read_exec_output,
     run_best_effort,
     run_exec_command,
+)
+from harbor_gke_ext.exec_engine import (
+    download_dir as ft_download_dir,
+)
+from harbor_gke_ext.exec_engine import (
+    download_file as ft_download_file,
+)
+from harbor_gke_ext.exec_engine import (
     upload_dir as ft_upload_dir,
+)
+from harbor_gke_ext.exec_engine import (
     upload_file as ft_upload_file,
 )
 from harbor_gke_ext.exec_stream import ExecOutputAccumulator, ExecStream
+from harbor_gke_ext.image_plan import (
+    is_plan_published,
+    was_image_planned,
+)
+from harbor_gke_ext.image_ref import ImageResolver
 from harbor_gke_ext.network_policy import (
     apply_network_policy,
     delete_network_policies,
 )
+from harbor_gke_ext.placement import ComposePlacementMode
 from harbor_gke_ext.pod_builder import (
     build_direct_pod,
     build_job,
 )
-from harbor.models.task.config import (
-    EnvironmentConfig,
-    NetworkMode,
-    NetworkPolicy,
-)
-from harbor.models.trial.config import ResourceMode
-from harbor.models.trial.paths import TrialPaths
-from harbor.utils.logger import logger
-from harbor.utils.optional_import import MissingExtraError
 
 _KNOWN_EK_KEYS: frozenset[str] = frozenset(
     inspect.signature(BaseEnvironment.__init__).parameters
@@ -154,6 +162,7 @@ _KNOWN_EK_KEYS: frozenset[str] = frozenset(
         "agent_timeout_multiplier",
         "agent_timeout_sec",
         "allow_metadata_server",
+        "allow_pod_ingress",
         "autopilot",
         "cloud_build_disk_size_gb",
         "cloud_build_machine_type",
@@ -318,7 +327,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         namespace: str = "default",
         registry_name: str = "harbor-tasks",
         registry_location: str | None = None,
-        project_id: Optional[str] = None,
+        project_id: str | None = None,
         cpu_limit_multiplier: float | None = None,
         memory_limit_multiplier: float | None = None,
         cloud_build_machine_type: str | None = None,
@@ -328,9 +337,10 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         enable_fqdn_network_policy: bool | None = None,
         machine_type: str | None = None,
         node_pool: str | None = None,
-        pod_ready_timeout: int | float | None = None,
+        pod_ready_timeout: float | None = None,
         service_account_name: str | None = None,
         allow_metadata_server: bool = False,
+        allow_pod_ingress: bool = False,
         compose_mode: str = "auto",
         compose_placement: str | None = None,
         gpu_override: str | None = None,
@@ -408,6 +418,12 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._enable_fqdn_network_policy: bool | None = (
             _parse_bool(raw_fqdn) if raw_fqdn is not None else None
         )
+        raw_allow_ingress = (
+            allow_pod_ingress
+            if allow_pod_ingress is not False
+            else kwargs.get("allow_pod_ingress", False)
+        )
+        self.allow_pod_ingress: bool = _parse_bool(raw_allow_ingress, default=False)
         self._resolved_image_url: str | None = None
         self._force_build: bool = False
         self._client_manager: KubernetesClientManager | None = None
@@ -582,8 +598,8 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         )
         raw_allow_meta = (
             allow_metadata_server
-            if allow_metadata_server is not None
-            else kwargs.get("allow_metadata_server")
+            if allow_metadata_server is not False
+            else kwargs.get("allow_metadata_server", False)
         )
         self.allow_metadata_server: bool = _parse_bool(raw_allow_meta, default=False)
 
@@ -751,15 +767,19 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     @property
     @override
     def capabilities(self) -> EnvironmentCapabilities:
-        has_fqdn = self._fqdn_network_policy_supported
+        caps = _CLUSTER_CAPABILITIES_CACHE.get(
+            (self.project_id or "", self.location or "", self.cluster_name or "")
+        )
+        has_netpol = caps.network_policy_enforced is not False if caps else True
+        has_fqdn = has_netpol and self._fqdn_network_policy_supported
         return EnvironmentCapabilities(
             gpus=True,
             tpus=True,
-            disable_internet=True,
-            dynamic_network_policy=True,
-            network_allowlist=True,
-            network_allowlist_ipv4_cidrs=True,
-            network_allowlist_ipv4_addresses=True,
+            disable_internet=has_netpol,
+            dynamic_network_policy=has_netpol,
+            network_allowlist=has_netpol,
+            network_allowlist_ipv4_cidrs=has_netpol,
+            network_allowlist_ipv4_addresses=has_netpol,
             network_allowlist_hostnames=has_fqdn,
             network_allowlist_wildcard_hostnames=has_fqdn,
             docker_compose=True,
@@ -1121,6 +1141,27 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             _CLUSTER_CAPABILITIES_TASKS[cluster_key] = task
         return await task
 
+    def _verify_network_enforcement(self, caps: ClusterCapabilities) -> None:
+        """Fail closed if NetworkPolicy or metadata server blocking is required on an unenforced cluster."""
+        if (
+            self.network_policy.network_mode == NetworkMode.PUBLIC
+            and self.allow_metadata_server
+        ):
+            return
+        if caps.network_policy_enforced is False:
+            raise RuntimeError(
+                f"Cannot start trial for task {self.environment_name!r} on GKE cluster "
+                f"{self.cluster_name!r}: active Kubernetes NetworkPolicy enforcement is required "
+                f"(network_mode={self.network_policy.network_mode.value!r}, "
+                f"allow_metadata_server={self.allow_metadata_server}), but the cluster has neither "
+                "GKE Dataplane V2 (`--enable-dataplane-v2`) nor Calico (`--enable-network-policy`) "
+                "enabled. Without an active CNI enforcer, Kubernetes accepts NetworkPolicy resources "
+                "without filtering any traffic, leaving the GCE/GKE metadata server "
+                "(169.254.169.254 / 169.254.169.252) and egress unrestricted. "
+                "If this is a public-network task and you explicitly accept unisolated metadata "
+                "server access on this cluster, pass `--ek allow_metadata_server=true`."
+            )
+
     @override
     async def start(self, force_build: bool):
         """Start a pod in GKE."""
@@ -1132,6 +1173,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._compose_dind_probe_enabled = True
         # Capabilities are cached per cluster, so this costs one probe per process.
         caps = await self._get_cluster_capabilities(is_autopilot)
+        self._verify_network_enforcement(caps)
         # Refuse contradictory placement settings before anything is created.
         self._validate_placement(caps, is_autopilot=is_autopilot)
         self._active_compute_class = self._resolve_active_compute_class(
@@ -1267,20 +1309,25 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "image_resolver": self._image_resolver,
                 "task_dir": getattr(self, "task_dir", None)
                 or self.environment_dir.parent,
+                "allow_metadata_server": self.allow_metadata_server,
                 "logger": self.logger,
             }
             pod = self._build_compose_pod()
             self._created_pod = pod
+            self._sync_dind_container_routing(pod)
 
-            if (
+            needs_netpol = (
                 self.network_policy.network_mode != NetworkMode.PUBLIC
                 or not self.allow_metadata_server
-            ):
+            )
+            if needs_netpol and not self._dind_services:
                 await self._apply_network_policy(self.network_policy)
                 await asyncio.sleep(1.0)
             await self._create_pod(pod)
 
             await self._wait_for_pod_ready(timeout_sec=self.pod_ready_timeout)
+            if needs_netpol and self._dind_services:
+                await self._apply_network_policy(self.network_policy)
             await self._wait_for_container_exec_ready(container=MAIN_SERVICE_NAME)
 
             mkdir_result = await self.ensure_dirs(
@@ -1555,7 +1602,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
     def _build_compose_pod(
         self, compute_class: str | None | Any = _COMPUTE_CLASS_UNSET
-    ) -> "k8s_client.V1Pod":
+    ) -> k8s_client.V1Pod:
         if self._compose_spec_args is None:
             raise RuntimeError("Compose spec arguments not initialized")
         args = dict(self._compose_spec_args)
@@ -1573,7 +1620,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
     def _build_direct_pod(
         self, compute_class: str | None | Any = _COMPUTE_CLASS_UNSET
-    ) -> "k8s_client.V1Pod":
+    ) -> k8s_client.V1Pod:
         effective_compute_class = (
             self._active_compute_class
             if compute_class is _COMPUTE_CLASS_UNSET
@@ -1673,7 +1720,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         if isinstance(services, list) and services:
             self._dind_services = frozenset(str(s) for s in services)
 
-    def _peak_ephemeral_storage_request_mb(self, pod: "k8s_client.V1Pod") -> int:
+    def _peak_ephemeral_storage_request_mb(self, pod: k8s_client.V1Pod) -> int:
         """Peak ``ephemeral-storage`` the Pod will hold at once, in MiB.
 
         Init containers run one at a time and release nothing until the Pod ends,
@@ -1703,7 +1750,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         return max(app_total + sidecar_total + one_shot_peak, one_shot_peak)
 
     def _assert_ephemeral_storage_schedulable(
-        self, pod: "k8s_client.V1Pod", caps: ClusterCapabilities
+        self, pod: k8s_client.V1Pod, caps: ClusterCapabilities
     ) -> None:
         """Refuse a storage reservation no single node in the cluster can hold.
 
@@ -1738,7 +1785,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             f"{self.environment_name}=<mb>`."
         )
 
-    async def _create_pod(self, pod: "k8s_client.V1Pod") -> None:
+    async def _create_pod(self, pod: k8s_client.V1Pod) -> None:
         """Create a Job wrapping the Pod, retrying with runtimeClassName='gvisor' if Autopilot rejects capabilities."""
         self._created_pod = pod
         self._sync_dind_container_routing(pod)
@@ -1853,7 +1900,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             return f"involvedObject.uid={self._job_uid}"
         return f"involvedObject.name={self.job_name}"
 
-    async def _attempt_create_pod(self, pod: "k8s_client.V1Pod") -> None:
+    async def _attempt_create_pod(self, pod: k8s_client.V1Pod) -> None:
         """Execute a single attempt to create a Job or Pod in Kubernetes."""
         if self._batch_api is not None:
             self._job_uid = None
@@ -2237,6 +2284,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             pod_labels=pod_labels,
             policy_key=self.job_name,
             dns_egress_extra_cidrs=self.dns_egress_extra_cidrs,
+            allow_pod_ingress=self.allow_pod_ingress,
         )
         if self._pod_ready:
             settlement_sec = float(
@@ -2679,7 +2727,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     f"Path kind check for {path!r} timed out after {timeout_sec}s"
                 )
             return result.return_code == 0
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             self.logger.warning(
                 f"Path kind check timed out for {path!r}; raising to trigger extension fallback"
             )

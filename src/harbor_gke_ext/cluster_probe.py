@@ -89,6 +89,8 @@ class ClusterCapabilities:
     # satisfiable at all. `None` means unknown and must never block submission.
     max_node_allocatable_ephemeral_storage_mb: int | None = None
 
+    network_policy_enforced: bool | None = None
+
 
 _TOLERATED_TAINT_KEYS: frozenset[str] = frozenset(
     {
@@ -425,6 +427,7 @@ def evaluate_autopilot_dind_capability(
     node_auto_provisioning_enabled: bool = False,
     node_pool_machine_types: Sequence[tuple[str, str]] = (),
     max_node_allocatable_ephemeral_storage_mb: int | None = None,
+    network_policy_enforced: bool | None = None,
 ) -> ClusterCapabilities:
     """Evaluate DinD availability and cluster capabilities from GKE control-plane metadata.
 
@@ -446,6 +449,7 @@ def evaluate_autopilot_dind_capability(
             (str(name), str(mt)) for name, mt in node_pool_machine_types
         ),
         "max_node_allocatable_ephemeral_storage_mb": max_node_allocatable_ephemeral_storage_mb,
+        "network_policy_enforced": network_policy_enforced,
     }
 
     if not is_autopilot:
@@ -579,6 +583,23 @@ def parse_gcloud_cluster_describe(data: dict[str, Any]) -> ClusterCapabilities:
     cluster_autoscaling = data.get("autoscaling") or {}
     nap_enabled = bool(cluster_autoscaling.get("enableNodeAutoprovisioning", False))
 
+    net_pol_cfg = data.get("networkPolicy") or {}
+    addons_np = (data.get("addonsConfig") or {}).get("networkPolicyConfig") or {}
+    net_cfg = data.get("networkConfig") or {}
+    datapath_provider = str(net_cfg.get("datapathProvider") or "").strip().upper()
+    calico_enabled = bool(net_pol_cfg.get("enabled", False)) and not bool(
+        addons_np.get("disabled", False)
+    )
+    if is_autopilot or datapath_provider == "ADVANCED_DATAPATH" or calico_enabled:
+        network_policy_enforced: bool | None = True
+    elif any(
+        k in data
+        for k in ("networkPolicy", "networkConfig", "addonsConfig", "autopilot")
+    ):
+        network_policy_enforced = False
+    else:
+        network_policy_enforced = None
+
     return evaluate_autopilot_dind_capability(
         is_autopilot=is_autopilot,
         gke_version=str(gke_version) if gke_version else None,
@@ -591,6 +612,7 @@ def parse_gcloud_cluster_describe(data: dict[str, Any]) -> ClusterCapabilities:
         node_auto_provisioning_enabled=nap_enabled,
         node_pool_machine_types=_parse_node_pool_machine_types(data),
         max_node_allocatable_ephemeral_storage_mb=max_storage_mb,
+        network_policy_enforced=network_policy_enforced,
     )
 
 

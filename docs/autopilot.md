@@ -223,7 +223,7 @@ gcloud container clusters update "${CLUSTER_NAME}" \
 
 Across all cluster modes (both Autopilot and Standard), `GKEEnvironment._apply_network_policy()` runs **before** the Job and Pod are created:
 
-- **`public` mode with `allow_metadata_server=False` (default):** Creates a Pod-scoped egress `NetworkPolicy` before Job creation that permits `0.0.0.0/0` except `169.254.169.254/32`, permits `::/0` except `fd00:170::2/128`, and permits DNS egress on port `53`. This blocks the Pod from querying the GKE metadata server while leaving public internet access open.
+- **`public` mode with `allow_metadata_server=False` (default):** Creates a Pod-scoped egress `NetworkPolicy` that permits `0.0.0.0/0` except `169.254.169.254/32` and `169.254.169.252/32`, and permits DNS egress on port `53`. This blocks the Pod from querying the GKE metadata server while leaving public internet access open.
 - **`public` mode with `allow_metadata_server=True`:** Skips creating any `NetworkPolicy` at trial startup — or deletes any existing Pod-scoped policies if switched mid-trial — so the Pod has unrestricted egress including `169.254.169.254`.
 - **`allowlist` mode:** Creates a Pod-scoped `NetworkPolicy` for IP/CIDR rules (plus `169.254.169.254/32` TCP port `80` when `allow_metadata_server=True`, and DNS port `53` when any CIDR or hostname is allowlisted or the metadata-server rule is present) and a Pod-scoped `FQDNNetworkPolicy` when hostnames are present.
 - **`no-network` mode:** Creates a Pod-scoped `NetworkPolicy` with an empty egress list (`egress: []`), blocking all egress including DNS and the metadata server.

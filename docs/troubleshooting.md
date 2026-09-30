@@ -150,7 +150,7 @@ EphemeralStorageUnschedulableError: Task '<task>' requests <requested_mb> MiB of
 
 **Cause**
 
-On GKE Standard, a default `100 GB` `COS_CONTAINERD` node boot disk (`94.3 GiB` filesystem capacity after OS partitions and `ext4` metadata) provides **`43.8 GiB`** (`44,880 MiB`) of allocatable `ephemeral-storage` after GKE deducts the system reservation ($\min(35\% \times D + 6\text{ GiB},\; 100\text{ GiB}) = 41.0\text{ GiB}$) and the $10\%$ eviction threshold ($9.4\text{ GiB}$). If a Pod requests more ephemeral storage than any single node in the cluster can provide (through `task.toml` `storage_mb` on `main` or through `dind-engine`'s `/var/lib/docker` storage estimate), Kubernetes leaves the Pod `Pending` until timeout. Before submitting the Job, `harbor-gke-ext` compares the Pod's peak `ephemeral-storage` request with the largest allocatable ephemeral storage of any schedulable node and raises `EphemeralStorageUnschedulableError` instead. That ceiling is the larger of two values:
+On GKE Standard, a default `100 GB` `COS_CONTAINERD` node boot disk (`94.3 GiB` filesystem capacity after OS partitions and `ext4` metadata) provides **`43.8 GiB`** (`44,880 MiB`) of allocatable `ephemeral-storage` after GKE deducts the system reservation (`MIN(35% * D + 6 GiB, 100 GiB) = 41.0 GiB`) and the `10%` eviction threshold (`9.4 GiB`). If a Pod requests more ephemeral storage than any single node in the cluster can provide (through `task.toml` `storage_mb` on `main` or through `dind-engine`'s `/var/lib/docker` storage estimate), Kubernetes leaves the Pod `Pending` until timeout. Before submitting the Job, `harbor-gke-ext` compares the Pod's peak `ephemeral-storage` request with the largest allocatable ephemeral storage of any schedulable node and raises `EphemeralStorageUnschedulableError` instead. That ceiling is the larger of two values:
 
 - An estimate from the cluster's node pool configuration: the allocatable storage implied by the boot disk size (or, for Local SSD-backed ephemeral storage, the Local SSD count) of every untainted node pool whose maximum node count is above zero, including pools that are currently scaled to zero.
 - The largest allocatable `ephemeral-storage` among live nodes that are schedulable and have no blocking taint.
@@ -269,7 +269,7 @@ urllib3.exceptions.ConnectTimeoutError: Connection to 169.254.169.254 timed out.
 
 **Cause**
 
-`harbor-gke-ext` blocks egress to `169.254.169.254/32` (and `fd00:170::2/128`) by default across all network modes (`public`, `allowlist`, and `no-network`) so untrusted task code cannot access the node or Pod service account token. Allowlisting a Google Cloud hostname (such as `aiplatform.googleapis.com`) does **not** automatically unblock the metadata server.
+`harbor-gke-ext` blocks egress to `169.254.169.254/32` and `169.254.169.252/32` by default across all network modes (`public`, `allowlist`, and `no-network`) so untrusted task code cannot access the node or Pod service account token. Allowlisting a Google Cloud hostname (such as `aiplatform.googleapis.com`) does **not** automatically unblock the metadata server.
 
 **Resolution**
 

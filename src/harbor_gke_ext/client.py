@@ -425,9 +425,15 @@ class KubernetesClientManager:
 
     @classmethod
     def reset_fqdn_cache(cls) -> None:
-        """Reset the cached FQDN network policy support status."""
+        """Reset the cached FQDN network policy and cluster capability status."""
         cls._fqdn_supported = None
         cls._fqdn_supported_by_cluster.clear()
+        try:
+            from harbor_gke_ext.environment import _CLUSTER_CAPABILITIES_CACHE
+
+            _CLUSTER_CAPABILITIES_CACHE.clear()
+        except Exception:
+            pass
 
     @staticmethod
     def _find_matching_kube_context(
@@ -532,6 +538,7 @@ class KubernetesClientManager:
             return cls._fqdn_supported
 
         created_temp_client = False
+        cacheable = True
         try:
             if api_client is None:
                 api_client = cls._resolve_cluster_api_client(
@@ -558,9 +565,14 @@ class KubernetesClientManager:
                 )
             else:
                 supported = False
+        except ApiException as exc:
+            logger.debug("Failed to probe GKE FQDNNetworkPolicy CRD support: %s", exc)
+            supported = False
+            cacheable = exc.status == 404
         except Exception as exc:
             logger.debug("Failed to probe GKE FQDNNetworkPolicy CRD support: %s", exc)
             supported = False
+            cacheable = False
         finally:
             if created_temp_client and api_client is not None:
                 try:
@@ -568,9 +580,10 @@ class KubernetesClientManager:
                 except Exception:
                     pass
 
-        cls._fqdn_supported = supported
-        if has_cluster_identity:
-            cls._fqdn_supported_by_cluster[cluster_key] = supported
+        if cacheable:
+            cls._fqdn_supported = supported
+            if has_cluster_identity:
+                cls._fqdn_supported_by_cluster[cluster_key] = supported
         return supported
 
     def __init__(self):
