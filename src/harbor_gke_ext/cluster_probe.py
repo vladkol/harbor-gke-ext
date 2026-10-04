@@ -13,9 +13,10 @@ Why this module exists
    - Schedulable CPU (overall and on gVisor-capable pools), the machine-type
      inventory, and node auto-provisioning status.
    - An estimate of the largest node's allocatable ephemeral storage.
-3. Kubernetes API probes complement the describe output: the largest live
-   node's allocatable ephemeral storage, and a dry run that detects support for
-   Pod-level resources.
+3. Kubernetes API probes complement the describe output: a dry run that
+   detects support for Pod-level resources, the ``kube-dns`` Service ClusterIP,
+   and whether the ``networking.gke.io/v1alpha1`` API (FQDNNetworkPolicy) is
+   served.
 4. ``ClusterAdmissionController`` queues trials before Pod creation when
    in-flight Pods would exceed the cluster's schedulable CPU budget (overall or
    gVisor) or the optional ``max_concurrent_pods`` limit.
@@ -33,7 +34,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from harbor.utils.logger import logger
 
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)")
 _MACHINE_VCPU_RE = re.compile(r"-(\d+)(?:-[a-z0-9]+)?$")
@@ -93,6 +93,9 @@ class ClusterCapabilities:
     network_policy_enforced: bool | None = None
     kube_dns_cluster_ip: str | None = None
 
+    # --- FQDNNetworkPolicy (`networking.gke.io/v1alpha1`) ---
+    # Decides whether hostname allowlist entries can be enforced.
+    fqdn_network_policy_supported: bool = False
 
 
 _TOLERATED_TAINT_KEYS: frozenset[str] = frozenset(
@@ -106,17 +109,14 @@ _TOLERATED_TAINT_KEYS: frozenset[str] = frozenset(
 )
 
 
-def _has_blocking_taint(taints: Sequence[Any] | None) -> bool:
-    """Return True if any taint has a NoSchedule/NoExecute effect not tolerated by Harbor Pods."""
-    if not taints:
-        return False
-    for taint in taints:
-        if isinstance(taint, dict):
-            key = str(taint.get("key") or "").strip()
-            effect = str(taint.get("effect") or "").strip()
-        else:
-            key = str(getattr(taint, "key", "") or "").strip()
-            effect = str(getattr(taint, "effect", "") or "").strip()
+def _has_blocking_taint(taints: Sequence[dict[str, Any]] | None) -> bool:
+    """Return True if a node pool taint (``gcloud`` shape) blocks Harbor Pods.
+
+    That is a NoSchedule/NoExecute taint whose key Harbor Pods do not tolerate.
+    """
+    for taint in taints or ():
+        key = str(taint.get("key") or "").strip()
+        effect = str(taint.get("effect") or "").strip()
         normalized_effect = effect.upper().replace("_", "")
         if (
             normalized_effect in ("NOSCHEDULE", "NOEXECUTE")
@@ -319,16 +319,11 @@ class ClusterAdmissionController:
     unschedulable ``Pending`` Pods.
     """
 
-    def __init__(
-        self,
-        *,
-        max_cpu_cores: float | None = None,
-        max_gvisor_cpu_cores: float | None = None,
-        max_concurrent_pods: int | None = None,
-    ) -> None:
-        self.max_cpu_cores = max_cpu_cores
-        self.max_gvisor_cpu_cores = max_gvisor_cpu_cores
-        self.max_concurrent_pods = max_concurrent_pods
+    def __init__(self) -> None:
+        # Set by `configure` from the cluster's probed capacity.
+        self.max_cpu_cores: float | None = None
+        self.max_gvisor_cpu_cores: float | None = None
+        self.max_concurrent_pods: int | None = None
         self.in_flight_cpu: float = 0.0
         self.in_flight_gvisor_cpu: float = 0.0
         self.in_flight_pods: int = 0
@@ -431,7 +426,6 @@ def evaluate_autopilot_dind_capability(
     node_pool_machine_types: Sequence[tuple[str, str]] = (),
     max_node_allocatable_ephemeral_storage_mb: int | None = None,
     network_policy_enforced: bool | None = None,
-    kube_dns_cluster_ip: str | None = None,
 ) -> ClusterCapabilities:
     """Evaluate DinD availability and cluster capabilities from GKE control-plane metadata.
 
@@ -454,7 +448,6 @@ def evaluate_autopilot_dind_capability(
         ),
         "max_node_allocatable_ephemeral_storage_mb": max_node_allocatable_ephemeral_storage_mb,
         "network_policy_enforced": network_policy_enforced,
-        "kube_dns_cluster_ip": kube_dns_cluster_ip,
     }
 
     if not is_autopilot:
@@ -625,8 +618,14 @@ def probe_cluster_via_gcloud(
     cluster_name: str,
     project_id: str,
     location: str,
-) -> ClusterCapabilities | None:
-    """Fetch cluster metadata via ``gcloud`` CLI and evaluate capabilities."""
+) -> ClusterCapabilities:
+    """Describe the cluster with ``gcloud`` and evaluate its capabilities.
+
+    This is the authoritative source for Autopilot mode and NetworkPolicy
+    enforcement. It needs ``container.clusters.get``, the same permission
+    ``gcloud container clusters get-credentials`` needs. Any failure raises:
+    the environment must not declare capabilities it could not verify.
+    """
     cmd = [
         "gcloud",
         "container",
@@ -637,82 +636,81 @@ def probe_cluster_via_gcloud(
         f"--location={location}",
         "--format=json",
     ]
+    target = f"cluster {cluster_name!r} (project={project_id!r}, location={location!r})"
     try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=15,
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"`gcloud container clusters describe` failed for {target}: {exc}") from exc
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"`gcloud container clusters describe` failed for {target} "
+            f"(exit {res.returncode}): {res.stderr.strip()}"
         )
-        if res.returncode != 0:
-            logger.warning(
-                f"gcloud cluster describe failed (exit {res.returncode}): {res.stderr.strip()}"
-            )
-            return None
+    try:
         data = json.loads(res.stdout)
-        if not isinstance(data, dict):
-            return None
-        return parse_gcloud_cluster_describe(data)
-    except Exception as exc:
-        logger.warning(f"Failed to probe GKE cluster capabilities via gcloud: {exc}")
-        return None
-
-
-def probe_network_enforcement_and_dns_via_k8s(
-    core_api: Any,
-) -> tuple[bool | None, str | None]:
-    """Probe CNI NetworkPolicy enforcement and kube-dns ClusterIP via the Kubernetes API.
-
-    Used as a fallback for NetworkPolicy enforcement when ``gcloud container clusters describe``
-    is unavailable or lacks IAM permissions, and to discover the exact ``kube-dns`` Service
-    ClusterIP for scoped DNS egress rules.
-    """
-    if core_api is None:
-        return None, None
-
-    enforced: bool | None = None
-    try:
-        pods_resp = core_api.list_namespaced_pod(namespace="kube-system")
-        items = getattr(pods_resp, "items", None)
-        if isinstance(items, list) and items:
-            found_enforcer = False
-            for pod in items:
-                meta = getattr(pod, "metadata", None)
-                name = str(getattr(meta, "name", "") or "")
-                labels = getattr(meta, "labels", None) or {}
-                k8s_app = str(labels.get("k8s-app") or "")
-                if name.startswith(("anetd-", "cilium-", "calico-node-")) or k8s_app in (
-                    "anetd",
-                    "cilium",
-                    "calico-node",
-                ):
-                    found_enforcer = True
-                    break
-            enforced = found_enforcer
-    except Exception as exc:
-        logger.debug(
-            f"Could not list kube-system pods for CNI enforcement probe: {exc}"
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"`gcloud container clusters describe` returned invalid JSON for {target}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"`gcloud container clusters describe` returned a non-object document for {target}."
         )
+    caps = parse_gcloud_cluster_describe(data)
+    if caps.network_policy_enforced is None:
+        raise RuntimeError(
+            f"`gcloud container clusters describe` for {target} has no network "
+            "configuration, so NetworkPolicy enforcement cannot be determined."
+        )
+    return caps
 
-    dns_ip: str | None = None
+
+def probe_kube_dns_cluster_ip(core_api: Any) -> str | None:
+    """Read the ``kube-system/kube-dns`` Service ClusterIP for scoped DNS egress.
+
+    Returns ``None`` only for a definitive absence: no such Service (HTTP 404)
+    or a headless one. Any other failure raises.
+    """
     try:
         svc = core_api.read_namespaced_service(name="kube-dns", namespace="kube-system")
-        raw_ip = str(getattr(getattr(svc, "spec", None), "cluster_ip", "") or "").strip()
-        if raw_ip and raw_ip.lower() != "none":
-            ipaddress.ip_address(raw_ip)
-            dns_ip = raw_ip
     except Exception as exc:
-        logger.debug(f"Could not read kube-system/kube-dns service ClusterIP: {exc}")
+        if getattr(exc, "status", None) == 404:
+            return None
+        raise RuntimeError(f"Could not read the kube-system/kube-dns Service: {exc}") from exc
+    raw_ip = str(getattr(getattr(svc, "spec", None), "cluster_ip", "") or "").strip()
+    if not raw_ip or raw_ip.lower() == "none":
+        return None
+    ipaddress.ip_address(raw_ip)
+    return raw_ip
 
-    return enforced, dns_ip
 
+def probe_fqdn_network_policy_support(core_api: Any) -> bool:
+    """Ask the API server whether it serves the ``FQDNNetworkPolicy`` resource.
+
+    Reads the ``networking.gke.io/v1alpha1`` discovery document. Returns ``True``
+    if it lists ``fqdnnetworkpolicies`` and ``False`` if the group-version is
+    absent (HTTP 404) or does not list the resource. Any other failure raises.
+    """
+    from kubernetes import client as k8s_client
+
+    try:
+        resource_list = k8s_client.CustomObjectsApi(
+            core_api.api_client
+        ).get_api_resources("networking.gke.io", "v1alpha1")
+    except Exception as exc:
+        if getattr(exc, "status", None) == 404:
+            return False
+        raise RuntimeError(f"FQDNNetworkPolicy discovery probe failed: {exc}") from exc
+    return any(
+        r.name == "fqdnnetworkpolicies" for r in resource_list.resources or ()
+    )
 
 
 def probe_pod_level_resources_support(
     core_api: Any,
     *,
     namespace: str = "default",
-) -> bool | None:
+) -> bool:
     """Ask the API server whether it retains Pod-level ``spec.resources``.
 
     Submits a minimal Pod with ``dryRun=All`` and checks whether the field
@@ -724,11 +722,9 @@ def probe_pod_level_resources_support(
     switched off, and the field would then be pruned in silence. Asking the
     server what it will keep is the only answer that is true by construction.
 
-    Returns ``True`` if retained, ``False`` if pruned, and ``None`` if the probe
-    itself could not be completed -- which callers must treat as "unknown".
+    Returns ``True`` if retained and ``False`` if pruned. Raises if the probe
+    itself could not be completed.
     """
-    if core_api is None:
-        return None
     try:
         from kubernetes import client as k8s_client
 
@@ -765,8 +761,7 @@ def probe_pod_level_resources_support(
             # A 422 validation error referencing `spec.resources.*` only occurs
             # when the API server retained and validated `spec.resources`.
             return True
-        logger.debug(f"Pod-level resources dry-run probe did not complete: {exc}")
-        return None
+        raise RuntimeError(f"Pod-level resources dry-run probe failed: {exc}") from exc
 
     returned = getattr(getattr(echoed, "spec", None), "resources", None)
     return returned is not None and bool(
@@ -809,38 +804,3 @@ def parse_quantity_to_mib(quantity: str | None) -> int | None:
         return int(float(text) / (1024 * 1024))
     except ValueError:
         return None
-
-
-def probe_max_node_ephemeral_storage_mb(core_api: Any) -> int | None:
-    """Return the largest allocatable ``ephemeral-storage`` across schedulable nodes.
-
-    The maximum, not the sum: a Pod runs on exactly one node, so a reservation
-    larger than the biggest single node can never be satisfied no matter how many
-    nodes exist. Cordoned nodes and nodes with blocking NoSchedule/NoExecute taints
-    (such as ``CriticalAddonsOnly``) are excluded because Harbor trial Pods cannot
-    schedule onto them.
-
-    Returns ``None`` when nothing could be read. That is "unknown", and callers
-    must not treat it as "zero" -- on a cluster whose pools are all scaled to zero
-    this is also the honest answer, since autoscaling may yet produce a node.
-    """
-    if core_api is None:
-        return None
-    try:
-        nodes = core_api.list_node().items
-    except Exception as exc:
-        logger.debug(f"Could not list nodes for ephemeral-storage preflight: {exc}")
-        return None
-
-    best: int | None = None
-    for node in nodes:
-        spec = getattr(node, "spec", None)
-        if getattr(spec, "unschedulable", False):
-            continue
-        if _has_blocking_taint(getattr(spec, "taints", None)):
-            continue
-        allocatable = getattr(getattr(node, "status", None), "allocatable", None) or {}
-        parsed = parse_quantity_to_mib(allocatable.get("ephemeral-storage"))
-        if parsed is not None and (best is None or parsed > best):
-            best = parsed
-    return best

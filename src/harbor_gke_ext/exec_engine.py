@@ -337,13 +337,20 @@ async def connect_exec_stream(
                 limiter.record_overload()
             status_code = _extract_api_status_code(e)
             is_transient = status_code in (429, 500, 502, 503, 504)
+            # The handshake error alone cannot tell a dead Pod from a slow one, so
+            # these branches ask the Pod. A lost Pod is reported as such: Harbor's
+            # retry filter matches exception class names, and a lost trial must not
+            # look like an API failure. A Pod that is not scheduled lost nothing;
+            # it ends the retries with the handshake error.
             if not is_transient and status_code in (400, 404, 0):
                 try:
                     await check_pod_terminated(
                         api, pod_name, namespace, target_container=container
                     )
                     is_transient = True
-                except Exception:
+                except TrialContainerLostError as lost:
+                    raise lost from e
+                except RuntimeError:
                     is_transient = False
             elif is_transient and "container not found" in str(e.body or "").lower():
                 # Kubelet answers HTTP 500 "container not found" both while a container is
@@ -354,7 +361,9 @@ async def connect_exec_stream(
                     await check_pod_terminated(
                         api, pod_name, namespace, target_container=container
                     )
-                except Exception:
+                except TrialContainerLostError as lost:
+                    raise lost from e
+                except RuntimeError:
                     is_transient = False
 
             if is_transient and attempt < max_attempts - 1:
@@ -380,22 +389,6 @@ async def connect_exec_stream(
     raise RuntimeError(f"Exec connection to pod {pod_name} was never attempted")
 
 
-def make_connect_fn(
-    api: k8s_client.CoreV1Api,
-    pod_name: str,
-    namespace: str,
-    dind_services: frozenset[str] | None = None,
-) -> ConnectFn:
-    """Bind ``connect_exec_stream`` to one Pod."""
-
-    async def _connect(command: list[str], **kwargs: Any) -> ExecStream:
-        return await connect_exec_stream(
-            api, pod_name, namespace, command, dind_services=dind_services, **kwargs
-        )
-
-    return _connect
-
-
 async def read_exec_output(stream: ExecStream, output: ExecOutputAccumulator) -> None:
     """Feed a command's stdout and stderr into ``output`` until the stream ends.
 
@@ -409,11 +402,6 @@ async def read_exec_output(stream: ExecStream, output: ExecOutputAccumulator) ->
         f"Kubernetes exec stream {stream.label} ended before the command completed"
     )
     await output.finish()
-
-
-def exec_return_code(stream: ExecStream) -> int:
-    """Exit code of a completed exec; raises ``GKEExecStreamClosedError`` if unknown."""
-    return stream.returncode()
 
 
 async def collect_exec_bytes(stream: ExecStream) -> tuple[bytes, bytes]:
@@ -900,28 +888,29 @@ async def poll_decoupled_exec(
         await _sleep()
 
 
+_TAR_UPLOAD_CHUNK_BYTES = 256 * 1024
+_TAR_UPLOAD_MIN_TIMEOUT_SEC = 30.0
+_TAR_UPLOAD_SEC_PER_MIB = 5.0
+
+
 async def stream_tar_to_pod(
     stream: ExecStream,
     tar_buffer: io.BytesIO,
     pod_name: str,
-    *,
-    chunk_size: int = 256 * 1024,
-    timeout_sec: float | None = None,
 ) -> None:
     """Stream tar bytes into a remote extraction command and wait for it to finish.
 
     Each chunk write waits until the kernel accepted it, which is the flow control.
-    ``timeout_sec`` (default: 5 s per MiB, at least 30 s) bounds the whole
-    transfer, including the remote extraction.
+    A timeout of 5 s per MiB, at least 30 s, bounds the whole transfer, including
+    the remote extraction.
     """
     tar_buffer.seek(0, io.SEEK_END)
     total_bytes = tar_buffer.tell()
     tar_buffer.seek(0)
 
-    adaptive_timeout = (
-        timeout_sec
-        if timeout_sec is not None
-        else max(30.0, (total_bytes / (1024 * 1024)) * 5.0)
+    adaptive_timeout = max(
+        _TAR_UPLOAD_MIN_TIMEOUT_SEC,
+        (total_bytes / (1024 * 1024)) * _TAR_UPLOAD_SEC_PER_MIB,
     )
     stderr_buf = bytearray()
 
@@ -935,7 +924,7 @@ async def stream_tar_to_pod(
     try:
         try:
             async with asyncio.timeout(adaptive_timeout):
-                while chunk := tar_buffer.read(chunk_size):
+                while chunk := tar_buffer.read(_TAR_UPLOAD_CHUNK_BYTES):
                     if stream.is_closed:
                         err_msg = await _drain_stderr()
                         raise RuntimeError(

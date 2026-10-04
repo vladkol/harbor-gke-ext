@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from harbor_gke_ext.constants import (
+    _GKE_JOB_BACKOFF_LIMIT,
     GKE_NVIDIA_LDCONFIG_SNIPPET,
     _sanitize_kubernetes_resource_name,
     resolve_gpu_accelerator_label,
@@ -243,7 +244,17 @@ def build_job(
     ttl_seconds_after_finished: int = 120,
     annotations: dict[str, str] | None = None,
 ) -> k8s_client.V1Job:
-    """Wrap a V1PodSpec into a Kubernetes batch/v1 Job with a clean-up TTL."""
+    """Wrap a V1PodSpec into a Kubernetes batch/v1 Job with a clean-up TTL.
+
+    The Job, not Harbor, replaces a Pod lost to infrastructure, up to
+    `_GKE_JOB_BACKOFF_LIMIT` times. Kubernetes sets `DisruptionTarget` only for
+    disruptions the Pod did not cause (preemption, eviction, node loss), never
+    for exceeding its own limits. The rules are evaluated in order, and a
+    disrupted Pod's containers exit non-zero as well, so the disruption rule
+    must come first. Any other container failure fails the Job, as it would
+    fail a `docker run`. Harbor follows the replacement only until `start()`
+    returns (`GKEEnvironment._follow_job_replacement_pod`).
+    """
     active_deadline = getattr(pod_spec, "active_deadline_seconds", None)
     merged_annotations = {
         "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
@@ -261,7 +272,25 @@ def build_job(
         spec=k8s_client.V1JobSpec(
             ttl_seconds_after_finished=ttl_seconds_after_finished,
             active_deadline_seconds=active_deadline,
-            backoff_limit=0,
+            backoff_limit=_GKE_JOB_BACKOFF_LIMIT,
+            pod_failure_policy=k8s_client.V1PodFailurePolicy(
+                rules=[
+                    k8s_client.V1PodFailurePolicyRule(
+                        action="Count",
+                        on_pod_conditions=[
+                            k8s_client.V1PodFailurePolicyOnPodConditionsPattern(
+                                type="DisruptionTarget", status="True"
+                            )
+                        ],
+                    ),
+                    k8s_client.V1PodFailurePolicyRule(
+                        action="FailJob",
+                        on_exit_codes=k8s_client.V1PodFailurePolicyOnExitCodesRequirement(
+                            operator="NotIn", values=[0]
+                        ),
+                    ),
+                ]
+            ),
             template=k8s_client.V1PodTemplateSpec(
                 metadata=k8s_client.V1ObjectMeta(
                     labels=labels,

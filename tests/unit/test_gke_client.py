@@ -28,13 +28,9 @@ from harbor.utils.optional_import import MissingExtraError
 def _reset_client_globals():
     """Ensure singleton and executor globals are cleaned between tests."""
     KubernetesClientManager._instance = None
-    KubernetesClientManager.reset_fqdn_cache()
-    client_mod._GKE_EXEC_LAUNCH_SEMAPHORE = None
     yield
     KubernetesClientManager._instance = None
-    KubernetesClientManager.reset_fqdn_cache()
     _shutdown_exec_executor()
-    client_mod._GKE_EXEC_LAUNCH_SEMAPHORE = None
 
 
 # ── Global primitives and helper functions ─────────────────────────────
@@ -54,28 +50,28 @@ def test_shutdown_exec_executor_swallows_exception():
 def test_ensure_file_descriptor_limit():
     # 1. resource module unavailable
     with patch.dict("sys.modules", {"resource": None}):
-        _ensure_file_descriptor_limit(65536)
+        _ensure_file_descriptor_limit()
 
     # 2. soft limit already >= target
     mock_resource = MagicMock()
     mock_resource.RLIMIT_NOFILE = 7
     mock_resource.getrlimit.return_value = (70000, 100000)
     with patch.dict("sys.modules", {"resource": mock_resource}):
-        _ensure_file_descriptor_limit(65536)
+        _ensure_file_descriptor_limit()
         mock_resource.setrlimit.assert_not_called()
 
     # 3. soft limit < target < hard limit
     mock_resource.reset_mock()
     mock_resource.getrlimit.return_value = (1024, 100000)
     with patch.dict("sys.modules", {"resource": mock_resource}):
-        _ensure_file_descriptor_limit(65536)
+        _ensure_file_descriptor_limit()
         mock_resource.setrlimit.assert_called_once_with(7, (65536, 100000))
 
     # 4. target > hard limit (caps at hard limit)
     mock_resource.reset_mock()
     mock_resource.getrlimit.return_value = (1024, 4096)
     with patch.dict("sys.modules", {"resource": mock_resource}):
-        _ensure_file_descriptor_limit(65536)
+        _ensure_file_descriptor_limit()
         mock_resource.setrlimit.assert_called_once_with(7, (4096, 4096))
 
     # 5. setrlimit raises exception (swallowed)
@@ -83,7 +79,7 @@ def test_ensure_file_descriptor_limit():
     mock_resource.getrlimit.return_value = (1024, 100000)
     mock_resource.setrlimit.side_effect = OSError("Operation not permitted")
     with patch.dict("sys.modules", {"resource": mock_resource}):
-        _ensure_file_descriptor_limit(65536)  # Should not raise
+        _ensure_file_descriptor_limit()  # Should not raise
 
 
 @pytest.mark.unit
@@ -197,10 +193,6 @@ def test_is_matching_cluster():
 @pytest.mark.unit
 def test_timeout_api_client_call_api_and_close():
     client = TimeoutApiClient()
-    assert client.default_timeout == (
-        _GKE_API_CONNECT_TIMEOUT_SEC,
-        _GKE_API_READ_TIMEOUT_SEC,
-    )
 
     with patch("kubernetes.client.ApiClient.call_api") as mock_super_call:
         # Injects default timeout
@@ -307,103 +299,9 @@ def test_manager_init_missing_extra_error():
 
 
 @pytest.mark.unit
-@pytest.mark.asyncio
-async def test_manager_get_instance():
-    inst1 = await KubernetesClientManager.get_instance()
-    inst2 = await KubernetesClientManager.get_instance()
-    assert inst1 is inst2
-
-    # Verify RuntimeError if instance creation fails
-    with patch.object(KubernetesClientManager, "__new__", return_value=None):
-        KubernetesClientManager._instance = None
-        with pytest.raises(
-            RuntimeError, match="Failed to create KubernetesClientManager instance"
-        ):
-            await KubernetesClientManager.get_instance()
-
-
-@pytest.mark.unit
-def test_manager_fqdn_network_policy_supported():
-    KubernetesClientManager.reset_fqdn_cache()
-
-    mock_client = MagicMock()
-
-    # 1. CRD present
-    mock_client.call_api.return_value = (
-        {"resources": [{"name": "fqdnnetworkpolicies"}]},
-        200,
-        {},
-    )
-    assert KubernetesClientManager.is_fqdn_network_policy_supported(mock_client) is True
-    # Cached result returned immediately
-    assert KubernetesClientManager.is_fqdn_network_policy_supported() is True
-
-    # 2. CRD not present
-    KubernetesClientManager.reset_fqdn_cache()
-    mock_client.call_api.return_value = (
-        {"resources": [{"name": "networkpolicies"}]},
-        200,
-        {},
-    )
-    assert (
-        KubernetesClientManager.is_fqdn_network_policy_supported(mock_client) is False
-    )
-
-    # 3. Malformed response (not dict or no resources)
-    KubernetesClientManager.reset_fqdn_cache()
-    mock_client.call_api.return_value = ("not-dict", 200, {})
-    assert (
-        KubernetesClientManager.is_fqdn_network_policy_supported(mock_client) is False
-    )
-
-    # 4. API exception
-    KubernetesClientManager.reset_fqdn_cache()
-    mock_client.call_api.side_effect = RuntimeError("API failed")
-    assert (
-        KubernetesClientManager.is_fqdn_network_policy_supported(mock_client) is False
-    )
-
-    # 5. Default api_client instantiation branch (when api_client=None)
-    KubernetesClientManager.reset_fqdn_cache()
-    with (
-        patch("kubernetes.config.load_kube_config") as mock_load_cfg,
-        patch("kubernetes.client.ApiClient") as mock_api_cls,
-    ):
-        mock_inst = MagicMock()
-        mock_inst.call_api.return_value = (
-            {"resources": [{"name": "fqdnnetworkpolicies"}]},
-            200,
-            {},
-        )
-        mock_api_cls.return_value = mock_inst
-        assert KubernetesClientManager.is_fqdn_network_policy_supported() is True
-        mock_load_cfg.assert_called_once()
-
-    # 6. Default api_client instantiation when load_kube_config fails
-    KubernetesClientManager.reset_fqdn_cache()
-    with (
-        patch("kubernetes.config.load_kube_config", side_effect=Exception("no config")),
-        patch("kubernetes.client.ApiClient") as mock_api_cls,
-    ):
-        mock_inst = MagicMock()
-        mock_inst.call_api.return_value = (
-            {"resources": [{"name": "fqdnnetworkpolicies"}]},
-            200,
-            {},
-        )
-        mock_api_cls.return_value = mock_inst
-        assert KubernetesClientManager.is_fqdn_network_policy_supported() is True
-
-    # 7. Signature without response_types_map
-    KubernetesClientManager.reset_fqdn_cache()
-    mock_client = MagicMock()
-
-    # Replace call_api with a function that only accepts response_type
-    def custom_call_api(resource_path, method, response_type=None, auth_settings=None):
-        return ({"resources": [{"name": "fqdnnetworkpolicies"}]}, 200, {})
-
-    mock_client.call_api = custom_call_api
-    assert KubernetesClientManager.is_fqdn_network_policy_supported(mock_client) is True
+def test_manager_get_instance(monkeypatch):
+    monkeypatch.setattr(KubernetesClientManager, "_instance", None)
+    assert KubernetesClientManager.get_instance() is KubernetesClientManager.get_instance()
 
 
 @pytest.mark.unit
@@ -497,149 +395,74 @@ def test_manager_init_client_gcloud_fallback_success_and_failure():
 
 
 @pytest.mark.unit
-@pytest.mark.asyncio
-async def test_manager_get_client_and_release():
+def test_manager_configure_initializes_once_and_pins_the_cluster():
     mgr = KubernetesClientManager()
 
+    def fake_init(cluster_name, region, project_id):
+        mgr._initialized = True
+        mgr._cluster_name, mgr._region, mgr._project_id = cluster_name, region, project_id
+
     with (
-        patch.object(mgr, "_init_client") as mock_init,
-        patch("kubernetes.client.CoreV1Api") as mock_core_v1,
+        patch.object(mgr, "_init_client", side_effect=fake_init) as mock_init,
         patch("atexit.register") as mock_atexit,
     ):
-        mock_core_v1.side_effect = lambda api_client: MagicMock(api_client=api_client)
+        mgr.configure("cl", "us-central1", "p")
+        mgr.configure("cl", "us-central1", "p")
 
-        client1 = await mgr.get_client("cl", "us-central1", "p")
-        assert mgr._reference_count == 1
         mock_init.assert_called_once_with("cl", "us-central1", "p")
         mock_atexit.assert_called_once_with(mgr._cleanup_sync)
-        assert mgr._cleanup_registered is True
+        for other in (
+            ("diff-cl", "us-central1", "p"),
+            ("cl", "diff-region", "p"),
+            ("cl", "us-central1", "diff-p"),
+        ):
+            with pytest.raises(ValueError, match="already initialized for cluster"):
+                mgr.configure(*other)
 
-        # Second call with same cluster configuration
-        mgr._initialized = True
-        mgr._cluster_name = "cl"
-        mgr._region = "us-central1"
-        mgr._project_id = "p"
-        client2 = await mgr.get_client("cl", "us-central1", "p")
-        assert mgr._reference_count == 2
-        assert client1 is not client2
 
-        # Incompatible cluster configurations raise ValueError
-        with pytest.raises(ValueError, match="already initialized for cluster"):
-            await mgr.get_client("diff-cl", "us-central1", "p")
-
-        with pytest.raises(ValueError, match="already initialized for cluster"):
-            await mgr.get_client("cl", "diff-region", "p")
-
-        with pytest.raises(ValueError, match="already initialized for cluster"):
-            await mgr.get_client("cl", "us-central1", "diff-p")
-
-        # Release client with real TimeoutApiClient
-        with patch.object(client1.api_client, "close") as mock_close:
-            await mgr.release_client(client1)
-            mock_close.assert_called_once()
-        assert mgr._reference_count == 1
-
-        # Release client when api.api_client.close() raises exception (swallowed)
-        bad_client = MagicMock()
-        bad_client.api_client.close.side_effect = RuntimeError("close error")
-        await mgr.release_client(bad_client)
-        assert mgr._reference_count == 0
-
-        # Reference count does not drop below 0
-        await mgr.release_client()
-        assert mgr._reference_count == 0
+@pytest.fixture
+def configured_manager():
+    mgr = KubernetesClientManager()
+    with (
+        patch.object(mgr, "configure") as mock_configure,
+        patch("harbor_gke_ext.client.TimeoutApiClient", side_effect=MagicMock),
+        patch("kubernetes.client.CoreV1Api") as mock_core_v1,
+    ):
+        mock_core_v1.side_effect = lambda api_client: MagicMock(api_client=api_client)
+        yield mgr, mock_configure
 
 
 @pytest.mark.unit
-def test_is_fqdn_network_policy_supported_per_cluster_context_and_cache():
-    """Verify FQDNNetworkPolicy probe resolves target cluster context rather than ambient default and caches per cluster."""
-    KubernetesClientManager.reset_fqdn_cache()
+@pytest.mark.asyncio
+async def test_manager_get_client_and_release(configured_manager):
+    mgr, mock_configure = configured_manager
 
-    mock_api_a = MagicMock()
-    mock_api_a.call_api.return_value = (
-        {"resources": [{"name": "fqdnnetworkpolicies"}]},
-        200,
-        {},
-    )
-    mock_api_b = MagicMock()
-    mock_api_b.call_api.return_value = (
-        {"resources": [{"name": "redirectservices"}]},
-        200,
-        {},
-    )
+    client1 = await mgr.get_client("cl", "us-central1", "p")
+    client2 = await mgr.get_client("cl", "us-central1", "p")
+    assert client1 is not client2
+    assert client1.api_client is not client2.api_client
+    mock_configure.assert_called_with("cl", "us-central1", "p")
+    assert mgr._reference_count == 2
 
-    def _fake_resolve(cluster_name=None, region=None, project_id=None):
-        if cluster_name == "cluster-with-fqdn":
-            return mock_api_a
-        return mock_api_b
+    mgr.release_client(client1)
+    client1.api_client.close.assert_called_once()
+    assert mgr._reference_count == 1
 
-    with patch.object(
-        KubernetesClientManager,
-        "_resolve_cluster_api_client",
-        side_effect=_fake_resolve,
-    ):
-        assert (
-            KubernetesClientManager.is_fqdn_network_policy_supported(
-                api_client=None,
-                cluster_name="cluster-without-fqdn",
-                region="us-central1",
-                project_id="test-proj",
-            )
-            is False
-        )
-        assert (
-            KubernetesClientManager.is_fqdn_network_policy_supported(
-                api_client=None,
-                cluster_name="cluster-with-fqdn",
-                region="us-central1",
-                project_id="test-proj",
-            )
-            is True
-        )
-        # Verify cache hits do not re-call API
-        mock_api_a.call_api.reset_mock()
-        assert (
-            KubernetesClientManager.is_fqdn_network_policy_supported(
-                api_client=None,
-                cluster_name="cluster-with-fqdn",
-                region="us-central1",
-                project_id="test-proj",
-            )
-            is True
-        )
-        mock_api_a.call_api.assert_not_called()
+    # A failing close is swallowed; the count never drops below zero.
+    bad_client = MagicMock()
+    bad_client.api_client.close.side_effect = RuntimeError("close error")
+    mgr.release_client(bad_client)
+    mgr.release_client()
+    assert mgr._reference_count == 0
 
-    # Transient API error does not poison the cache; subsequent call succeeds
-    KubernetesClientManager.reset_fqdn_cache()
-    flaky_client = MagicMock()
-    flaky_client.call_api.side_effect = [
-        RuntimeError("transient timeout"),
-        ({"resources": [{"name": "fqdnnetworkpolicies"}]}, 200, {}),
-    ]
-    assert (
-        KubernetesClientManager.is_fqdn_network_policy_supported(
-            flaky_client,
-            cluster_name="flaky-cluster",
-            region="us-central1",
-            project_id="test-proj",
-        )
-        is False
-    )
-    assert (
-        KubernetesClientManager.is_fqdn_network_policy_supported(
-            flaky_client,
-            cluster_name="flaky-cluster",
-            region="us-central1",
-            project_id="test-proj",
-        )
-        is True
-    )
 
-    # reset_fqdn_cache also clears _CLUSTER_CAPABILITIES_CACHE
-    from harbor_gke_ext.cluster_probe import ClusterCapabilities
-    from harbor_gke_ext.environment import _CLUSTER_CAPABILITIES_CACHE
+@pytest.mark.unit
+def test_manager_scoped_client_closes_its_api_client(configured_manager):
+    mgr, mock_configure = configured_manager
 
-    _CLUSTER_CAPABILITIES_CACHE[("p", "r", "c")] = ClusterCapabilities()
-    KubernetesClientManager.reset_fqdn_cache()
-    assert ("p", "r", "c") not in _CLUSTER_CAPABILITIES_CACHE
+    with pytest.raises(RuntimeError, match="probe failed"):
+        with mgr.scoped_client("cl", "us-central1", "p") as api:
+            raise RuntimeError("probe failed")
 
+    mock_configure.assert_called_once_with("cl", "us-central1", "p")
+    api.api_client.close.assert_called_once()

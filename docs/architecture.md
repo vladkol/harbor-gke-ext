@@ -43,7 +43,7 @@ one or more containers. Nothing is shared between trials.
 
 ```mermaid
 graph TD
-  T["Harbor trial"] --> J["batch/v1 Job<br/>backoffLimit: 0<br/>ttlSecondsAfterFinished: 120"]
+  T["Harbor trial"] --> J["batch/v1 Job<br/>backoffLimit: 3 (disruptions only)<br/>ttlSecondsAfterFinished: 120"]
   J --> P["Pod<br/>restartPolicy: Never<br/>safe-to-evict: false"]
   P --> I["initContainers<br/>(seed, init services, sidecars, DinD plane)"]
   P --> M["containers<br/>main + post-main sidecars"]
@@ -55,9 +55,9 @@ Five deliberate choices shape everything downstream:
 | Choice | Value | Reason |
 | --- | --- | --- |
 | Workload kind | `batch/v1` Job | Gives a terminal state and a controller-managed cleanup path that a bare Pod does not have. |
-| `backoffLimit` | `0` | A trial is a measurement. Silently re-running a failed agent would corrupt the result. |
+| `backoffLimit` and `podFailurePolicy` | `3` (`_GKE_JOB_BACKOFF_LIMIT`); `DisruptionTarget` counts, any container failure fails the Job | A trial is a measurement. The Job replaces only a Pod lost to infrastructure (preemption, eviction, node loss), and Harbor adopts a replacement only until `start()` returns, so an agent never runs twice and a trial never moves to another Pod. |
 | `ttlSecondsAfterFinished` | `120` | Bounds the lifetime of finished objects so a large sweep cannot accumulate garbage in the namespace. |
-| `restartPolicy` | `Never` | Same reason as `backoffLimit: 0`, applied at the Pod level. |
+| `restartPolicy` | `Never` | A crashed container fails the Pod instead of restarting in place. `podFailurePolicy` requires it. |
 | `cluster-autoscaler.kubernetes.io/safe-to-evict` | `"false"` | Prevents the autoscaler from reclaiming a node underneath a trial that is mid-run. |
 
 The rationale behind each is recorded in [Design decisions](design-decisions.md).
@@ -121,7 +121,7 @@ sequenceDiagram
   participant P as Pod
 
   H->>E: preflight()
-  E->>E: verify gcloud and its auth, auth plugin, kubeconfig
+  E->>E: verify gcloud and its auth, auth plugin
   H->>E: start(force_build)
   E->>E: validate definition and accelerator config
   E->>AR: does task-<digest>:latest exist?
@@ -140,11 +140,14 @@ sequenceDiagram
 ```
 
 `preflight()` is a class method that runs once before any environment is
-constructed. It fails fast when `gcloud` is missing, no kubeconfig exists, or
+constructed. It fails fast when `gcloud` is missing or
 `gcloud` has no active authenticated account (unless
 `GOOGLE_APPLICATION_CREDENTIALS` points at a file). It warns when
 `gke-gcloud-auth-plugin` is absent, because GKE 1.26 and later require it for
-authentication.
+authentication. It does not check for a kubeconfig: Harbor calls it without
+the environment's arguments, so it cannot know the target cluster, and the
+client fetches credentials for that cluster itself when no kubeconfig context
+matches it.
 
 During `start()`, `_apply_network_policy()` runs **before** `_create_pod()` creates
 the `batch/v1` Job (whenever `network_mode != PUBLIC` or `allow_metadata_server` is
@@ -170,8 +173,8 @@ exec transports and the retry budgets.
 | `placement.py` | The classifier that decides, per service, native or Docker-in-Docker or fatal, and reconciles GPU declarations. |
 | `exec_stream.py` | The single-threaded exec stream reactor: non-blocking WebSocket I/O, frame parsing, keepalive pings, exit-status parsing, and incremental output decoding. |
 | `prebuild.py` | `CloudBuildPlugin` and the `harbor-gke-ext-prebuild` entry point for warming a registry ahead of a large job. |
-| `client.py` | `KubernetesClientManager`: cluster credential and kubeconfig context resolution (one cluster per process), per-caller timeout-bounded `ApiClient`s, the exec-handshake thread pool, and the `FQDNNetworkPolicy` capability cache. |
-| `cluster_probe.py` | Probes GKE Standard and Autopilot cluster capabilities (node pools, taints, NAP limits, machine-type inventory, `ephemeral-storage` ceiling, `spec.resources`, and Autopilot DinD admission), and provides `ClusterAdmissionController`, which queues trials before Pod creation when in-flight Pods would exceed the cluster's schedulable CPU budget (overall or gVisor) or the optional `max_concurrent_pods` limit. |
+| `client.py` | `KubernetesClientManager`: cluster credential and kubeconfig context resolution (one cluster per process), per-caller timeout-bounded `ApiClient`s, and the exec-handshake thread pool. |
+| `cluster_probe.py` | Probes GKE Standard and Autopilot cluster capabilities (node pools, taints, NAP limits, machine-type inventory, `ephemeral-storage` ceiling, `spec.resources`, `FQDNNetworkPolicy` support, and Autopilot DinD admission), and provides `ClusterAdmissionController`, which queues trials before Pod creation when in-flight Pods would exceed the cluster's schedulable CPU budget (overall or gVisor) or the optional `max_concurrent_pods` limit. |
 | `cloud_build.py` | Artifact Registry URL resolution, image existence checks, and gated Cloud Build submission. |
 | `image_plan.py` | Discovers every build context in a dataset (agent, verifier, Compose sidecars) and computes content digests. |
 | `compose_spec.py` | Normalizes Compose input through the official `docker compose config --format json` CLI. |
@@ -222,7 +225,7 @@ into those inner containers:
   transfers through `/var/run/harbor-dind/` via `docker cp`.
 
 Because `_dind_services` is bound to the `GKEEnvironment` instance before any Pod
-name exists, Job suffixes and Spot preemption Pod renames never affect exec routing.
+name exists, Job suffixes and replacement Pod names never affect exec routing.
 
 **Every Compose image string passes through `ImageResolver`.** Container images
 used to enter Pod specifications through six independent code paths, and only
@@ -284,16 +287,17 @@ carefully scoped shared state:
   (`exec_stream.py`), so the number of running commands is not bounded by a
   thread pool.
 - Cluster capability probing is cached per cluster, because the probe costs a
-  `gcloud` round trip and the answer does not change mid-run. Concurrent first
-  callers share one in-flight probe task, so the probe runs once per cluster per
-  process. A separate `asyncio.Lock` guards the Autopilot detection cache.
+  `gcloud` round trip and the answer does not change mid-run. The probe is
+  synchronous, because Harbor reads `capabilities` from the environment
+  constructor, and a `threading.Lock` makes concurrent first callers wait for
+  one probe. Async callers reach it through `asyncio.to_thread`. A failed probe
+  raises and is not cached.
 
-Most of these caches have explicit reset functions for tests
-(`reset_cluster_autopilot_cache()`, `reset_image_registry_cache()`,
-`reset_gcloud_cache()`, `reset_planned_images()`, and
-`KubernetesClientManager.reset_fqdn_cache()`). Tests reset the client
-singleton, the image build locks, and the control-plane limiter directly. A
-process is bound to one cluster.
+Synchronous per-process facts (the gcloud check, the default project, the
+Compose binary, OCI manifests, and the control-plane limiter) are memoized with
+`functools.cache`, which never stores a call that raised, so a transient failure
+is retried on the next call. The unit-test `conftest.py` clears every cache
+before and after each test. A process is bound to one cluster.
 
 ## Accelerators, networking, and storage
 
@@ -308,11 +312,10 @@ These three subsystems cut across the Pod shapes:
 - **Storage.** Ephemeral storage sizing, node-pool capacity verification, and
   ComputeClass selection are computed in `environment.py`, `cluster_probe.py`,
   and `pod_builder.py`. On **GKE Standard** (recommended), the storage ceiling is
-  the larger of two values: an estimate from the cluster's node-pool
-  configuration (`_parse_cluster_max_ephemeral_storage_mb()` in
-  `cluster_probe.py`, which counts every untainted pool with `maxNodes > 0`,
-  including scale-to-zero pools, plus the NAP defaults) and the largest live
-  node's allocatable `ephemeral-storage`. Before it creates the Job,
+  an estimate from the cluster's node-pool configuration
+  (`_parse_cluster_max_ephemeral_storage_mb()` in `cluster_probe.py`, which
+  counts every pool without a blocking taint and with `maxNodes > 0`,
+  including scale-to-zero pools, plus the NAP defaults). Before it creates the Job,
   `environment.py` compares the Pod's peak `ephemeral-storage` request with this
   cluster-wide ceiling. The check is skipped when the ceiling is unknown, on
   Autopilot, and when NAP is enabled. For Compose tasks,

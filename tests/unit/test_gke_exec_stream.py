@@ -13,13 +13,13 @@ import time
 
 import pytest
 
+from harbor_gke_ext import exec_stream
 from harbor_gke_ext.constants import GKEExecStreamClosedError
 from harbor_gke_ext.exec_stream import (
     END_CONNECTION_LOST,
     END_LOCAL_CLOSE,
     END_REMOTE_CLOSE,
     ExecOutputAccumulator,
-    ExecReactor,
     ExecStream,
     FrameParser,
     WebSocketProtocolError,
@@ -111,7 +111,7 @@ def test_parser_rejects_protocol_violations(wire):
 def test_parser_rejects_oversized_frames_before_buffering():
     header = struct.pack("!BBQ", 0x80 | OP_BINARY, 127, 1 << 40)
     with pytest.raises(WebSocketProtocolError):
-        FrameParser(max_message_bytes=1024).feed(header)
+        FrameParser().feed(header)
 
 
 # ─── Status parsing ────────────────────────────────────────────────────────────
@@ -192,7 +192,7 @@ async def test_stream_delivers_channels_status_and_replies_to_close():
     out, err = await asyncio.wait_for(_read_all(stream), 5)
     assert (out, err) == (b"out-1 out-2", b"err-1")
     assert stream.returncode() == 3
-    assert stream.end_reason == END_REMOTE_CLOSE
+    assert stream.describe_end() == END_REMOTE_CLOSE
     frames = await asyncio.to_thread(server.recv_frames, OP_CLOSE)
     assert frames[-1][0] == OP_CLOSE
 
@@ -205,7 +205,7 @@ async def test_stream_lost_without_status_raises_with_cause():
 
     out, _ = await asyncio.wait_for(_read_all(stream), 5)
     assert out == b"partial"
-    assert stream.end_reason == END_CONNECTION_LOST
+    assert stream.describe_end().startswith(END_CONNECTION_LOST)
     with pytest.raises(GKEExecStreamClosedError, match="ConnectionError"):
         stream.raise_unless_completed("ctx")
     with pytest.raises(GKEExecStreamClosedError):
@@ -217,7 +217,7 @@ async def test_status_then_eof_without_close_frame_counts_as_completed():
     stream = ExecStream.attach(server.client_sock, label="t")
     server.send(channel_frame(3, status_payload(0)))
     server.sock.close()
-    await asyncio.wait_for(stream.wait_closed(), 5)
+    await asyncio.wait_for(_read_all(stream), 5)
     stream.raise_unless_completed("ctx")
     assert stream.returncode() == 0
 
@@ -231,16 +231,13 @@ async def test_server_ping_gets_pong_with_same_payload():
     stream.close()
 
 
-async def test_reactor_sends_keepalive_pings():
-    reactor = ExecReactor(ping_interval_sec=0.05)
-    try:
-        server = ScriptedServer()
-        stream = ExecStream.attach(server.client_sock, label="t", reactor=reactor)
-        frames = await asyncio.to_thread(server.recv_frames, OP_PING, 3.0)
-        assert any(op == OP_PING for op, _ in frames)
-        stream.close()
-    finally:
-        reactor.stop()
+async def test_reactor_sends_keepalive_pings(monkeypatch):
+    monkeypatch.setattr(exec_stream, "_GKE_EXEC_STREAM_PING_INTERVAL_SEC", 0.05)
+    server = ScriptedServer()
+    stream = ExecStream.attach(server.client_sock, label="t")
+    frames = await asyncio.to_thread(server.recv_frames, OP_PING, 3.0)
+    assert any(op == OP_PING for op, _ in frames)
+    stream.close()
 
 
 async def test_local_close_is_non_blocking_and_fails_later_writes():
@@ -249,8 +246,8 @@ async def test_local_close_is_non_blocking_and_fails_later_writes():
     started = time.monotonic()
     stream.close()
     assert time.monotonic() - started < 0.05
-    assert await stream.wait_closed(5)
-    assert stream.end_reason == END_LOCAL_CLOSE
+    await asyncio.wait_for(_read_all(stream), 5)
+    assert stream.describe_end() == END_LOCAL_CLOSE
     frames = await asyncio.to_thread(server.recv_frames, OP_CLOSE)
     assert frames and frames[-1][0] == OP_CLOSE
     with pytest.raises(GKEExecStreamClosedError):
@@ -303,7 +300,7 @@ async def test_protocol_error_ends_stream_without_status():
     server = ScriptedServer()
     stream = ExecStream.attach(server.client_sock, label="t")
     server.send(server_frame(0x0, b"orphan continuation"))
-    assert await stream.wait_closed(5)
+    await asyncio.wait_for(_read_all(stream), 5)
     with pytest.raises(GKEExecStreamClosedError, match="protocol_error"):
         stream.raise_unless_completed("ctx")
 

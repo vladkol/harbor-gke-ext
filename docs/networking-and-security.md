@@ -50,7 +50,8 @@ allowed_hosts = [
 
 `GKEEnvironment.capabilities` reflects the actual dataplane capabilities of the target cluster:
 - `disable_internet`, `dynamic_network_policy`, `network_allowlist`, `network_allowlist_ipv4_cidrs`, and `network_allowlist_ipv4_addresses` are advertised only when the cluster has an active `NetworkPolicy` enforcer (GKE Dataplane V2 or Legacy Datapath + Calico; see [Cluster enforcement detection](#cluster-enforcement-detection-dataplane-v2-vs-calico)).
-- `network_allowlist_hostnames` and `network_allowlist_wildcard_hostnames` are advertised only when `FQDNNetworkPolicy` support is detected on the cluster (GKE Dataplane V2 with `--enable-fqdn-network-policy`) or forced with `--ek enable_fqdn_network_policy=true`.
+- `network_allowlist_hostnames` and `network_allowlist_wildcard_hostnames` are advertised only when, in addition, the API server serves `FQDNNetworkPolicy` (the `networking.gke.io/v1alpha1` discovery document lists `fqdnnetworkpolicies`).
+- Harbor may read `capabilities` from the environment constructor, so the first read in a process runs the cluster capability probe synchronously. If the probe cannot complete, it raises and nothing is declared or cached.
 
 When evaluating a non-empty allowlist:
 - The base `NetworkPolicy` includes `ipBlock` peers for every CIDR and bare IP address (normalized to `/32` for IPv4 and `/128` for IPv6), plus a unified DNS egress rule (UDP/TCP port 53). If `allow_metadata_server=True`, it also appends explicit egress rules for `169.254.169.254/32` (TCP ports `80` and `8080`) and `169.254.169.252/32` (TCP ports `988` and `987`, required when Workload Identity runs on Legacy Datapath + Calico).
@@ -140,11 +141,11 @@ If you set `allow_metadata_server=True`, **no `NetworkPolicy` is created at star
 
 A critical footgun in Kubernetes is that `networking.k8s.io/v1` `NetworkPolicy` is a declarative API resource: **the Kubernetes API server always accepts `NetworkPolicy` objects (`HTTP 201 Created`), even when the cluster has no CNI network policy controller installed to enforce them.** On a GKE Standard cluster created on the Legacy Datapath without `--enable-dataplane-v2` or `--enable-network-policy`, creating a `NetworkPolicy` succeeds in etcd while having **zero effect on Pod packets**.
 
-To prevent silent policy non-enforcement or metadata server exposure, `harbor-gke-ext` inspects the cluster's dataplane configuration during `_get_cluster_capabilities()` (`gcloud container clusters describe` with a Kubernetes API fallback inspecting `kube-system` CNI Pods `anetd`/`cilium`/`calico-node`) and sets `ClusterCapabilities.network_policy_enforced`:
+To prevent silent policy non-enforcement or metadata server exposure, `harbor-gke-ext` inspects the cluster's dataplane configuration during the cluster capability probe (`gcloud container clusters describe`) and sets `ClusterCapabilities.network_policy_enforced`. There is no fallback: if the describe fails, or its document has no network configuration, the probe raises.
 
 1. **GKE Autopilot (`autopilot.enabled: true`):** Always runs GKE Dataplane V2 (`network_policy_enforced=True`).
-2. **GKE Dataplane V2 (`networkConfig.datapathProvider == "ADVANCED_DATAPATH"` or `anetd`/`cilium` in `kube-system`):** Enforces `NetworkPolicy` in-kernel via Cilium eBPF (`network_policy_enforced=True`), and optionally supports `FQDNNetworkPolicy` when `/apis/networking.gke.io/v1alpha1` (`fqdnnetworkpolicies`) is registered on the cluster.
-3. **Legacy Datapath + Calico (`networkPolicy.enabled: true` and `addonsConfig.networkPolicyConfig.disabled != true`, or `calico-node` in `kube-system`):** Enforces L3/L4 `NetworkPolicy` via `calico-node` (`network_policy_enforced=True`, `fqdn_supported=False`).
+2. **GKE Dataplane V2 (`networkConfig.datapathProvider == "ADVANCED_DATAPATH"`):** Enforces `NetworkPolicy` in-kernel via Cilium eBPF (`network_policy_enforced=True`), and optionally supports `FQDNNetworkPolicy` when `/apis/networking.gke.io/v1alpha1` (`fqdnnetworkpolicies`) is registered on the cluster.
+3. **Legacy Datapath + Calico (`networkPolicy.enabled: true` and `addonsConfig.networkPolicyConfig.disabled != true`):** Enforces L3/L4 `NetworkPolicy` via `calico-node` (`network_policy_enforced=True`, `fqdn_supported=False`).
 4. **Legacy Datapath without Calico:** Sets `network_policy_enforced=False` and disables network-policy capabilities in `GKEEnvironment.capabilities`.
 
 ### Fail-closed startup verification
@@ -152,7 +153,6 @@ To prevent silent policy non-enforcement or metadata server exposure, `harbor-gk
 In `GKEEnvironment.start()`, whenever a trial requires network policy enforcement (`network_mode` is `no-network` or `allowlist`, or `allow_metadata_server=False` in `public` mode), `_verify_network_enforcement()` checks `ClusterCapabilities.network_policy_enforced`:
 
 - If the cluster has **no active `NetworkPolicy` enforcer (`network_policy_enforced=False`)**, `start()` fails closed immediately with a `RuntimeError` explaining how to enable Dataplane V2 (`--enable-dataplane-v2 --enable-fqdn-network-policy`) or Calico (`--enable-network-policy`), or how to opt out explicitly (`--ek allow_metadata_server=true` for unrestricted `public` tasks).
-- If enforcement **could not be verified (`network_policy_enforced=None`)** because neither `gcloud container clusters describe` nor `kube-system` Pod listing succeeded, `start()` also fails closed rather than failing open, unless the operator explicitly passes `--ek assume_network_policy_enforced=true`.
 - If a task requests hostname or wildcard allowlisting on a cluster without `FQDNNetworkPolicy` support, deployment fails closed during capability validation (`ValueError`) or policy application (`RuntimeError`).
 
 ### Why GKE Dataplane V2 is strongly recommended over Calico

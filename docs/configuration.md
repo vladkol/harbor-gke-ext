@@ -32,9 +32,9 @@ Harbor parses each `--ek` value as JSON before handing it to the environment. If
 the value is not valid JSON, the Python literals `True`, `False`, and `None` are
 recognized; any other value is passed as a string. For example:
 
-* `--ek autopilot=true` arrives as the boolean `True`.
+* `--ek allow_pod_ingress=true` arrives as the boolean `True`.
 * `--ek pod_ready_timeout=900` arrives as the integer `900`.
-* `--ek autopilot=yes` is not valid JSON, so it arrives as the string `"yes"`.
+* `--ek allow_pod_ingress=yes` is not valid JSON, so it arrives as the string `"yes"`.
 
 Boolean options are normalized by `_parse_bool`, which treats `true`, `1`, `yes`, `t`, `y`, and `on` as true (case-insensitive), and treats any other string (such as `false`, `0`, or `no`) as false.
 
@@ -58,7 +58,6 @@ Boolean options are normalized by `_parse_bool`, which treats `true`, `1`, `yes`
 | `region` | string | — | Fallback for `location`. Lowest precedence. |
 | `project_id` | string | Auto-detected | Google Cloud project that hosts the cluster, Artifact Registry, and Cloud Build. |
 | `namespace` | string | `default` | Kubernetes namespace for the Job, Pod, and network policies. |
-| `autopilot` | boolean | Auto-detected | Overrides automatic GKE Standard vs. Autopilot detection (`false` on Standard, `true` on Autopilot). |
 
 If `project_id`, `location` (`zone`/`region`), or `cluster_name` is omitted, `GKEEnvironment` first inspects the active `kubectl` context in `KUBECONFIG` / `~/.kube/config`. When the active context follows GKE's canonical naming (`gke_<project_id>_<location>_<cluster_name>`, written by `gcloud container clusters get-credentials`) and matches any explicitly provided `project_id`, `cluster_name`, and `location` (a zone and a region match when they share the same parent region), any omitted fields—including `project_id`—are filled from that context before checking host environment variables.
 
@@ -370,7 +369,6 @@ type is unrecognized.
 | :--- | :--- | :--- | :--- |
 | `allow_metadata_server` | boolean | `false` | Controls egress to the GCE metadata server (`169.254.169.254/32`) and GKE Workload Identity metadata proxy (`169.254.169.252/32`). When `false` (default), metadata egress is blocked in all network modes and `start()` verifies that the cluster enforces `NetworkPolicy`. When `true`, `public` mode creates no `NetworkPolicy` (and deletes any existing policy on update), while `allowlist` mode adds explicit TCP egress rules for `169.254.169.254/32` (ports `80`, `8080`) and `169.254.169.252/32` (ports `988`, `987`). |
 | `allow_pod_ingress` | boolean | `false` | Controls inbound Pod-to-Pod traffic. When `false` (default), every `NetworkPolicy` sets `policyTypes: ["Ingress", "Egress"]` with `ingress: []`, isolating concurrent trial Pods in the same namespace from one another. Set to `true` to emit `policyTypes: ["Egress"]` only. |
-| `enable_fqdn_network_policy` | boolean | Auto-detected | Forces or disables `FQDNNetworkPolicy` support instead of probing `/apis/networking.gke.io/v1alpha1`. |
 | `dns_egress_extra_cidrs` | string or list | `[]` | Comma-separated or list of additional CIDRs allowed on UDP/TCP port 53 alongside the default GKE cluster/VPC DNS egress rule. |
 | `network_policy_settlement_sec` | float | `2.0` | Pause after updating or deleting a `NetworkPolicy` on an already-running Pod (`_pod_ready=True`) so dataplane rules take effect before commands run. Not applied when creating the initial policy before the Job/Pod starts. Set to `0` to skip. |
 
@@ -538,7 +536,7 @@ The package reads the following fields from each task definition.
 | `[environment].gpu_types` | Preferred accelerators. Overridden by `gpu_override`, consulted before `default_gpu_type`. |
 | `[environment].tpu` | TPU `type` and `topology`. Mutually exclusive with GPUs. |
 | `[environment].cpus`, `memory_mb` | CPU and memory budget for the Pod. |
-| `[environment].storage_mb` | Ephemeral storage request for `main`, capped by `max_storage_request_mb`. On GKE Standard, the Pod's peak ephemeral-storage request (including `dind-engine`) is checked before Pod creation against a cluster-wide ceiling: the larger of an estimate from the node pool configuration (every untainted pool with `maxNodes > 0`, plus node auto-provisioning defaults) and the largest allocatable value among live nodes. The check is skipped when the ceiling is unknown, on Autopilot, and when node auto-provisioning is enabled. On Autopilot, `storage_mb` is part of the estimate that drives `Performance` promotion above 10,240 MiB. |
+| `[environment].storage_mb` | Ephemeral storage request for `main`, capped by `max_storage_request_mb`. On GKE Standard, the Pod's peak ephemeral-storage request (including `dind-engine`) is checked before Pod creation against a cluster-wide ceiling estimated from the node pool configuration (every pool without a blocking taint and with `maxNodes > 0`, plus node auto-provisioning defaults). The check is skipped when the ceiling is unknown, on Autopilot, and when node auto-provisioning is enabled. On Autopilot, `storage_mb` is part of the estimate that drives `Performance` promotion above 10,240 MiB. |
 | `[environment].workdir` | Default working directory for `exec` in `main`. Ignored for sidecars. |
 | `[environment].env` | Environment variables injected into `main` only. |
 | `[environment].network_mode` | Selects the network policy applied to the Pod. |
@@ -551,7 +549,7 @@ The package reads the following fields from each task definition.
 
 | Variable | Purpose |
 | :--- | :--- |
-| `KUBECONFIG` | Kubeconfig path. Defaults to `~/.kube/config`. The file must exist: preflight exits with an error that suggests `gcloud container clusters get-credentials` when it is missing. Used to infer `project_id`, `location`, and `cluster_name` from the active GKE context when they are omitted. Harbor connects through a kubeconfig context for the target cluster and runs `gcloud container clusters get-credentials` when no matching context is available. |
+| `KUBECONFIG` | Kubeconfig path. Defaults to `~/.kube/config`. The file need not exist. Used to infer `project_id`, `location`, and `cluster_name` from the active GKE context when they are omitted. Harbor connects through a kubeconfig context for the target cluster and runs `gcloud container clusters get-credentials` when no matching context is available. |
 | `GOOGLE_CLOUD_PROJECT` | First environment variable fallback for the default project. |
 | `CLOUDSDK_CORE_PROJECT` | Second environment variable fallback for the default project. |
 | `GCP_PROJECT` | Third environment variable fallback for the default project. |

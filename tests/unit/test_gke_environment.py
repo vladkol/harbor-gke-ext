@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -25,7 +27,7 @@ from harbor.models.task.config import (
 )
 from harbor.models.trial.paths import TrialPaths
 from harbor.utils.optional_import import MissingExtraError
-from harbor_gke_ext.cluster_probe import ClusterCapabilities
+from harbor_gke_ext.cluster_probe import ClusterCapabilities, DindAvailability
 from harbor_gke_ext.compose_translator import (
     DIND_STORAGE_FLOOR_MB,
     _GKENativeComposeServiceTransport,
@@ -39,30 +41,41 @@ from harbor_gke_ext.constants import (
 )
 from harbor_gke_ext.environment import (
     GKEEnvironment,
-    _get_cluster_autopilot_lock,
     _parse_bool,
-    reset_cluster_autopilot_cache,
 )
 from harbor_gke_ext.exec_stream import ExecOutputAccumulator
 
 
 @pytest.fixture(autouse=True)
-def _reset_globals():
-    """Reset module-level caches and singletons before/after tests."""
-    reset_cluster_autopilot_cache()
+def _reset_image_build_locks():
     GKEEnvironment._image_build_locks.clear()
     yield
-    reset_cluster_autopilot_cache()
     GKEEnvironment._image_build_locks.clear()
+
+
+def _cluster_caps(*, autopilot: bool = False, **overrides) -> ClusterCapabilities:
+    """What the capability probe reports for a healthy Dataplane V2 cluster."""
+    fields = {
+        "is_autopilot": autopilot,
+        "dind_availability": (
+            DindAvailability.DIND_UNAVAILABLE
+            if autopilot
+            else DindAvailability.DIND_AVAILABLE
+        ),
+        "network_policy_enforced": True,
+        "kube_dns_cluster_ip": "10.96.0.10",
+        "supports_pod_level_resources": True,
+    }
+    fields.update(overrides)
+    return ClusterCapabilities(**fields)
 
 
 @pytest.fixture(autouse=True)
 def mock_k8s_manager(monkeypatch):
-    """Mock the KubernetesClientManager singleton and APIs offline."""
+    """Mock the KubernetesClientManager singleton, APIs and cluster probes offline."""
     from harbor_gke_ext.client import _shutdown_exec_executor
 
     _shutdown_exec_executor()
-    env_mod.reset_cluster_autopilot_cache()
     mock_core_api = MagicMock()
     mock_core_api.api_client = MagicMock()
     mock_batch_api = MagicMock()
@@ -71,41 +84,43 @@ def mock_k8s_manager(monkeypatch):
 
     mock_mgr = MagicMock()
     mock_mgr.get_client = AsyncMock(return_value=mock_core_api)
-    mock_mgr.release_client = AsyncMock()
+    mock_mgr.scoped_client.side_effect = lambda *args: contextlib.nullcontext(
+        mock_core_api
+    )
 
     monkeypatch.setattr(
         env_mod.KubernetesClientManager,
         "get_instance",
-        AsyncMock(return_value=mock_mgr),
-    )
-    monkeypatch.setattr(
-        env_mod.KubernetesClientManager,
-        "is_fqdn_network_policy_supported",
-        classmethod(lambda cls, *args, **kwargs: False),
+        staticmethod(lambda: mock_mgr),
     )
     monkeypatch.setattr(
         "harbor_gke_ext.client.get_active_gke_context",
         lambda: None,
     )
-    monkeypatch.setattr(
-        env_mod,
-        "probe_cluster_via_gcloud",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        env_mod,
-        "probe_network_enforcement_and_dns_via_k8s",
-        lambda *args, **kwargs: (True, "10.96.0.10"),
-    )
+    probes = {
+        "probe_cluster_via_gcloud": MagicMock(
+            return_value=ClusterCapabilities(
+                is_autopilot=False,
+                dind_availability=DindAvailability.DIND_AVAILABLE,
+                network_policy_enforced=True,
+                max_node_allocatable_ephemeral_storage_mb=44_880,
+            )
+        ),
+        "probe_pod_level_resources_support": MagicMock(return_value=True),
+        "probe_kube_dns_cluster_ip": MagicMock(return_value="10.96.0.10"),
+        "probe_fqdn_network_policy_support": MagicMock(return_value=False),
+    }
+    for name, probe in probes.items():
+        monkeypatch.setattr(env_mod, name, probe)
     yield {
         "manager": mock_mgr,
         "core_api": mock_core_api,
         "batch_api": mock_batch_api,
         "networking_api": mock_networking_api,
         "custom_api": mock_custom_api,
+        "probes": probes,
     }
     _shutdown_exec_executor()
-    env_mod.reset_cluster_autopilot_cache()
 
 
 def make_gke_env(
@@ -122,6 +137,8 @@ def make_gke_env(
     trial_paths: TrialPaths | None = None,
     **kwargs,
 ) -> GKEEnvironment:
+    """Build an environment against a cluster already probed as Standard or
+    Autopilot (``mock_autopilot``). ``None`` leaves the cluster unprobed."""
     env_dir = tmp_path / "env"
     env_dir.mkdir(parents=True, exist_ok=True)
     if dockerfile is not None:
@@ -136,11 +153,13 @@ def make_gke_env(
 
     cfg = task_env_config or EnvironmentConfig(cpus=2, memory_mb=4096)
 
-    if "autopilot" not in kwargs and mock_autopilot is not None:
-        kwargs["autopilot"] = mock_autopilot
+    if mock_autopilot is not None:
+        env_mod._CLUSTER_CAPABILITIES_CACHE[(project_id, location, cluster_name)] = (
+            _cluster_caps(autopilot=mock_autopilot)
+        )
 
     env_name = kwargs.pop("environment_name", "test-env")
-    env = GKEEnvironment(
+    return GKEEnvironment(
         environment_dir=env_dir,
         environment_name=env_name,
         session_id=session_id,
@@ -152,9 +171,6 @@ def make_gke_env(
         registry_name=registry_name,
         **kwargs,
     )
-    if mock_autopilot is not None:
-        env._is_autopilot = mock_autopilot
-    return env
 
 
 def mock_monotonic_sequence(*values: float, start_default: float = 99999.0):
@@ -195,14 +211,6 @@ def test_parse_bool():
     assert _parse_bool("no") is False
     assert _parse_bool([1]) is True
     assert _parse_bool([]) is False
-
-
-@pytest.mark.unit
-def test_cluster_autopilot_lock():
-    lock1 = _get_cluster_autopilot_lock()
-    lock2 = _get_cluster_autopilot_lock()
-    assert lock1 is lock2
-    assert isinstance(lock1, asyncio.Lock)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,15 +269,6 @@ def test_preflight_unauthenticated_gcloud_fails(monkeypatch, tmp_path):
         mock_run.return_value = SimpleNamespace(returncode=0, stdout="\n")
         with pytest.raises(SystemExit, match="active authenticated gcloud account"):
             GKEEnvironment.preflight()
-
-
-@pytest.mark.unit
-def test_preflight_missing_kubeconfig(monkeypatch, tmp_path):
-    monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
-    monkeypatch.setenv("KUBECONFIG", str(tmp_path / "nonexistent_kubeconfig"))
-    with pytest.raises(SystemExit) as exc_info:
-        GKEEnvironment.preflight()
-    assert "Kubernetes credentials" in str(exc_info.value)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,9 +368,12 @@ def test_get_default_project(monkeypatch, tmp_path):
     env = make_gke_env(tmp_path, project_id=None)
     assert env.project_id == "google-env-proj"
 
-    # 4. Failure raises ValueError once cache is cleared
-    env_mod.reset_cluster_autopilot_cache()
-    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+
+
+@pytest.mark.unit
+def test_get_default_project_fails_without_any_source(monkeypatch, tmp_path):
+    for var in ("GCP_PROJECT", "GOOGLE_CLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"):
+        monkeypatch.delenv(var, raising=False)
     with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "cmd")):
         with pytest.raises(ValueError, match="No GCP project specified"):
             make_gke_env(tmp_path, project_id=None)
@@ -484,11 +486,10 @@ def test_accelerator_validation(tmp_path):
 
 @pytest.mark.unit
 def test_capabilities(tmp_path):
-    env = make_gke_env(tmp_path, enable_fqdn_network_policy=True)
+    env = make_gke_env(tmp_path)
     caps = env.capabilities
     assert caps.gpus is True
     assert caps.tpus is True
-    assert caps.network_allowlist_hostnames is True
     assert caps.docker_compose is True
 
     # Compose mode runs natively in Unified Native Pod, supporting GPU/TPU
@@ -619,83 +620,91 @@ async def test_build_and_push_image(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Autopilot Detection
+# 6. Cluster capability probe
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.unit
-@pytest.mark.asyncio
-async def test_is_autopilot_fallback_to_nodes(tmp_path, mock_k8s_manager):
+def test_capability_probe_merges_gcloud_and_kubernetes_answers(
+    tmp_path, mock_k8s_manager
+):
     env = make_gke_env(tmp_path, mock_autopilot=None)
 
-    mock_proc = MagicMock()
-    mock_proc.returncode = 1
-    mock_proc.communicate = AsyncMock(return_value=(b"", b"permission denied"))
+    caps = env._cluster_capabilities()
 
-    mock_node = MagicMock()
-    mock_node.metadata.labels = {"cloud.google.com/gke-autopilot": "true"}
-    mock_k8s_manager["core_api"].list_node.return_value = SimpleNamespace(
-        items=[mock_node]
+    assert caps.is_autopilot is False
+    assert caps.network_policy_enforced is True
+    assert caps.supports_pod_level_resources is True
+    assert caps.kube_dns_cluster_ip == "10.96.0.10"
+    assert caps.fqdn_network_policy_supported is False
+    # The node-pool estimate from `gcloud describe` is the storage ceiling.
+    assert caps.max_node_allocatable_ephemeral_storage_mb == 44_880
+    mock_k8s_manager["manager"].scoped_client.assert_called_once_with(
+        env.cluster_name, env.location, env.project_id
     )
-
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        with patch.object(env, "_ensure_client", AsyncMock()):
-            env._core_api = mock_k8s_manager["core_api"]
-            assert await env.is_autopilot() is True
+    mock_k8s_manager["probes"][
+        "probe_pod_level_resources_support"
+    ].assert_called_once_with(mock_k8s_manager["core_api"], namespace=env.namespace)
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_is_autopilot_fallback_to_nodepool_label(tmp_path, mock_k8s_manager):
-    env = make_gke_env(tmp_path, mock_autopilot=None)
+async def test_capability_probe_runs_once_per_cluster(tmp_path, mock_k8s_manager):
+    first = make_gke_env(tmp_path, mock_autopilot=None, session_id="trial-1")
+    second = make_gke_env(tmp_path, mock_autopilot=None, session_id="trial-2")
 
-    mock_proc = MagicMock()
-    mock_proc.returncode = 1
-    mock_proc.communicate = AsyncMock(return_value=(b"", b"err"))
-
-    mock_node = MagicMock()
-    mock_node.metadata.labels = {"cloud.google.com/gke-nodepool": "autopilot-pool-1"}
-    mock_k8s_manager["core_api"].list_node.return_value = SimpleNamespace(
-        items=[mock_node]
+    results = await asyncio.gather(
+        first._get_cluster_capabilities(), second._get_cluster_capabilities()
     )
+    assert second.capabilities == first.capabilities
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        with patch.object(env, "_ensure_client", AsyncMock()):
-            env._core_api = mock_k8s_manager["core_api"]
-            assert await env.is_autopilot() is True
+    assert results[0] is results[1]
+    mock_k8s_manager["probes"]["probe_cluster_via_gcloud"].assert_called_once()
 
 
 @pytest.mark.unit
-@pytest.mark.asyncio
-async def test_is_autopilot_fallback_fails(tmp_path, mock_k8s_manager):
+@pytest.mark.parametrize(
+    "failing_probe",
+    [
+        "probe_cluster_via_gcloud",
+        "probe_pod_level_resources_support",
+        "probe_kube_dns_cluster_ip",
+        "probe_fqdn_network_policy_support",
+    ],
+)
+def test_capability_probe_failure_raises_and_is_not_cached(
+    tmp_path, mock_k8s_manager, failing_probe
+):
+    """Unverified capabilities are never declared, and a later call retries."""
     env = make_gke_env(tmp_path, mock_autopilot=None)
+    probe = mock_k8s_manager["probes"][failing_probe]
+    healthy = probe.return_value
+    probe.side_effect = RuntimeError("probe failed")
 
-    mock_proc = MagicMock()
-    mock_proc.returncode = 1
-    mock_proc.communicate = AsyncMock(return_value=(b"", b"err"))
+    with pytest.raises(RuntimeError, match="probe failed"):
+        _ = env.capabilities
 
-    mock_k8s_manager["core_api"].list_node.side_effect = Exception(
-        "failed to list nodes"
-    )
-
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        with patch.object(env, "_ensure_client", AsyncMock()):
-            env._core_api = mock_k8s_manager["core_api"]
-            assert await env.is_autopilot() is False
+    probe.side_effect = None
+    probe.return_value = healthy
+    assert env.capabilities.disable_internet is True
 
 
 @pytest.mark.unit
-@pytest.mark.asyncio
-async def test_is_autopilot_concurrency(tmp_path):
-    env = make_gke_env(tmp_path, mock_autopilot=None)
-    mock_proc = MagicMock()
-    mock_proc.returncode = 0
-    mock_proc.communicate = AsyncMock(return_value=(b"true\n", b""))
+def test_constructor_refuses_isolated_task_on_cluster_without_enforcement(
+    tmp_path, mock_k8s_manager
+):
+    """Harbor validates network policy from the constructor through ``capabilities``."""
+    from harbor.models.task.config import NetworkMode, NetworkPolicy
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        res1, res2 = await asyncio.gather(env.is_autopilot(), env.is_autopilot())
-        assert res1 is True
-        assert res2 is True
+    mock_k8s_manager["probes"]["probe_cluster_via_gcloud"].return_value = (
+        _cluster_caps(network_policy_enforced=False)
+    )
+    with pytest.raises(ValueError):
+        make_gke_env(
+            tmp_path,
+            mock_autopilot=None,
+            network_policy=NetworkPolicy(network_mode=NetworkMode.NO_NETWORK),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -905,7 +914,7 @@ def test_resolve_active_compute_class(tmp_path):
 
     # 5. Node pool specified returns None
     env_nodepool = make_gke_env(tmp_path, node_pool="my-pool", compute_class="General")
-    assert env_nodepool._resolve_active_compute_class() is None
+    assert env_nodepool._resolve_active_compute_class(is_autopilot=False) is None
 
     # 6. Autopilot fallback default None
     env_default = make_gke_env(tmp_path, mock_autopilot=True)
@@ -937,52 +946,91 @@ def test_dind_compose_pod_promotes_to_performance(tmp_path, monkeypatch):
 
 @pytest.mark.unit
 def test_dind_placement_probe_never_runs_from_constructor(tmp_path, monkeypatch):
-    """Determining DinD placement shells out, which must not happen in __init__."""
+    """Resolving Compose placement shells out, which must not happen in __init__."""
 
     def _explode(*_args, **_kwargs):
-        raise AssertionError(
-            "normalize_compose_project must not run during construction"
-        )
+        raise AssertionError("Compose placement must not be resolved in __init__")
 
     monkeypatch.setattr(
-        "harbor_gke_ext.compose_spec.normalize_compose_project", _explode
+        "harbor_gke_ext.environment.resolve_compose_placement", _explode
     )
 
     env = make_gke_env(
         tmp_path,
+        compose_yaml="services:\n  main:\n    image: busybox\n    privileged: true\n",
         mock_autopilot=True,
         task_env_config=EnvironmentConfig(storage_mb=1024),
+        dind_node_pool="dind-pool",
     )
-    env._compose_mode = True
 
-    assert env._compose_dind_probe_enabled is False
     assert env._compose_needs_dind() is False
+
+
+_GPU_RESERVATION = (
+    "    deploy:\n"
+    "      resources:\n"
+    "        reservations:\n"
+    "          devices:\n"
+    "            - driver: nvidia\n"
+    "              count: 1\n"
+    "              capabilities: [gpu]\n"
+)
 
 
 @pytest.mark.unit
-def test_dind_placement_probe_is_computed_once(tmp_path, monkeypatch):
-    """The subprocess is on every trial's path, so the answer must be cached."""
-    compose_file = tmp_path / "extra-compose.yaml"
-    compose_file.write_text("services:\n  main:\n    image: busybox\n")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("main_extra", "task_gpus"),
+    [
+        pytest.param("", {}, id="cpu"),
+        pytest.param(
+            _GPU_RESERVATION, {"gpus": 1, "gpu_types": ["nvidia-l4"]}, id="gpu"
+        ),
+    ],
+)
+async def test_start_fences_a_dind_compose_pod_before_its_services_run(
+    tmp_path, main_extra, task_gpus
+):
+    """An internet-off Pod with a DinD plane must not run services before its policy.
 
-    env = make_gke_env(tmp_path, mock_autopilot=True)
-    env._compose_mode = True
-    env._compose_dind_probe_enabled = True
-    env.extra_docker_compose_paths = [compose_file]
-
-    calls: list[int] = []
-
-    def _fake_normalize(*_args, **_kwargs):
-        calls.append(1)
-        raise RuntimeError("docker is unavailable in unit tests")
-
-    monkeypatch.setattr(
-        "harbor_gke_ext.compose_spec.normalize_compose_project", _fake_normalize
+    The DinD services start when `dind-pull` exits. Unless `dind-pull` waits for
+    the NetworkPolicy handshake, they run with open egress until `start()`
+    applies the policy after the Pod is ready. The DinD Pod is also privileged,
+    so it belongs on `dind_node_pool`. Both follow from the placement the Pod is
+    actually built with, GPU task or not.
+    """
+    env = make_gke_env(
+        tmp_path,
+        compose_yaml=(
+            "services:\n"
+            "  main:\n"
+            "    image: python:3.12-slim\n"
+            f"{main_extra}"
+            "  helper:\n"
+            "    image: docker:27-dind\n"
+            "    privileged: true\n"
+        ),
+        task_env_config=EnvironmentConfig(
+            cpus=2, memory_mb=4096, network_mode="no-network", **task_gpus
+        ),
+        dind_node_pool="dind-pool",
     )
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch.object(env, "_image_exists", AsyncMock(return_value=True)),
+        patch.object(env, "_apply_network_policy", AsyncMock()),
+        patch.object(env, "_create_pod", AsyncMock()) as mock_create,
+        patch.object(env, "_wait_for_pod_ready", AsyncMock()),
+        patch.object(env, "_wait_for_container_exec_ready", AsyncMock()),
+        patch.object(env, "ensure_dirs", AsyncMock(return_value=None)),
+        patch.object(env, "_upload_environment_dir_after_start", AsyncMock()),
+    ):
+        await env.start(force_build=False)
 
-    assert env._compose_needs_dind() is False
-    assert env._compose_needs_dind() is False
-    assert len(calls) == 1
+    (pod,) = mock_create.await_args.args
+    (dind_pull,) = [c for c in pod.spec.init_containers if c.name == "dind-pull"]
+    assert ".netpol-applied" in " ".join(dind_pull.command + (dind_pull.args or []))
+    assert pod.spec.node_selector["cloud.google.com/gke-nodepool"] == "dind-pool"
 
 
 @pytest.mark.unit
@@ -1038,7 +1086,7 @@ def test_task_node_pool_suppresses_compute_class(tmp_path):
         task_compute_classes="test-env=Scale-Out",
     )
     assert env._active_node_pool == "dind-pool"
-    assert env._resolve_active_compute_class() is None
+    assert env._resolve_active_compute_class(is_autopilot=False) is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1253,7 +1301,7 @@ def _listed_pod(name: str, deletion_timestamp=None) -> SimpleNamespace:
 async def test_create_job_retries_webhook_overload_and_shrinks_limiter(
     tmp_path, mock_k8s_manager
 ):
-    from harbor_gke_ext.control_plane import get_control_plane_limiter
+    from limiter_probe import free_slots
 
     env = make_gke_env(tmp_path)
     await env._ensure_client()
@@ -1282,7 +1330,7 @@ async def test_create_job_retries_webhook_overload_and_shrinks_limiter(
     assert 1.6 <= delays[0] <= 2.4
     assert 3.2 <= delays[1] <= 4.8
     # Both failures fell inside one cooldown: a single halving.
-    assert get_control_plane_limiter().limit == 64
+    assert await free_slots() == 64
 
 
 @pytest.mark.unit
@@ -1371,7 +1419,7 @@ async def test_create_job_resolves_pod_by_controller_uid_and_skips_terminating(
 async def test_create_job_tolerates_webhook_overload_failed_create_event(
     tmp_path, mock_k8s_manager
 ):
-    from harbor_gke_ext.control_plane import get_control_plane_limiter
+    from limiter_probe import free_slots
 
     env = make_gke_env(tmp_path)
     await env._ensure_client()
@@ -1403,28 +1451,7 @@ async def test_create_job_tolerates_webhook_overload_failed_create_event(
 
     assert env.pod_name == "spawned-pod"
     # The same event seen on two polls counts as one overload signal.
-    assert get_control_plane_limiter().limit == 64
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_reresolve_pod_name_uses_controller_uid_when_known(
-    tmp_path, mock_k8s_manager
-):
-    env = make_gke_env(tmp_path)
-    await env._ensure_client()
-    env._job_uid = "uid-new"
-    mock_k8s_manager["core_api"].list_namespaced_pod.return_value = SimpleNamespace(
-        items=[
-            SimpleNamespace(
-                metadata=SimpleNamespace(name="replacement", deletion_timestamp=None),
-                status=SimpleNamespace(phase="Running", reason=None),
-            )
-        ]
-    )
-    assert await env._reresolve_pod_name() == "replacement"
-    call = mock_k8s_manager["core_api"].list_namespaced_pod.call_args
-    assert call.kwargs["label_selector"] == "batch.kubernetes.io/controller-uid=uid-new"
+    assert await free_slots() == 64
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1498,14 +1525,16 @@ async def test_start_direct_pod_mkdir_failure(tmp_path):
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_start_compose_dind_mode_enables_sidecar(tmp_path):
+    # Forced DinD placement needs a cluster that allows DinD (Standard);
+    # Autopilot refuses it with AUTOPILOT_DIND_UNAVAILABLE.
     env = make_gke_env(
         tmp_path,
         compose_yaml="services:\n  app:\n    image: nginx\n",
         compose_mode="dind",
+        mock_autopilot=False,
     )
     with (
         patch.object(env, "_ensure_client", AsyncMock()),
-        patch.object(env, "is_autopilot", AsyncMock(return_value=True)),
         patch(
             "harbor_gke_ext.environment.discover_compose_build_services",
             return_value={},
@@ -1520,7 +1549,7 @@ async def test_start_compose_dind_mode_enables_sidecar(tmp_path):
     ):
         await env.start(force_build=False)
         assert env._compose_spec_args["compose_placement"] == "dind"
-        assert env._compose_spec_args["is_autopilot"] is True
+        assert env._compose_spec_args["is_autopilot"] is False
 
 
 @pytest.mark.unit
@@ -1664,7 +1693,7 @@ async def test_stop_delete_pod_and_release(tmp_path, mock_k8s_manager):
         mock_del_net.assert_awaited_once()
         mock_k8s_manager["batch_api"].delete_namespaced_job.assert_called_once()
         mock_k8s_manager["core_api"].delete_namespaced_pod.assert_called_once()
-        mock_k8s_manager["manager"].release_client.assert_awaited_once()
+        mock_k8s_manager["manager"].release_client.assert_called_once()
         assert env._core_api is None
 
 
@@ -1683,7 +1712,7 @@ async def test_stop_delete_handles_api_exception(tmp_path, mock_k8s_manager):
 
     # Should log warnings and not raise, but still release client
     await env.stop(delete=True)
-    mock_k8s_manager["manager"].release_client.assert_awaited_once()
+    mock_k8s_manager["manager"].release_client.assert_called_once()
 
 
 _MIB = 1024 * 1024
@@ -2115,7 +2144,7 @@ async def test_wait_for_container_exec_ready_retries_until_true_executes(
 
     fake_kubelet.status_override = status_for_attempt
     with patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()):
-        await local_exec_env._wait_for_container_exec_ready(max_attempts=5)
+        await local_exec_env._wait_for_container_exec_ready()
 
     assert len(fake_kubelet.connections) == 3
     assert attempts == 3
@@ -2675,6 +2704,142 @@ async def test_wait_for_pod_ready_image_pull_backoff(tmp_path, mock_k8s_manager)
         await env._wait_for_pod_ready(timeout_sec=5)
 
 
+def _trial_pod(
+    name: str,
+    *,
+    phase: str = "Running",
+    deleting: bool = False,
+    disrupted: bool = False,
+) -> SimpleNamespace:
+    """A Pod as `read_namespaced_pod` returns it; Running Pods have `main` ready."""
+    import datetime as dt
+
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name=name,
+            annotations={},
+            deletion_timestamp=dt.datetime.now(dt.UTC) if deleting else None,
+        ),
+        status=SimpleNamespace(
+            phase=phase,
+            reason=None,
+            conditions=(
+                [SimpleNamespace(type="DisruptionTarget", status="True")]
+                if disrupted
+                else []
+            ),
+            container_statuses=(
+                [SimpleNamespace(name="main", ready=True, state=None)]
+                if phase == "Running"
+                else []
+            ),
+            init_container_statuses=[],
+        ),
+    )
+
+
+def _serve_pods(core_api: MagicMock, pods: dict[str, SimpleNamespace]) -> None:
+    """Back reads and the Job's Pod list with ``pods``; a missing name reads as 404."""
+
+    def read(name: str, namespace: str) -> SimpleNamespace:
+        if name not in pods:
+            raise ApiException(status=404, reason="Not Found")
+        return pods[name]
+
+    core_api.read_namespaced_pod.side_effect = read
+    core_api.list_namespaced_pod.side_effect = lambda **_: SimpleNamespace(
+        items=list(pods.values())
+    )
+    core_api.list_namespaced_event.return_value = SimpleNamespace(items=[])
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "old_pod, expected_pod",
+    [
+        # The incident: preempted moments after binding, yet reported Running and ready.
+        (
+            _trial_pod("old-pod", deleting=True, disrupted=True),
+            "new-pod",
+        ),
+        # Node-pressure eviction leaves a Failed Pod object behind, with no deletion.
+        (
+            _trial_pod("old-pod", phase="Failed", disrupted=True),
+            "new-pod",
+        ),
+        # Already gone, for example force-deleted by Pod GC after node loss.
+        (None, "new-pod"),
+        # Kubernetes may set the condition and then not delete the Pod.
+        (_trial_pod("old-pod", disrupted=True), "old-pod"),
+    ],
+    ids=["preempted", "evicted", "vanished", "condition_without_deletion"],
+)
+async def test_wait_for_pod_ready_follows_the_jobs_replacement_pod(
+    tmp_path, mock_k8s_manager, old_pod, expected_pod
+):
+    """A disrupted Pod is replaced by the Job controller; readiness must follow it.
+
+    State earned by the lost Pod (seed upload, DinD NetworkPolicy handshake,
+    main-ready gate) must not carry over to its replacement.
+    """
+    env = make_gke_env(tmp_path)
+    await env._ensure_client()
+    env.pod_name = "old-pod"
+    env._job_uid = "uid-job"
+    env._seed_uploaded = env._dind_netpol_applied = env._main_gate_released = True
+    pods = {"new-pod": _trial_pod("new-pod")}
+    if old_pod is not None:
+        pods = {"old-pod": old_pod, **pods}
+    _serve_pods(mock_k8s_manager["core_api"], pods)
+
+    with patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()):
+        await env._wait_for_pod_ready(timeout_sec=30)
+
+    assert env.pod_name == expected_pod
+    followed = expected_pod != "old-pod"
+    assert (env._seed_uploaded, env._dind_netpol_applied, env._main_gate_released) == (
+        (False, False, False) if followed else (True, True, True)
+    )
+    if followed:
+        call = mock_k8s_manager["core_api"].list_namespaced_pod.call_args
+        assert call.kwargs["label_selector"] == (
+            "batch.kubernetes.io/controller-uid=uid-job"
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_wait_for_pod_ready_fails_fast_when_the_job_gives_up(
+    tmp_path, mock_k8s_manager
+):
+    """Once the Job is terminal no replacement is coming; waiting out the timeout is wrong."""
+    env = make_gke_env(tmp_path)
+    await env._ensure_client()
+    env._batch_api = mock_k8s_manager["batch_api"]
+    env.pod_name = "old-pod"
+    env._job_uid = "uid-job"
+    _serve_pods(mock_k8s_manager["core_api"], {})
+    mock_k8s_manager["batch_api"].read_namespaced_job.return_value = SimpleNamespace(
+        status=SimpleNamespace(
+            conditions=[
+                SimpleNamespace(
+                    type="Failed",
+                    status="True",
+                    reason="BackoffLimitExceeded",
+                    message="Job has reached the specified backoff limit",
+                )
+            ]
+        )
+    )
+
+    with (
+        patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()),
+        pytest.raises(TrialContainerLostError, match="BackoffLimitExceeded"),
+    ):
+        await env._wait_for_pod_ready(timeout_sec=30)
+
+
 @pytest.mark.unit
 def test_get_pod_failure_summary_exit_127(tmp_path):
     env = make_gke_env(tmp_path)
@@ -2783,7 +2948,7 @@ def test_resolve_active_machine_type(tmp_path):
         tmp_path,
         environment_name="example-bench/avx2-task",
         task_env_config=EnvironmentConfig(storage_mb=20480),
-        autopilot=True,
+        mock_autopilot=True,
     )
     assert env_default._active_machine_type is None
 
@@ -2793,7 +2958,7 @@ def test_resolve_active_machine_type(tmp_path):
         environment_name="example-bench/avx2-task",
         task_env_config=EnvironmentConfig(storage_mb=20480),
         task_machine_types="avx2-task:n2-standard-4",
-        autopilot=True,
+        mock_autopilot=True,
     )
     assert env_pinned._active_machine_type == "n2-standard-4"
     pod = env_pinned._build_direct_pod()
@@ -2845,7 +3010,8 @@ async def test_cluster_admission_controller_and_capacity_derivation():
         "gvisor-pool": "e2-standard-4",
     }
 
-    ctrl = ClusterAdmissionController(max_cpu_cores=4, max_gvisor_cpu_cores=4)
+    ctrl = ClusterAdmissionController()
+    ctrl.configure(max_cpu_cores=4, max_gvisor_cpu_cores=4)
     tok1 = await ctrl.acquire(4.0, is_gvisor=False)
     assert ctrl.in_flight_cpu == 4.0
 
@@ -3012,10 +3178,10 @@ def test_validate_placement_conflicts_and_allowed_overrides(tmp_path):
         tmp_path,
         environment_name="bench/task-a",
         node_pool="workers",
-        autopilot=True,
+        mock_autopilot=True,
     )
     with pytest.raises(PlacementConflictError, match="Autopilot"):
-        env_ap_pool._validate_placement(caps, is_autopilot=True)
+        env_ap_pool._validate_placement(replace(caps, is_autopilot=True))
 
     # 2. Job-wide node_pool + compute_class -> PlacementConflictError
     env_pool_cc = make_gke_env(
@@ -3278,41 +3444,33 @@ async def test_wait_for_pod_ready_completes_dind_pull_netpol_handshake(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "enforced,assume,expected_error",
+    "netpol_enforced,fqdn_supported,expect_netpol,expect_hostnames",
     [
-        (True, False, None),
-        (False, False, "active Kubernetes NetworkPolicy enforcement is required"),
-        (False, True, "active Kubernetes NetworkPolicy enforcement is required"),
-        (None, False, "Could not verify NetworkPolicy enforcement"),
-        (None, True, None),
+        pytest.param(True, True, True, True, id="netpol-and-fqdn"),
+        pytest.param(True, False, True, False, id="netpol-without-fqdn"),
+        pytest.param(False, True, False, False, id="no-enforcement"),
     ],
 )
-def test_verify_network_enforcement_matrix(
+def test_capabilities_declare_only_what_the_cluster_enforces(
     tmp_path: Path,
-    enforced: bool | None,
-    assume: bool,
-    expected_error: str | None,
+    netpol_enforced: bool,
+    fqdn_supported: bool,
+    expect_netpol: bool,
+    expect_hostnames: bool,
 ) -> None:
-    """WP-4 (F-07): Verify _verify_network_enforcement and capabilities fail closed on None unless assumed."""
-    env = make_gke_env(
-        tmp_path,
-        allow_metadata_server=False,
-        assume_network_policy_enforced=assume,
+    env = make_gke_env(tmp_path)
+    env_mod._CLUSTER_CAPABILITIES_CACHE[env._cluster_key] = _cluster_caps(
+        network_policy_enforced=netpol_enforced,
+        fqdn_network_policy_supported=fqdn_supported,
     )
-    caps = _standard_caps(network_policy_enforced=enforced)
-    env_mod._CLUSTER_CAPABILITIES_CACHE[
-        (env.project_id, env.location, env.cluster_name)
-    ] = caps
 
-    expected_cap = enforced is True or (enforced is None and assume)
-    assert env.capabilities.disable_internet is expected_cap
-    assert env.capabilities.network_allowlist is expected_cap
-
-    if expected_error is None:
-        env._verify_network_enforcement(caps)
-    else:
-        with pytest.raises(RuntimeError, match=expected_error):
-            env._verify_network_enforcement(caps)
+    caps = env.capabilities
+    assert caps.disable_internet is expect_netpol
+    assert caps.dynamic_network_policy is expect_netpol
+    assert caps.network_allowlist is expect_netpol
+    assert caps.network_allowlist_ipv4_cidrs is expect_netpol
+    assert caps.network_allowlist_hostnames is expect_hostnames
+    assert caps.network_allowlist_wildcard_hostnames is expect_hostnames
 
 
 @pytest.mark.unit

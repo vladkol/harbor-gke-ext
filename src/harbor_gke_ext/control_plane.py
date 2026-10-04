@@ -23,10 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import functools
 import math
 import random
 import time
-from typing import Callable
 
 from harbor_gke_ext.client import _extract_api_status_code
 from harbor_gke_ext.constants import (
@@ -80,15 +80,7 @@ def is_control_plane_overload(exc: BaseException) -> bool:
     return 500 <= status <= 599 and _GKE_WEBHOOK_CALL_FAILURE_MARKER in text
 
 
-def jittered_backoff_delay(
-    attempt: int,
-    *,
-    initial_sec: float = _GKE_EXEC_CONNECT_INITIAL_DELAY_SEC,
-    base: float = _GKE_EXEC_CONNECT_EXPONENTIAL_BASE,
-    max_sec: float = _GKE_EXEC_CONNECT_MAX_DELAY_SEC,
-    jitter_ratio: float = _GKE_RETRY_JITTER_RATIO,
-    uniform: Callable[[float, float], float] = random.uniform,
-) -> float:
+def jittered_backoff_delay(attempt: int) -> float:
     """Return the delay before retry ``attempt`` (0-based), with uniform jitter.
 
     The capped exponential value ``min(initial * base**attempt, max)`` is scaled
@@ -96,8 +88,14 @@ def jittered_backoff_delay(
     The mean equals the unjittered schedule, so the expected total retry window
     is unchanged. Only the synchronisation between clients is removed.
     """
-    nominal = min(initial_sec * (base**attempt), max_sec)
-    return nominal * uniform(1.0 - jitter_ratio, 1.0 + jitter_ratio)
+    nominal = min(
+        _GKE_EXEC_CONNECT_INITIAL_DELAY_SEC
+        * (_GKE_EXEC_CONNECT_EXPONENTIAL_BASE**attempt),
+        _GKE_EXEC_CONNECT_MAX_DELAY_SEC,
+    )
+    return nominal * random.uniform(
+        1.0 - _GKE_RETRY_JITTER_RATIO, 1.0 + _GKE_RETRY_JITTER_RATIO
+    )
 
 
 class AdaptiveConcurrencyLimiter:
@@ -106,12 +104,14 @@ class AdaptiveConcurrencyLimiter:
     Use it like a semaphore (``async with limiter:``) and report outcomes with
     ``record_success`` and ``record_overload``. The limit:
 
-    - starts at ``maximum`` and never leaves ``[minimum, maximum]``;
-    - is multiplied by ``decrease_factor`` on overload, at most once per
-      ``decrease_cooldown_sec``, because a burst of calls failing together
-      reflects one overload episode;
-    - grows by one slot per ``increase_interval_sec`` in which a success is
-      recorded, and not during the cooldown after a decrease.
+    - starts at ``_GKE_CONTROL_PLANE_LIMIT_MAX`` and never leaves
+      ``[_GKE_CONTROL_PLANE_LIMIT_MIN, _GKE_CONTROL_PLANE_LIMIT_MAX]``;
+    - is multiplied by ``_GKE_CONTROL_PLANE_LIMIT_DECREASE_FACTOR`` on overload,
+      at most once per ``_GKE_CONTROL_PLANE_LIMIT_DECREASE_COOLDOWN_SEC``,
+      because a burst of calls failing together reflects one overload episode;
+    - grows by one slot per ``_GKE_CONTROL_PLANE_LIMIT_INCREASE_INTERVAL_SEC``
+      in which a success is recorded, and not during the cooldown after a
+      decrease.
 
     When the limit shrinks, in-flight calls are not interrupted; new calls wait
     until the in-flight count drops below the new limit. Waiters are served in
@@ -121,47 +121,12 @@ class AdaptiveConcurrencyLimiter:
     because each method runs to completion without awaiting.
     """
 
-    def __init__(
-        self,
-        *,
-        minimum: int = _GKE_CONTROL_PLANE_LIMIT_MIN,
-        maximum: int = _GKE_CONTROL_PLANE_LIMIT_MAX,
-        decrease_factor: float = _GKE_CONTROL_PLANE_LIMIT_DECREASE_FACTOR,
-        decrease_cooldown_sec: float = _GKE_CONTROL_PLANE_LIMIT_DECREASE_COOLDOWN_SEC,
-        increase_interval_sec: float = _GKE_CONTROL_PLANE_LIMIT_INCREASE_INTERVAL_SEC,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        if minimum < 1 or maximum < minimum:
-            raise ValueError(
-                f"Invalid limiter bounds: minimum={minimum}, maximum={maximum}"
-            )
-        if not 0.0 < decrease_factor < 1.0:
-            raise ValueError(
-                f"decrease_factor must be in (0, 1), got {decrease_factor}"
-            )
-        self._minimum = minimum
-        self._maximum = maximum
-        self._decrease_factor = decrease_factor
-        self._decrease_cooldown_sec = decrease_cooldown_sec
-        self._increase_interval_sec = increase_interval_sec
-        self._clock = clock
-        self._limit = maximum
+    def __init__(self) -> None:
+        self._limit = _GKE_CONTROL_PLANE_LIMIT_MAX
         self._in_flight = 0
         self._waiters: collections.deque[asyncio.Future[None]] = collections.deque()
         self._last_decrease: float | None = None
         self._last_increase: float | None = None
-
-    @property
-    def limit(self) -> int:
-        return self._limit
-
-    @property
-    def in_flight(self) -> int:
-        return self._in_flight
-
-    @property
-    def waiting(self) -> int:
-        return sum(1 for fut in self._waiters if not fut.done())
 
     async def acquire(self) -> None:
         if self._in_flight < self._limit and not self._waiters:
@@ -197,15 +162,17 @@ class AdaptiveConcurrencyLimiter:
         self.release()
 
     def record_overload(self) -> None:
-        now = self._clock()
+        now = time.monotonic()
         if (
             self._last_decrease is not None
-            and now - self._last_decrease < self._decrease_cooldown_sec
+            and now - self._last_decrease
+            < _GKE_CONTROL_PLANE_LIMIT_DECREASE_COOLDOWN_SEC
         ):
             return
         previous = self._limit
         self._limit = max(
-            self._minimum, math.floor(self._limit * self._decrease_factor)
+            _GKE_CONTROL_PLANE_LIMIT_MIN,
+            math.floor(self._limit * _GKE_CONTROL_PLANE_LIMIT_DECREASE_FACTOR),
         )
         self._last_decrease = now
         self._last_increase = now
@@ -218,22 +185,24 @@ class AdaptiveConcurrencyLimiter:
             )
 
     def record_success(self) -> None:
-        if self._limit >= self._maximum:
+        if self._limit >= _GKE_CONTROL_PLANE_LIMIT_MAX:
             return
-        now = self._clock()
+        now = time.monotonic()
         if (
             self._last_decrease is not None
-            and now - self._last_decrease < self._decrease_cooldown_sec
+            and now - self._last_decrease
+            < _GKE_CONTROL_PLANE_LIMIT_DECREASE_COOLDOWN_SEC
         ):
             return
         if (
             self._last_increase is not None
-            and now - self._last_increase < self._increase_interval_sec
+            and now - self._last_increase
+            < _GKE_CONTROL_PLANE_LIMIT_INCREASE_INTERVAL_SEC
         ):
             return
         self._limit += 1
         self._last_increase = now
-        if self._limit == self._maximum:
+        if self._limit == _GKE_CONTROL_PLANE_LIMIT_MAX:
             logger.debug("Kubernetes control-plane limit recovered to %d.", self._limit)
         self._wake_waiters()
 
@@ -246,12 +215,7 @@ class AdaptiveConcurrencyLimiter:
             fut.set_result(None)
 
 
-_CONTROL_PLANE_LIMITER: AdaptiveConcurrencyLimiter | None = None
-
-
+@functools.cache
 def get_control_plane_limiter() -> AdaptiveConcurrencyLimiter:
     """Return the process-wide limiter for exec handshakes and Job/Pod creates."""
-    global _CONTROL_PLANE_LIMITER
-    if _CONTROL_PLANE_LIMITER is None:
-        _CONTROL_PLANE_LIMITER = AdaptiveConcurrencyLimiter()
-    return _CONTROL_PLANE_LIMITER
+    return AdaptiveConcurrencyLimiter()

@@ -11,7 +11,6 @@ from harbor_gke_ext.image_plan import (
     is_plan_published,
     plan_task_images,
     record_planned_images,
-    reset_planned_images,
     was_image_planned,
 )
 from harbor.models.task.config import StepConfig, TaskConfig
@@ -26,14 +25,6 @@ SEPARATE_VERIFIER_TOML = """
 [verifier]
 environment_mode = "separate"
 """
-
-
-@pytest.fixture(autouse=True)
-def _reset_published_plan():
-    """Plan publication is process-global; keep tests isolated."""
-    reset_planned_images()
-    yield
-    reset_planned_images()
 
 
 def _write_task(

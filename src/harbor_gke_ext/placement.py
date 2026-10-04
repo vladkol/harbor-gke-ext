@@ -36,7 +36,6 @@ from harbor_gke_ext.cluster_probe import (
     DindAvailability,
 )
 from harbor_gke_ext.compose_spec import (
-    HARBOR_SYNTHETIC_LOG_PATHS,
     MAIN_SERVICE_NAME,
     UnsupportedComposeFeatureError,
     is_harbor_synthetic_log_mount,
@@ -158,8 +157,6 @@ SAFE_SYSCTL_PREFIXES: tuple[str, ...] = (
     "net.ipv4.tcp_syncookies",
     "net.ipv4.ping_group_range",
 )
-
-HARBOR_LOG_PATHS: frozenset[str] = HARBOR_SYNTHETIC_LOG_PATHS
 
 DOCKER_SOCK_PATH = "/var/run/docker.sock"
 

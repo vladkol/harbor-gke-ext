@@ -22,6 +22,7 @@ host, Harbor automatically downloads and SHA-256-verifies a pinned standalone
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import functools
 import hashlib
 import threading
 import json
@@ -68,7 +69,6 @@ _PINNED_COMPOSE_SHA256: dict[tuple[str, str], str] = {
 }
 
 _DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)")
-_CACHED_COMPOSE_CMD: list[str] | None = None
 
 
 def parse_duration_seconds(val: str | int | float | None) -> int | None:
@@ -200,40 +200,40 @@ def _download_standalone_compose(target_path: Path) -> None:
 _COMPOSE_BINARY_LOCK = threading.Lock()
 
 
-def ensure_compose_binary(*, force_probe: bool = False) -> list[str]:
-    """Locate a working Compose CLI command or download the pinned fallback binary (gated once per process)."""
-    global _CACHED_COMPOSE_CMD
-    if _CACHED_COMPOSE_CMD is not None and not force_probe:
-        return list(_CACHED_COMPOSE_CMD)
+def ensure_compose_binary() -> list[str]:
+    """Locate a working Compose CLI command or download the pinned fallback binary.
 
+    Resolved once per process. The lock keeps concurrent first calls from each
+    downloading the fallback binary.
+    """
     with _COMPOSE_BINARY_LOCK:
-        if _CACHED_COMPOSE_CMD is not None and not force_probe:
-            return list(_CACHED_COMPOSE_CMD)
+        return list(_resolve_compose_command())
 
-        cache_bin = Path.home() / ".cache" / "harbor" / "bin" / "docker-compose"
-        candidates: list[list[str]] = [
-            ["docker", "compose"],
-            ["docker-compose"],
-            ["/usr/local/bin/docker-compose"],
-            ["/opt/homebrew/bin/docker-compose"],
-            [str(cache_bin)],
-            ["podman", "compose"],
-            ["podman-compose"],
-        ]
 
-        for cmd in candidates:
-            if _probe_compose_cmd(cmd):
-                _CACHED_COMPOSE_CMD = cmd
-                return list(cmd)
+@functools.cache
+def _resolve_compose_command() -> tuple[str, ...]:
+    cache_bin = Path.home() / ".cache" / "harbor" / "bin" / "docker-compose"
+    candidates: list[list[str]] = [
+        ["docker", "compose"],
+        ["docker-compose"],
+        ["/usr/local/bin/docker-compose"],
+        ["/opt/homebrew/bin/docker-compose"],
+        [str(cache_bin)],
+        ["podman", "compose"],
+        ["podman-compose"],
+    ]
 
-        # Fallback: download pinned standalone docker-compose binary
-        _download_standalone_compose(cache_bin)
-        if not _probe_compose_cmd([str(cache_bin)]):
-            raise RuntimeError(
-                f"Downloaded docker-compose binary at {cache_bin} failed execution check"
-            )
-        _CACHED_COMPOSE_CMD = [str(cache_bin)]
-        return list(_CACHED_COMPOSE_CMD)
+    for cmd in candidates:
+        if _probe_compose_cmd(cmd):
+            return tuple(cmd)
+
+    # Fallback: download pinned standalone docker-compose binary
+    _download_standalone_compose(cache_bin)
+    if not _probe_compose_cmd([str(cache_bin)]):
+        raise RuntimeError(
+            f"Downloaded docker-compose binary at {cache_bin} failed execution check"
+        )
+    return (str(cache_bin),)
 
 
 def _needs_base_main_overlay(compose_files: Sequence[Path]) -> bool:
@@ -621,11 +621,6 @@ def build_default_compose_env(
     compose_files: Sequence[Path] = (),
     context_dir: Path | str | None = None,
     main_image_name: str = "hb__task:latest",
-    main_image_url: str | None = None,
-    task_env_dir: Path | str | None = None,
-    trial_dir: Path | str | None = None,
-    cpus: int | None = None,
-    memory_mb: int | None = None,
 ) -> dict[str, str]:
     """Assemble environment variable dictionary for Compose CLI config parsing.
 
@@ -645,20 +640,18 @@ def build_default_compose_env(
         if name in os.environ:
             merged[name] = os.environ[name]
 
-    eff_ctx = context_dir if context_dir is not None else task_env_dir
     ctx_str = (
-        str(Path(eff_ctx).resolve().absolute())
-        if eff_ctx is not None
+        str(Path(context_dir).resolve().absolute())
+        if context_dir is not None
         else "/harbor/environment"
     )
-    eff_image = main_image_url or main_image_name
 
     defaults = {
         "CONTEXT_DIR": ctx_str,
-        "MAIN_IMAGE_NAME": eff_image,
-        "PREBUILT_IMAGE_NAME": eff_image,
-        "CPUS": str(cpus) if cpus is not None else "1",
-        "MEMORY": f"{memory_mb}M" if memory_mb is not None else "2048M",
+        "MAIN_IMAGE_NAME": main_image_name,
+        "PREBUILT_IMAGE_NAME": main_image_name,
+        "CPUS": "1",
+        "MEMORY": "2048M",
         "ENV_ARTIFACTS_PATH": "/logs/artifacts",
         "HOST_ARTIFACTS_PATH": "/logs/artifacts",
         "ENV_VERIFIER_LOGS_PATH": "/logs/verifier",
@@ -687,7 +680,6 @@ def normalize_compose_project(
     compose_files: Sequence[Path],
     env_vars: Mapping[str, str] | None = None,
     *,
-    project_name: str = "harbor",
     context_dir: Path | str | None = None,
     task_dir: Path | str | None = None,
 ) -> dict[str, Any]:
@@ -762,7 +754,7 @@ def normalize_compose_project(
         cmd = [
             *compose_cmd,
             "--project-name",
-            project_name,
+            "harbor",
             "--project-directory",
             str(eff_context_dir),
             *files_arg,
@@ -798,13 +790,11 @@ def normalize_compose_project(
 def discover_compose_build_services(
     compose_files: Path | Sequence[Path],
     compose_env: Mapping[str, str] | None = None,
-    *,
-    require_dir: bool = True,
-    task_dir: Path | str | None = None,
 ) -> dict[str, tuple[Path, str | None]]:
     """Discover non-main services that declare a ``build`` section.
 
-    Returns ``{service_name: (resolved_context_path, optional_dockerfile_name)}``.
+    Returns ``{service_name: (resolved_context_path, optional_dockerfile_name)}``
+    for build contexts that exist as directories.
     Used by :mod:`harbor_gke_ext.image_plan` to pre-build sidecars in
     Artifact Registry.
     """
@@ -816,7 +806,6 @@ def discover_compose_build_services(
         paths,
         compose_env,
         context_dir=base_dir,
-        task_dir=task_dir,
     )
     services = project.get("services") or {}
     discovered: dict[str, tuple[Path, str | None]] = {}
@@ -837,7 +826,7 @@ def discover_compose_build_services(
             dockerfile = None if df in (None, "", "Dockerfile") else str(df)
         else:
             continue
-        if not require_dir or ctx_path.is_dir():
+        if ctx_path.is_dir():
             discovered[sname] = (ctx_path, dockerfile)
 
     return discovered

@@ -46,25 +46,16 @@ To plan Autopilot evaluations, follow these recommendations:
 
 ## Cluster detection and capability probing
 
-During environment initialization and startup, `harbor-gke-ext` runs two separate steps: Autopilot detection and the cluster capability probe.
-
-**Autopilot detection (`is_autopilot()`)** resolves in this order:
-
-1. **Explicit override (`--ek autopilot=true|false`):** If `--ek autopilot` is passed, `is_autopilot()` returns that boolean.
-2. **`gcloud` query:** Otherwise, `harbor-gke-ext` runs `gcloud container clusters describe --format="value(autopilot.enabled)"` once per `(project_id, location, cluster_name)` and caches the result for the process.
-3. **Node labels:** If the `gcloud` query fails, `harbor-gke-ext` lists up to five nodes and checks for the `cloud.google.com/gke-autopilot=true` label (or `autopilot` in the node pool name). If neither matches, the cluster is treated as Standard.
-
-The override feeds detection and ComputeClass resolution. It doesn't change the capability probe's `ClusterCapabilities.is_autopilot` value when the probe succeeds. gVisor promotion, the Autopilot resource floor, and the storage pre-check's Autopilot exemption read only the probe value; the node-pool check in placement validation reads both.
-
-**Capability probe (`probe_cluster_via_gcloud()`)** runs separately, even when the override is set. It calls `gcloud container clusters describe` once per `(project_id, location, cluster_name)` and caches the resulting `ClusterCapabilities` object across the process. The probe reads:
+`harbor-gke-ext` probes each target cluster once per process and caches the resulting `ClusterCapabilities`. Autopilot mode is part of that probe; there is no separate detection step and no override. The probe runs `gcloud container clusters describe` (which needs `container.clusters.get`, the same permission `gcloud container clusters get-credentials` needs) and reads:
 
 - `autopilot.enabled`
 - `currentMasterVersion`
 - `autopilot.privilegedAdmissionConfig.allowlistPaths`
 - `autopilot.workloadPolicyConfig.allowNetAdmin`
+- The network configuration that decides `NetworkPolicy` enforcement
 - Node pool configuration (machine types, autoscaling limits, boot disk sizes, taints) and node auto-provisioning settings
 
-If the probe fails, `ClusterCapabilities` falls back to the result of Autopilot detection.
+It then asks the Kubernetes API for Pod-level `spec.resources` support, the `kube-dns` ClusterIP, and `FQDNNetworkPolicy` support. If any step fails, the probe raises and nothing is cached: the environment never declares capabilities it could not verify.
 
 ## Resource modes: `--cpus auto --memory auto` vs `--cpus request --memory request`
 

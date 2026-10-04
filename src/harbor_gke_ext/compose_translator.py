@@ -48,6 +48,7 @@ by :class:`harbor_gke_ext.image_ref.ImageResolver`.
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import io
 import json
@@ -153,12 +154,6 @@ _NVIDIA_LIB_DIR = GKE_NVIDIA_LIB_DIR
 # ``_build_shape_b_dind_containers``.
 _DIND_GPU_FACTS_DIR = "/harbor/gpu"
 
-_OCI_CONFIG_CACHE: dict[str, dict[str, Any]] = {}
-
-# Sum of the compressed ``layers[].size`` values from an image's OCI manifest,
-# keyed by image reference. ``None`` records a resolution failure so a broken or
-# unpublished reference is not retried once per Pod build.
-_OCI_COMPRESSED_SIZE_CACHE: dict[str, int | None] = {}
 
 # Ratio between an image's on-disk footprint under overlay2 and the sum of its
 # compressed layer sizes:
@@ -259,8 +254,11 @@ def _build_safe_https_opener() -> Any:
     return opener
 
 
+_REGISTRY_HTTP_TIMEOUT_SEC = 5.0
+
+
 def _fetch_oci_config_from_registry(
-    image_ref: str, *, timeout_sec: float = 5.0
+    image_ref: str,
 ) -> tuple[dict[str, Any], int | None]:
     """Fetch an image's OCI ``config`` dict and compressed size via Registry API v2.
 
@@ -311,7 +309,7 @@ def _fetch_oci_config_from_registry(
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, headers=headers)
         try:
-            with opener.open(req, timeout=timeout_sec) as resp:
+            with opener.open(req, timeout=_REGISTRY_HTTP_TIMEOUT_SEC) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as err:
             if err.code == 401 and not token and not is_google:
@@ -334,14 +332,14 @@ def _fetch_oci_config_from_registry(
                     )
                     _validate_public_https_url(tok_url)
                     with opener.open(
-                        urllib.request.Request(tok_url), timeout=timeout_sec
+                        urllib.request.Request(tok_url), timeout=_REGISTRY_HTTP_TIMEOUT_SEC
                     ) as tok_resp:
                         tok_data = json.loads(tok_resp.read().decode("utf-8"))
                         token = tok_data.get("token") or tok_data.get("access_token")
                     if token:
                         headers["Authorization"] = f"Bearer {token}"
                         req2 = urllib.request.Request(url, headers=headers)
-                        with opener.open(req2, timeout=timeout_sec) as resp2:
+                        with opener.open(req2, timeout=_REGISTRY_HTTP_TIMEOUT_SEC) as resp2:
                             return json.loads(resp2.read().decode("utf-8"))
             raise
 
@@ -397,15 +395,8 @@ def _resolve_oci_manifest_facts(image_ref: str) -> tuple[dict[str, Any], int | N
     transient registry error permanent for the rest of the process, silently
     degrading every later trial that happens to use the same image.
     """
-    if image_ref in _OCI_CONFIG_CACHE:
-        return (
-            dict(_OCI_CONFIG_CACHE[image_ref]),
-            _OCI_COMPRESSED_SIZE_CACHE.get(image_ref),
-        )
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        return {}, None
     try:
-        cfg, compressed = _fetch_oci_config_from_registry(image_ref)
+        cfg, compressed = _cached_oci_manifest_facts(image_ref)
     except Exception as exc:
         # Warning, not debug: both consumers degrade silently and in ways that
         # surface far from here. On the `docker import` fallback path (used when
@@ -423,9 +414,13 @@ def _resolve_oci_manifest_facts(image_ref: str) -> tuple[dict[str, Any], int | N
             exc,
         )
         return {}, None
-    _OCI_CONFIG_CACHE[image_ref] = cfg
-    _OCI_COMPRESSED_SIZE_CACHE[image_ref] = compressed
     return dict(cfg), compressed
+
+
+@functools.cache
+def _cached_oci_manifest_facts(image_ref: str) -> tuple[dict[str, Any], int | None]:
+    # `functools.cache` does not store calls that raise. Callers copy the dict.
+    return _fetch_oci_config_from_registry(image_ref)
 
 
 def _resolve_oci_image_config(image_ref: str) -> dict[str, Any]:
@@ -1419,8 +1414,7 @@ def _parse_compose_duration_sec(val: Any, default: int = 5) -> int:
 
 
 def _convert_dict_probe_to_k8s(
-    probe_dict: dict[str, Any] | None = None,
-    raw_healthcheck: dict[str, Any] | None = None,
+    raw_healthcheck: dict[str, Any] | None,
 ) -> k8s_client.V1Probe | None:
     """Convert a Compose healthcheck specification into a Kubernetes V1Probe."""
     hc = raw_healthcheck or {}
@@ -1443,36 +1437,18 @@ def _convert_dict_probe_to_k8s(
             exec_cmd = [str(x) for x in test_cmd]
     elif isinstance(test_cmd, str) and test_cmd.strip():
         exec_cmd = ["/bin/sh", "-c", test_cmd.strip()]
-    elif probe_dict and isinstance(probe_dict.get("exec"), dict):
-        raw_c = probe_dict["exec"].get("command") or []
-        if len(raw_c) == 1 and isinstance(raw_c[0], str):
-            exec_cmd = ["/bin/sh", "-c", raw_c[0]]
-        else:
-            exec_cmd = [str(x) for x in raw_c]
 
     if not exec_cmd:
         return None
 
-    interval = _parse_compose_duration_sec(
-        hc.get("interval"),
-        default=(probe_dict or {}).get("periodSeconds", 5),
-    )
-    timeout = _parse_compose_duration_sec(
-        hc.get("timeout"),
-        default=(probe_dict or {}).get("timeoutSeconds", 5),
-    )
-    start_period = _parse_compose_duration_sec(
-        hc.get("start_period"),
-        default=(probe_dict or {}).get("initialDelaySeconds", 0),
-    )
+    interval = _parse_compose_duration_sec(hc.get("interval"), default=5)
+    timeout = _parse_compose_duration_sec(hc.get("timeout"), default=5)
+    start_period = _parse_compose_duration_sec(hc.get("start_period"), default=0)
     retries_raw = hc.get("retries")
-    if retries_raw is not None:
-        try:
-            retries = max(1, int(retries_raw))
-        except (TypeError, ValueError):
-            retries = 3
-    else:
-        retries = int((probe_dict or {}).get("failureThreshold", 3))
+    try:
+        retries = max(1, int(retries_raw)) if retries_raw is not None else 3
+    except (TypeError, ValueError):
+        retries = 3
 
     return k8s_client.V1Probe(
         _exec=k8s_client.V1ExecAction(command=exec_cmd),
@@ -3231,6 +3207,74 @@ def _build_shape_b_dind_containers(
     )
 
 
+@dataclass(frozen=True)
+class ResolvedComposePlacement:
+    """A normalized Compose project and the placement decision made for it."""
+
+    project: dict[str, Any]
+    plan: PlacementPlan
+    base_dir: Path
+    task_dir: Path
+
+
+def resolve_compose_placement(
+    compose_path: Path | Sequence[Path],
+    compose_env: dict[str, str] | None = None,
+    *,
+    task_dir: Path | None = None,
+    compose_placement: ComposePlacementMode | None = None,
+    is_autopilot: bool = False,
+    cluster_capabilities: ClusterCapabilities | None = None,
+    effective_gpus: int = 0,
+    gpu_types: list[str] | str | None = None,
+    gpu_override: str | None = None,
+    default_gpu_type: str | None = None,
+    default_gpu_count: int | None = None,
+    logger: Any | None = None,
+) -> ResolvedComposePlacement:
+    """Normalize the Compose project and classify its placement (Shape A, B or C).
+
+    This is the single place the placement is decided. ``translate_compose``
+    builds the Pod from it, and ``GKEEnvironment.start`` calls it with the same
+    arguments to make the decisions that must precede translation (NetworkPolicy
+    handshake, DinD node pool, storage sizing). Raises
+    ``UnsupportedComposeFeatureError`` when the project cannot run on GKE.
+    """
+    paths = [compose_path] if isinstance(compose_path, Path) else list(compose_path)
+    if not paths:
+        raise ValueError("translate_compose requires at least one compose file path")
+    base_dir = Path(paths[0]).resolve().parent
+    eff_task_dir = (
+        task_dir.resolve()
+        if task_dir is not None
+        else (base_dir.parent if base_dir.name == "environment" else base_dir)
+    )
+    project = normalize_compose_project(
+        paths,
+        compose_env,
+        context_dir=base_dir,
+        task_dir=eff_task_dir,
+    )
+    plan = classify_compose_placement(
+        project,
+        task_dir=eff_task_dir,
+        base_dir=base_dir,
+        compose_placement=compose_placement or "auto",
+        cluster_capabilities=(
+            cluster_capabilities or ClusterCapabilities(is_autopilot=is_autopilot)
+        ),
+        toml_gpus=effective_gpus,
+        toml_gpu_types=gpu_types,
+        gpu_override=gpu_override,
+        default_gpu_type=default_gpu_type,
+        default_gpu_count=default_gpu_count,
+        logger=logger,
+    )
+    return ResolvedComposePlacement(
+        project=project, plan=plan, base_dir=base_dir, task_dir=eff_task_dir
+    )
+
+
 def translate_compose(
     compose_path: Path | Sequence[Path] | None = None,
     pod_name: str = "harbor-pod",
@@ -3296,38 +3340,27 @@ def translate_compose(
     if not eff_main_image:
         raise ValueError("translate_compose requires main_image_url or main_image")
 
-    base_dir = Path(paths[0]).resolve().parent
-    eff_task_dir = (
-        task_dir.resolve()
-        if task_dir is not None
-        else (base_dir.parent if base_dir.name == "environment" else base_dir)
-    )
-
     resolver = image_resolver or ImageResolver()
     caps = cluster_capabilities or ClusterCapabilities(is_autopilot=is_autopilot)
-
     effective_mode: ComposePlacementMode = compose_placement or "auto"
 
-    project = normalize_compose_project(
+    resolved = resolve_compose_placement(
         paths,
         compose_env,
-        context_dir=base_dir,
-        task_dir=eff_task_dir,
-    )
-
-    placement = classify_compose_placement(
-        project,
-        task_dir=eff_task_dir,
-        base_dir=base_dir,
+        task_dir=task_dir,
         compose_placement=effective_mode,
         cluster_capabilities=caps,
-        toml_gpus=effective_gpus,
-        toml_gpu_types=gpu_types,
+        effective_gpus=effective_gpus,
+        gpu_types=gpu_types,
         gpu_override=gpu_override,
         default_gpu_type=default_gpu_type,
         default_gpu_count=default_gpu_count,
         logger=logger,
     )
+    project = resolved.project
+    placement = resolved.plan
+    base_dir = resolved.base_dir
+    eff_task_dir = resolved.task_dir
 
     services = project.get("services") or {}
 

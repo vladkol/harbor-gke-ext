@@ -94,7 +94,7 @@ See [Cluster setup](docs/cluster-setup.md).
 | Python 3.12 or later | Same floor as Harbor. |
 | `gcloud` CLI | Required. Harbor refuses to start if `gcloud` is missing or has no active authenticated account (`gcloud auth login`), unless `GOOGLE_APPLICATION_CREDENTIALS` points at a file. Version 480.0.0 or later is recommended; the version is not checked. |
 | `gke-gcloud-auth-plugin` | Required by GKE 1.26 and later. Absence produces a warning, then authentication failures. |
-| A kubeconfig | `~/.kube/config` must exist, or `KUBECONFIG` must point at one. `gcloud container clusters get-credentials` creates it. The package does not invoke `kubectl`. |
+| Cluster credentials | Not needed in advance. The package uses the kubeconfig context that matches the target cluster (`KUBECONFIG` or `~/.kube/config`); if none matches, it runs `gcloud container clusters get-credentials` itself. Either way the caller needs `container.clusters.get` on the cluster: the capability probe runs `gcloud container clusters describe`. The package does not invoke `kubectl`. |
 | A Google Cloud project | With billing enabled and the `container`, `artifactregistry`, `cloudbuild`, `compute`, and `iam` APIs turned on. |
 | A GKE cluster (1.34+) | Autopilot or Standard. Kubernetes 1.34+ is required for Pod-level `spec.resources` enforcement. See [Cluster setup](docs/cluster-setup.md). |
 
@@ -449,8 +449,9 @@ Every option is catalogued in the
 
 ## How it works: the three Pod shapes
 
-One trial becomes one `batch/v1` Job with `backoffLimit: 0`, owning one Pod with
-`restartPolicy: Never`. `harbor-gke-ext` inspects the
+One trial becomes one `batch/v1` Job owning one Pod with `restartPolicy: Never`.
+The Job replaces the Pod only if infrastructure takes it away before the trial
+starts (preemption, eviction, node loss). `harbor-gke-ext` inspects the
 task and selects one of three shapes:
 
 | Shape | Topology | When it is chosen |

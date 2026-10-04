@@ -34,7 +34,6 @@ import re
 from typing import Any
 
 DOCKER_HUB_REGISTRY = "docker.io"
-_ARTIFACT_REGISTRY_SUFFIX = "-docker.pkg.dev"
 _GAR_HOST_RE = re.compile(r"^[a-z0-9-]+-docker\.pkg\.dev$")
 _GCR_HOSTS = frozenset({"gcr.io", "us.gcr.io", "eu.gcr.io", "asia.gcr.io"})
 _DOCKER_HUB_HOSTS = frozenset(
@@ -81,10 +80,8 @@ class ImageOrigin(StrEnum):
     """Provenance category of a container image reference in a GKE trial."""
 
     MAIN_BUILT = "main_built"
-    MAIN_PREBUILT = "main_prebuilt"
     SIDECAR_BUILT = "sidecar_built"
     SIDECAR_EXTERNAL = "sidecar_external"
-    VERIFIER = "verifier"
     INFRA = "infra"
 
 
@@ -234,11 +231,6 @@ class ResolvedImage:
     ref: ImageRef
     origin: ImageOrigin
     rewritten: bool = False
-
-    @property
-    def reference(self) -> str:
-        """The effective image string to emit into a Kubernetes Pod specification."""
-        return self.ref.canonical if self.rewritten else self.original
 
     @property
     def streaming_eligible(self) -> bool:

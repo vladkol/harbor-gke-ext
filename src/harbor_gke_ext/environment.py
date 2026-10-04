@@ -4,7 +4,6 @@ import asyncio
 import datetime
 import inspect
 import json
-import os
 import re
 import shlex
 import threading
@@ -55,10 +54,8 @@ from harbor.utils.optional_import import MissingExtraError
 from harbor_gke_ext.client import (
     KubernetesClientManager,
     _ensure_file_descriptor_limit,
-    _extract_api_status_code,
     derive_region,
     ensure_gcloud_ready,
-    reset_gcloud_cache,
     resolve_gke_target,
 )
 from harbor_gke_ext.cloud_build import (
@@ -69,12 +66,11 @@ from harbor_gke_ext.cloud_build import (
 from harbor_gke_ext.cluster_probe import (
     ClusterAdmissionController,
     ClusterCapabilities,
-    DindAvailability,
     _parse_machine_type_vcpus,
     parse_quantity_to_mib,
     probe_cluster_via_gcloud,
-    probe_max_node_ephemeral_storage_mb,
-    probe_network_enforcement_and_dns_via_k8s,
+    probe_fqdn_network_policy_support,
+    probe_kube_dns_cluster_ip,
     probe_pod_level_resources_support,
 )
 from harbor_gke_ext.compose_translator import (
@@ -83,6 +79,7 @@ from harbor_gke_ext.compose_translator import (
     _GKENativeComposeServiceTransport,
     discover_compose_build_services,
     resolve_compose_infra_env,
+    resolve_compose_placement,
     translate_compose,
 )
 from harbor_gke_ext.constants import (
@@ -152,7 +149,7 @@ from harbor_gke_ext.network_policy import (
     apply_network_policy,
     delete_network_policies,
 )
-from harbor_gke_ext.placement import ComposePlacementMode
+from harbor_gke_ext.placement import ComposePlacementMode, PlacementPlan
 from harbor_gke_ext.pod_builder import (
     build_direct_pod,
     build_job,
@@ -169,8 +166,6 @@ _KNOWN_EK_KEYS: frozenset[str] = frozenset(
         "agent_timeout_sec",
         "allow_metadata_server",
         "allow_pod_ingress",
-        "assume_network_policy_enforced",
-        "autopilot",
         "cloud_build_disk_size_gb",
         "cloud_build_machine_type",
         "cloud_build_timeout_sec",
@@ -190,7 +185,6 @@ _KNOWN_EK_KEYS: frozenset[str] = frozenset(
         "dind_storage_mb",
         "dns_egress_extra_cidrs",
         "enable_dind",
-        "enable_fqdn_network_policy",
         "gpu_override",
         "image_pull_secrets",
         "location",
@@ -238,7 +232,9 @@ except ImportError:
 if TYPE_CHECKING:
     from kubernetes import client as k8s_client
 
-_COMPUTE_CLASS_UNSET: Any = object()
+_PATH_KIND_CHECK_TIMEOUT_SEC = 60
+_FAILED_CONTAINER_LOG_TAIL_LINES = 80
+_INFRA_CONTAINER_LOG_LIMIT_BYTES = 16384
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Provisional default for ResourceMode.AUTO (Option A: capped by default,
 # request == limit == declared budget, matching Docker). Switch to
@@ -246,34 +242,19 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _GKE_DEFAULT_RESOURCE_AUTO_MODE: ResourceMode = ResourceMode.GUARANTEE
 
 
-# Process-wide cache for GKE cluster Autopilot status, capabilities, and admission control
-_CLUSTER_AUTOPILOT_CACHE: dict[tuple[str, str, str], bool] = {}
+# Process-wide cluster capabilities and admission control, keyed by
+# (project_id, location, cluster_name). Capabilities are probed once per
+# process under `_CLUSTER_CAPABILITIES_LOCK`; a failed probe is not cached.
 _CLUSTER_CAPABILITIES_CACHE: dict[tuple[str, str, str], ClusterCapabilities] = {}
-_CLUSTER_CAPABILITIES_TASKS: dict[
-    tuple[str, str, str], asyncio.Task[ClusterCapabilities]
-] = {}
-_CLUSTER_AUTOPILOT_TASKS: dict[tuple[str, str, str], asyncio.Task[bool]] = {}
+_CLUSTER_CAPABILITIES_LOCK = threading.Lock()
 _CLUSTER_ADMISSION_CONTROLLERS: dict[
     tuple[str, str, str], ClusterAdmissionController
 ] = {}
-_CLUSTER_AUTOPILOT_LOCK: asyncio.Lock | None = None
 
 
-def _get_cluster_autopilot_lock() -> asyncio.Lock:
-    global _CLUSTER_AUTOPILOT_LOCK
-    if _CLUSTER_AUTOPILOT_LOCK is None:
-        _CLUSTER_AUTOPILOT_LOCK = asyncio.Lock()
-    return _CLUSTER_AUTOPILOT_LOCK
-
-
-def reset_cluster_autopilot_cache() -> None:
-    """Clear cached cluster autopilot determinations (for testing and reset)."""
-    _CLUSTER_AUTOPILOT_CACHE.clear()
-    _CLUSTER_CAPABILITIES_CACHE.clear()
-    _CLUSTER_AUTOPILOT_TASKS.clear()
-    _CLUSTER_ADMISSION_CONTROLLERS.clear()
-    GKEEnvironment._preflight_verified = False
-    reset_gcloud_cache()
+# Exec readiness probes before giving up. With `jittered_backoff_delay` the 17
+# waits between them average about 290 s in total.
+_EXEC_READY_MAX_ATTEMPTS = 18
 
 
 class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
@@ -284,42 +265,23 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     """
 
     _image_build_locks: ClassVar[dict[str, asyncio.Lock]] = {}
-    _preflight_lock: ClassVar[threading.Lock] = threading.Lock()
-    _preflight_verified: ClassVar[bool] = False
 
     @classmethod
     @override
     def preflight(cls) -> None:
+        # Harbor calls this without the job's environment kwargs, so only host
+        # prerequisites can be checked here. Cluster identity is resolved per
+        # trial, and a missing kubeconfig is not an error: the client fetches
+        # credentials with `gcloud container clusters get-credentials`.
         import shutil
 
-        if not shutil.which("gcloud"):
-            raise SystemExit(
-                "GKE requires the gcloud CLI to be installed. "
-                "See https://docs.cloud.google.com/sdk/docs/install-sdk"
-            )
+        ensure_gcloud_ready()
         if not shutil.which("gke-gcloud-auth-plugin"):
             logger.warning(
                 "gke-gcloud-auth-plugin is not found in PATH. Modern GKE clusters (v1.26+) "
                 "require this plugin to authenticate. If you experience authentication errors, "
                 "install it via 'gcloud components install gke-gcloud-auth-plugin'."
             )
-        kubeconfig = Path(
-            os.environ.get("KUBECONFIG", Path.home() / ".kube" / "config")
-        )
-        if not kubeconfig.exists():
-            raise SystemExit(
-                "GKE requires Kubernetes credentials. Run "
-                "'gcloud container clusters get-credentials <CLUSTER> "
-                "--location <LOCATION>' to configure kubectl, or set the "
-                "KUBECONFIG environment variable."
-            )
-        if cls._preflight_verified:
-            return
-        with cls._preflight_lock:
-            if cls._preflight_verified:
-                return
-            ensure_gcloud_ready()
-            cls._preflight_verified = True
 
     def __init__(
         self,
@@ -342,7 +304,6 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         cloud_build_disk_size_gb: int | None = None,
         cloud_build_worker_pool: str | None = None,
         private_pool: str | None = None,
-        enable_fqdn_network_policy: bool | None = None,
         machine_type: str | None = None,
         node_pool: str | None = None,
         pod_ready_timeout: float | None = None,
@@ -417,14 +378,6 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             int(raw_compose_up_timeout)
             if raw_compose_up_timeout is not None
             else max(_GKE_DEFAULT_COMPOSE_UP_TIMEOUT_SEC, task_build_timeout_sec // 2)
-        )
-        raw_fqdn = (
-            enable_fqdn_network_policy
-            if enable_fqdn_network_policy is not None
-            else kwargs.get("enable_fqdn_network_policy")
-        )
-        self._enable_fqdn_network_policy: bool | None = (
-            _parse_bool(raw_fqdn) if raw_fqdn is not None else None
         )
         raw_allow_ingress = (
             allow_pod_ingress
@@ -508,6 +461,9 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             derive_region(registry_location) if registry_location else self.region
         )
         self.registry_name = registry_name
+        # Needed by the cluster capability probe, which Harbor may trigger from
+        # `super().__init__()` by reading `capabilities`.
+        self.namespace = namespace
 
         super().__init__(
             environment_dir=environment_dir,
@@ -533,7 +489,6 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self.cloud_build_timeout_sec: int = int(
             kwargs.get("cloud_build_timeout_sec", 10800)
         )
-        self.namespace = namespace
         self.machine_type: str | None = machine_type or kwargs.get("machine_type")
         self.task_machine_types: dict[str, str] = self._parse_task_mapping(
             task_machine_types
@@ -560,20 +515,15 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             if task_dind_storage_mb is not None
             else kwargs.get("task_dind_storage_mb")
         )
-        # Determining Compose DinD placement runs `docker compose config`. That
-        # must never happen from this constructor, so the probe stays disabled
-        # until `start()` enables it. See `_compose_needs_dind`.
-        self._compose_dind_probe_enabled: bool = False
-        self._compose_needs_dind_cached: bool | None = None
+        # The Compose placement the Pod is built from. `start()` resolves it
+        # (that runs `docker compose config`, which never happens from this
+        # constructor). See `_compose_needs_dind`.
+        self._compose_placement: PlacementPlan | None = None
         # Resolved once here because _resolve_active_compute_class() consults it:
         # an explicit node pool and a ComputeClass produce mutually exclusive node
         # selectors, so the node pool suppresses the ComputeClass.
         self._active_node_pool: str | None = self._resolve_active_node_pool()
         self._active_machine_type: str | None = self._resolve_active_machine_type()
-        raw_autopilot = kwargs.get("autopilot")
-        self._is_autopilot_cached: bool | None = (
-            _parse_bool(raw_autopilot) if raw_autopilot is not None else None
-        )
         raw_ready_timeout = (
             pod_ready_timeout
             if pod_ready_timeout is not None
@@ -612,9 +562,6 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             else kwargs.get("allow_metadata_server", False)
         )
         self.allow_metadata_server: bool = _parse_bool(raw_allow_meta, default=False)
-        self.assume_network_policy_enforced: bool = _parse_bool(
-            kwargs.get("assume_network_policy_enforced"), default=False
-        )
 
         # Decoupled mode flag (--ek decoupled=true)
         self.decoupled: bool = _parse_bool(kwargs.get("decoupled"), default=False)
@@ -703,7 +650,9 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._job_uid: str | None = None
 
         self._active_strategy: str | None = "native" if self._compose_mode else None
-        self._active_compute_class: str | None = self._resolve_active_compute_class()
+        # Depends on Autopilot mode, so `start()` resolves it from the cluster
+        # capabilities.
+        self._active_compute_class: str | None = None
         raw_max_pods = kwargs.get("max_concurrent_pods")
         self.max_concurrent_pods: int | None = (
             int(raw_max_pods) if raw_max_pods is not None else None
@@ -737,7 +686,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     async def _ensure_client(self):
         """Ensure Kubernetes client is initialized via the singleton manager."""
         if self._client_manager is None:
-            self._client_manager = await KubernetesClientManager.get_instance()
+            self._client_manager = KubernetesClientManager.get_instance()
         if self._core_api is None:
             self._core_api = await self._client_manager.get_client(
                 self.cluster_name, self.location, self.project_id
@@ -751,17 +700,8 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             self._custom_api = k8s_client.CustomObjectsApi(api_client)
 
     @property
-    def _fqdn_network_policy_supported(self) -> bool:
-        """Whether the cluster supports FQDNNetworkPolicy custom resources."""
-        if self._enable_fqdn_network_policy is not None:
-            return self._enable_fqdn_network_policy
-        api_client = getattr(self._core_api, "api_client", None)
-        return KubernetesClientManager.is_fqdn_network_policy_supported(
-            api_client=api_client,
-            cluster_name=self.cluster_name,
-            region=self.location,
-            project_id=self.project_id,
-        )
+    def _cluster_key(self) -> tuple[str, str, str]:
+        return (self.project_id, self.location, self.cluster_name)
 
     @staticmethod
     @override
@@ -781,21 +721,11 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     @property
     @override
     def capabilities(self) -> EnvironmentCapabilities:
-        caps = _CLUSTER_CAPABILITIES_CACHE.get(
-            (self.project_id or "", self.location or "", self.cluster_name or "")
-        )
-        has_netpol = (
-            bool(
-                caps.network_policy_enforced is True
-                or (
-                    caps.network_policy_enforced is None
-                    and self.assume_network_policy_enforced
-                )
-            )
-            if caps
-            else True
-        )
-        has_fqdn = has_netpol and self._fqdn_network_policy_supported
+        # Probes the cluster on first use (Harbor may read this from the
+        # constructor) and raises if the probe fails.
+        caps = self._cluster_capabilities()
+        has_netpol = caps.network_policy_enforced is True
+        has_fqdn = has_netpol and caps.fqdn_network_policy_supported
         return EnvironmentCapabilities(
             gpus=True,
             tpus=True,
@@ -974,212 +904,66 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             image_name="task",
         )
 
-    async def is_autopilot(self) -> bool:
-        """Detect whether the target GKE cluster is an Autopilot cluster.
-
-        Detection signals:
-        1. Memoized cached determination on instance.
-        2. Explicit user override (--ek autopilot=true/false).
-        3. Memoized process-level cluster determination.
-        4. Singleflight probe via GCP Container API / gcloud CLI:
-           `gcloud container clusters describe <cluster> --location=<location> --project=<project> --format="value(autopilot.enabled)"`
-        5. Fallback to node labels if gcloud fails or is inaccessible.
-        """
-        if self._is_autopilot_cached is not None:
-            return self._is_autopilot_cached
-
-        cluster_key = (self.project_id, self.location, self.cluster_name)
-        if cluster_key in _CLUSTER_AUTOPILOT_CACHE:
-            self._is_autopilot_cached = _CLUSTER_AUTOPILOT_CACHE[cluster_key]
-            return self._is_autopilot_cached
-
-        lock = _get_cluster_autopilot_lock()
-        async with lock:
-            if cluster_key in _CLUSTER_AUTOPILOT_CACHE:
-                self._is_autopilot_cached = _CLUSTER_AUTOPILOT_CACHE[cluster_key]
-                return self._is_autopilot_cached
-            if cluster_key in _CLUSTER_AUTOPILOT_TASKS:
-                task = _CLUSTER_AUTOPILOT_TASKS[cluster_key]
-            else:
-
-                async def _probe_and_clean() -> bool:
-                    try:
-                        return await self._probe_cluster_autopilot()
-                    finally:
-                        async with lock:
-                            _CLUSTER_AUTOPILOT_TASKS.pop(cluster_key, None)
-
-                task = asyncio.create_task(_probe_and_clean())
-                _CLUSTER_AUTOPILOT_TASKS[cluster_key] = task
-
-        is_auto = await asyncio.shield(task)
-
-        self._is_autopilot_cached = is_auto
-        return is_auto
-
-    async def _probe_cluster_autopilot(self) -> bool:
-        cluster_key = (self.project_id, self.location, self.cluster_name)
-        # Primary authoritative check via gcloud CLI
-        try:
-            cmd = [
-                "gcloud",
-                "container",
-                "clusters",
-                "describe",
-                self.cluster_name,
-                "--location",
-                self.location,
-                "--project",
-                self.project_id,
-                "--format=value(autopilot.enabled)",
-                "--quiet",
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-            if proc.returncode == 0:
-                out = stdout.decode().strip()
-                is_auto = out.lower() == "true"
-                _CLUSTER_AUTOPILOT_CACHE[cluster_key] = is_auto
-                return is_auto
-            self.logger.debug(
-                f"gcloud clusters describe failed (code {proc.returncode}): {stderr.decode().strip()}"
-            )
-        except Exception as exc:
-            self.logger.debug(
-                f"Could not query cluster autopilot status via gcloud: {exc}"
-            )
-
-        # Fallback: Node labels (if nodes are already running)
-        try:
-            await self._ensure_client()
-            nodes = await asyncio.to_thread(self._api.list_node, limit=5)
-            for node in getattr(nodes, "items", []):
-                labels = getattr(node.metadata, "labels", None) or {}
-                if labels.get("cloud.google.com/gke-autopilot") == "true":
-                    _CLUSTER_AUTOPILOT_CACHE[cluster_key] = True
-                    return True
-                if (
-                    "autopilot"
-                    in labels.get("cloud.google.com/gke-nodepool", "").lower()
-                ):
-                    _CLUSTER_AUTOPILOT_CACHE[cluster_key] = True
-                    return True
-        except Exception as exc:
-            self.logger.debug(f"Could not list nodes to detect Autopilot: {exc}")
-
-        _CLUSTER_AUTOPILOT_CACHE[cluster_key] = False
-        return False
-
-    async def _get_cluster_capabilities(
-        self, is_autopilot: bool | None = None
-    ) -> ClusterCapabilities:
-        cluster_key = (self.project_id, self.location, self.cluster_name)
-        if cluster_key in _CLUSTER_CAPABILITIES_CACHE:
-            return _CLUSTER_CAPABILITIES_CACHE[cluster_key]
-
-        async def _probe_once() -> ClusterCapabilities:
-            eff_auto = (
-                is_autopilot if is_autopilot is not None else await self.is_autopilot()
-            )
-            probed = await asyncio.to_thread(
-                probe_cluster_via_gcloud,
-                self.cluster_name,
-                self.project_id,
-                self.location,
-            )
-            if probed is not None:
-                base = probed
-            elif not eff_auto:
-                base = ClusterCapabilities(
-                    is_autopilot=False,
-                    dind_availability=DindAvailability.DIND_AVAILABLE,
-                    dind_reason="Standard GKE cluster supports privileged DinD containers.",
-                )
-            else:
-                base = ClusterCapabilities(
-                    is_autopilot=True,
-                    dind_availability=DindAvailability.DIND_UNAVAILABLE,
-                    dind_reason="Autopilot cluster DinD capability could not be verified via gcloud.",
-                )
-
-            # Pod-level `spec.resources` is the whole basis of Harbor's task-budget
-            # model on GKE. On a control plane that prunes it, the field vanishes
-            # with no error and the model evaporates in silence. Ask once, here,
-            # while we are already paying for a capability round trip.
-            async with asyncio.TaskGroup() as tg:
-                pod_level_task = tg.create_task(
-                    asyncio.to_thread(
-                        probe_pod_level_resources_support,
-                        self._core_api,
-                        namespace=self.namespace,
-                    )
-                )
-                node_storage_task = tg.create_task(
-                    asyncio.to_thread(
-                        probe_max_node_ephemeral_storage_mb,
-                        self._core_api,
-                    )
-                )
-                net_dns_task = tg.create_task(
-                    asyncio.to_thread(
-                        probe_network_enforcement_and_dns_via_k8s,
-                        self._core_api,
-                    )
-                )
-            supports_pod_level = pod_level_task.result()
-            max_node_storage_mb = node_storage_task.result()
-            k8s_netpol_enforced, k8s_dns_ip = net_dns_task.result()
-
-            if supports_pod_level is False:
-                self.logger.warning(
-                    "Cluster %r does not retain Pod-level `spec.resources` "
-                    "(Kubernetes 1.34+ with the PodLevelResources feature gate is "
-                    "required). Trials whose budget is Pod-level (compose Pods, and "
-                    "direct Pods unless run with `--cpus guarantee --memory "
-                    "guarantee`) will run with no ceiling on the Pod and no "
-                    "ceiling on any container, so a task that exceeds its declared "
-                    "budget is bounded only by the node -- and the resulting "
-                    "kubelet eviction may fall on a different trial's Pod rather "
-                    "than the one at fault.",
-                    self.cluster_name,
-                )
-            known_storage_ceilings = [
-                val
-                for val in (
-                    base.max_node_allocatable_ephemeral_storage_mb,
-                    max_node_storage_mb,
-                )
-                if val is not None and val > 0
-            ]
-            effective_max_storage_mb = (
-                max(known_storage_ceilings) if known_storage_ceilings else None
-            )
-            effective_netpol_enforced = base.network_policy_enforced
-            if effective_netpol_enforced is None:
-                if eff_auto:
-                    effective_netpol_enforced = True
-                else:
-                    effective_netpol_enforced = k8s_netpol_enforced
-            effective_dns_ip = base.kube_dns_cluster_ip or k8s_dns_ip
-            caps = replace(
-                base,
-                supports_pod_level_resources=supports_pod_level,
-                max_node_allocatable_ephemeral_storage_mb=effective_max_storage_mb,
-                network_policy_enforced=effective_netpol_enforced,
-                kube_dns_cluster_ip=effective_dns_ip,
-            )
-            _CLUSTER_CAPABILITIES_CACHE[cluster_key] = caps
+    async def _get_cluster_capabilities(self) -> ClusterCapabilities:
+        caps = _CLUSTER_CAPABILITIES_CACHE.get(self._cluster_key)
+        if caps is not None:
             return caps
+        return await asyncio.to_thread(self._cluster_capabilities)
 
-        task = _CLUSTER_CAPABILITIES_TASKS.get(cluster_key)
-        if task is None or task.done():
-            task = asyncio.create_task(_probe_once())
-            _CLUSTER_CAPABILITIES_TASKS[cluster_key] = task
-        return await task
+    def _cluster_capabilities(self) -> ClusterCapabilities:
+        """Return the cluster's capabilities, probing once per process.
+
+        Synchronous because Harbor reads ``capabilities`` from the environment
+        constructor. Blocks while the first probe runs; any failure raises and
+        is not cached, so a later call probes again.
+        """
+        key = self._cluster_key
+        caps = _CLUSTER_CAPABILITIES_CACHE.get(key)
+        if caps is not None:
+            return caps
+        with _CLUSTER_CAPABILITIES_LOCK:
+            caps = _CLUSTER_CAPABILITIES_CACHE.get(key)
+            if caps is None:
+                caps = self._probe_cluster_capabilities()
+                _CLUSTER_CAPABILITIES_CACHE[key] = caps
+        return caps
+
+    def _probe_cluster_capabilities(self) -> ClusterCapabilities:
+        base = probe_cluster_via_gcloud(
+            self.cluster_name, self.project_id, self.location
+        )
+        manager = KubernetesClientManager.get_instance()
+        with manager.scoped_client(
+            self.cluster_name, self.location, self.project_id
+        ) as core_api:
+            # Pod-level `spec.resources` is the whole basis of Harbor's
+            # task-budget model on GKE. On a control plane that prunes it, the
+            # field vanishes with no error and the model evaporates in silence.
+            supports_pod_level = probe_pod_level_resources_support(
+                core_api, namespace=self.namespace
+            )
+            kube_dns_ip = probe_kube_dns_cluster_ip(core_api)
+            fqdn_supported = probe_fqdn_network_policy_support(core_api)
+
+        if not supports_pod_level:
+            self.logger.warning(
+                "Cluster %r does not retain Pod-level `spec.resources` "
+                "(Kubernetes 1.34+ with the PodLevelResources feature gate is "
+                "required). Trials whose budget is Pod-level (compose Pods, and "
+                "direct Pods unless run with `--cpus guarantee --memory "
+                "guarantee`) will run with no ceiling on the Pod and no "
+                "ceiling on any container, so a task that exceeds its declared "
+                "budget is bounded only by the node -- and the resulting "
+                "kubelet eviction may fall on a different trial's Pod rather "
+                "than the one at fault.",
+                self.cluster_name,
+            )
+        return replace(
+            base,
+            supports_pod_level_resources=supports_pod_level,
+            kube_dns_cluster_ip=kube_dns_ip,
+            fqdn_network_policy_supported=fqdn_supported,
+        )
 
     def _verify_network_enforcement(self, caps: ClusterCapabilities) -> None:
         """Fail closed if NetworkPolicy or metadata server blocking is required on an unenforced cluster."""
@@ -1188,7 +972,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             and self.allow_metadata_server
         ):
             return
-        if caps.network_policy_enforced is False:
+        if caps.network_policy_enforced is not True:
             raise RuntimeError(
                 f"Cannot start trial for task {self.environment_name!r} on GKE cluster "
                 f"{self.cluster_name!r}: active Kubernetes NetworkPolicy enforcement is required "
@@ -1201,32 +985,48 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "If this is a public-network task and you explicitly accept unisolated metadata "
                 "server access on this cluster, pass `--ek allow_metadata_server=true`."
             )
-        if caps.network_policy_enforced is None and not self.assume_network_policy_enforced:
-            raise RuntimeError(
-                f"Could not verify NetworkPolicy enforcement on cluster {self.cluster_name!r} "
-                f"for task {self.environment_name!r} (network_policy_enforced is unknown/None). "
-                "Refusing to fail open because network isolation or metadata server protection "
-                f"is required (network_mode={self.network_policy.network_mode.value!r}, "
-                f"allow_metadata_server={self.allow_metadata_server}). "
-                "Ensure 'gcloud container clusters describe' (container.clusters.get) or "
-                "kube-system Pod read access is available, or pass "
-                "'--ek assume_network_policy_enforced=true' to override."
-            )
 
     @override
     async def start(self, force_build: bool):
         """Start a pod in GKE."""
         self._force_build = force_build
         await self._ensure_client()
-        is_autopilot = await self.is_autopilot()
-        # Safe from here on: `start()` is async and already off the constructor
-        # path, so `_compose_needs_dind` may run `docker compose config`.
-        self._compose_dind_probe_enabled = True
         # Capabilities are cached per cluster, so this costs one probe per process.
-        caps = await self._get_cluster_capabilities(is_autopilot)
+        caps = await self._get_cluster_capabilities()
+        is_autopilot = caps.is_autopilot
         self._verify_network_enforcement(caps)
         # Refuse contradictory placement settings before anything is created.
-        self._validate_placement(caps, is_autopilot=is_autopilot)
+        self._validate_placement(caps)
+
+        # The ComputeClass (storage sizing), the node pool and the NetworkPolicy
+        # handshake below all depend on whether the Pod gets an in-Pod Docker
+        # daemon. They read the placement resolved here from exactly the
+        # arguments `translate_compose` receives, so they describe the Pod that
+        # is built. A project that cannot run fails here, as translation would.
+        compose_placement_args: dict[str, Any] = {}
+        if self._compose_mode:
+            compose_placement_args = {
+                "compose_path": self._all_compose_paths,
+                "compose_env": resolve_compose_infra_env(
+                    self, use_prebuilt=bool(self.task_env_config.docker_image)
+                ),
+                "task_dir": getattr(self, "task_dir", None)
+                or self.environment_dir.parent,
+                "compose_placement": self.compose_placement,
+                "is_autopilot": is_autopilot,
+                "cluster_capabilities": caps,
+                "effective_gpus": self._effective_gpus,
+                "gpu_types": self._effective_gpu_types,
+                "gpu_override": self.gpu_override,
+                "default_gpu_type": self.default_gpu_type,
+                "default_gpu_count": self.default_gpu_count,
+                "logger": self.logger,
+            }
+            resolved = await asyncio.to_thread(
+                resolve_compose_placement, **compose_placement_args
+            )
+            self._compose_placement = resolved.plan
+
         self._active_compute_class = self._resolve_active_compute_class(
             is_autopilot=is_autopilot
         )
@@ -1242,13 +1042,9 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         if self._compose_mode:
             await self._ensure_client()
-            compose_paths = self._all_compose_paths
-            compose_env = resolve_compose_infra_env(
-                self, use_prebuilt=bool(self.task_env_config.docker_image)
-            )
+            compose_paths = compose_placement_args["compose_path"]
+            compose_env = compose_placement_args["compose_env"]
             self._active_strategy = "native"
-            is_autopilot = await self.is_autopilot()
-            cluster_caps = await self._get_cluster_capabilities(is_autopilot)
 
             sidecar_builds = discover_compose_build_services(
                 compose_paths,
@@ -1327,7 +1123,8 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             )
             effective_compose_node_pool = self._resolve_active_node_pool()
             self._compose_spec_args = {
-                "compose_path": compose_paths,
+                # The placement inputs, exactly as resolved above.
+                **compose_placement_args,
                 "pod_name": self.pod_name,
                 "namespace": self.namespace,
                 "environment_name": self.environment_name,
@@ -1336,7 +1133,6 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "sidecar_images": sidecar_images,
                 "sidecar_image_urls": sidecar_images,
                 "startup_env": self._startup_env(),
-                "compose_env": compose_env,
                 "cpu_request": self.cpu_request,
                 "cpu_limit": self.cpu_limit,
                 "memory_request": self.memory_request,
@@ -1347,27 +1143,16 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "compose_up_timeout_sec": self.compose_up_timeout_sec,
                 "machine_type": self._active_machine_type,
                 "node_pool": effective_compose_node_pool,
-                "effective_gpus": self._effective_gpus,
-                "gpu_types": self._effective_gpu_types,
-                "gpu_override": self.gpu_override,
-                "default_gpu_type": self.default_gpu_type,
-                "default_gpu_count": self.default_gpu_count,
                 "tpu": self.task_env_config.tpu,
                 "main_workdir": self.task_env_config.workdir
                 if self.task_env_config
                 else None,
                 "service_account_name": self.service_account_name,
-                "compose_placement": self.compose_placement,
                 "image_pull_secrets": self.image_pull_secrets,
                 "runtime_class_name": self.kwargs.get("runtime_class_name"),
-                "is_autopilot": is_autopilot,
-                "cluster_capabilities": cluster_caps,
                 "image_resolver": self._image_resolver,
-                "task_dir": getattr(self, "task_dir", None)
-                or self.environment_dir.parent,
                 "allow_metadata_server": self.allow_metadata_server,
                 "wait_for_netpol": bool(needs_netpol and self._compose_needs_dind()),
-                "logger": self.logger,
             }
             pod = self._build_compose_pod()
             self._created_pod = pod
@@ -1655,17 +1440,11 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         return max(total_deadline_sec, 60)
 
-    def _build_compose_pod(
-        self, compute_class: str | None | Any = _COMPUTE_CLASS_UNSET
-    ) -> k8s_client.V1Pod:
+    def _build_compose_pod(self) -> k8s_client.V1Pod:
         if self._compose_spec_args is None:
             raise RuntimeError("Compose spec arguments not initialized")
         args = dict(self._compose_spec_args)
-        args["compute_class"] = (
-            self._active_compute_class
-            if compute_class is _COMPUTE_CLASS_UNSET
-            else compute_class
-        )
+        args["compute_class"] = self._active_compute_class
         args["active_deadline_seconds"] = self._resolve_active_deadline_seconds()
 
         override_val = self.kwargs.get("override_entrypoint")
@@ -1673,14 +1452,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         return translate_compose(**args)
 
-    def _build_direct_pod(
-        self, compute_class: str | None | Any = _COMPUTE_CLASS_UNSET
-    ) -> k8s_client.V1Pod:
-        effective_compute_class = (
-            self._active_compute_class
-            if compute_class is _COMPUTE_CLASS_UNSET
-            else compute_class
-        )
+    def _build_direct_pod(self) -> k8s_client.V1Pod:
         return build_direct_pod(
             pod_name=self.pod_name,
             namespace=self.namespace,
@@ -1701,7 +1473,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             active_deadline_seconds=self._resolve_active_deadline_seconds(),
             workdir=self.task_env_config.workdir if self.task_env_config else None,
             service_account_name=self.service_account_name,
-            compute_class=effective_compute_class,
+            compute_class=self._active_compute_class,
             image_pull_secrets=self.image_pull_secrets,
             override_entrypoint=_parse_bool(
                 self.kwargs.get("override_entrypoint"), default=False
@@ -1724,7 +1496,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         return any(kw in err_lower for kw in keywords)
 
     def _get_admission_controller(self) -> ClusterAdmissionController:
-        cluster_key = (self.project_id, self.location, self.cluster_name)
+        cluster_key = self._cluster_key
         ctrl = _CLUSTER_ADMISSION_CONTROLLERS.get(cluster_key)
         if ctrl is None:
             ctrl = ClusterAdmissionController()
@@ -1844,9 +1616,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         """Create a Job wrapping the Pod, retrying with runtimeClassName='gvisor' if Autopilot rejects capabilities."""
         self._created_pod = pod
         self._sync_dind_container_routing(pod)
-        cached_caps = _CLUSTER_CAPABILITIES_CACHE.get(
-            (self.project_id, self.location, self.cluster_name)
-        )
+        cached_caps = _CLUSTER_CAPABILITIES_CACHE.get(self._cluster_key)
         if cached_caps is not None:
             self._assert_ephemeral_storage_schedulable(pod, cached_caps)
         ctrl = self._get_admission_controller()
@@ -2220,7 +1990,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         finally:
             await self._release_admission_token()
             if self._client_manager is not None:
-                await self._client_manager.release_client(self._core_api)
+                self._client_manager.release_client(self._core_api)
                 self._core_api = None
                 self._batch_api = None
                 self._networking_api = None
@@ -2460,49 +2230,6 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 f"these containers were not killed themselves. {sizing}"
             )
 
-    async def _reresolve_pod_name(self) -> str:
-        """Re-resolve ``self.pod_name`` from the Job's pods after a 404 or Spot preemption."""
-        from harbor_gke_ext.constants import PodPreemptedError
-
-        await self._ensure_client()
-        if self._api is None:
-            raise RuntimeError("Kubernetes CoreV1Api client is not initialized")
-        pods = await asyncio.to_thread(
-            self._api.list_namespaced_pod,
-            namespace=self.namespace,
-            label_selector=self._job_pod_label_selector(),
-        )
-        for p in getattr(pods, "items", None) or []:
-            meta = getattr(p, "metadata", None)
-            status = getattr(p, "status", None)
-            if meta is None or getattr(meta, "deletion_timestamp", None) is not None:
-                continue
-            phase = getattr(status, "phase", None)
-            reason = getattr(status, "reason", None)
-            if reason in (
-                "Evicted",
-                "NodeLost",
-                "Preempted",
-                "UnexpectedAdmissionError",
-                "DeadlineExceeded",
-            ):
-                continue
-            if phase in ("Running", "Pending") and getattr(meta, "name", None):
-                new_name = str(meta.name)
-                if new_name != self.pod_name:
-                    self.logger.warning(
-                        f"Re-resolved pod for job {self.job_name}: {self.pod_name} -> {new_name}"
-                    )
-                    # `self._dind_services` deliberately needs no adjustment here:
-                    # it is keyed to this environment instance, not to the Pod
-                    # name, so a replacement Pod inherits the routing unchanged.
-                    self.pod_name = new_name
-                    self.pod = p
-                return self.pod_name
-        raise PodPreemptedError(
-            f"Pod {self.pod_name} for job {self.job_name} was preempted or lost and has no active replacement."
-        )
-
     async def _connect_exec_stream(
         self,
         command: list[str],
@@ -2517,39 +2244,21 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         await self._ensure_client()
         if self._api is None:
             raise RuntimeError("Kubernetes CoreV1Api client is not initialized")
-        try:
-            return await connect_exec_stream(
-                self._api,
-                self.pod_name,
-                self.namespace,
-                command,
-                container=container,
-                stderr=stderr,
-                stdin=stdin,
-                stdout=stdout,
-                tty=tty,
-                dind_services=self._dind_services,
-                max_attempts=max_attempts,
-            )
-        except ApiException as e:
-            if _extract_api_status_code(e) == 404:
-                old_name = self.pod_name
-                new_name = await self._reresolve_pod_name()
-                if new_name != old_name:
-                    return await connect_exec_stream(
-                        self._api,
-                        self.pod_name,
-                        self.namespace,
-                        command,
-                        container=container,
-                        stderr=stderr,
-                        stdin=stdin,
-                        stdout=stdout,
-                        tty=tty,
-                        dind_services=self._dind_services,
-                        max_attempts=max_attempts,
-                    )
-            raise
+        # Always the Pod `start()` brought up. The Job may replace a disrupted
+        # Pod, but the trial's state died with the old one, so a 404 propagates.
+        return await connect_exec_stream(
+            self._api,
+            self.pod_name,
+            self.namespace,
+            command,
+            container=container,
+            stderr=stderr,
+            stdin=stdin,
+            stdout=stdout,
+            tty=tty,
+            dind_services=self._dind_services,
+            max_attempts=max_attempts,
+        )
 
     async def _terminate_lingering_phase_connections(self) -> None:
         """Best-effort teardown of active outbound sockets/conntrack flows across phase narrowing."""
@@ -2596,9 +2305,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         pod_labels = (
             target_pod.metadata.labels if (target_pod and target_pod.metadata) else None
         )
-        cached_caps = _CLUSTER_CAPABILITIES_CACHE.get(
-            (self.project_id or "", self.location or "", self.cluster_name or "")
-        )
+        caps = await self._get_cluster_capabilities()
         await apply_network_policy(
             networking_api=self._networking_api,
             custom_api=self._custom_api,
@@ -2606,16 +2313,14 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             pod_name=self.pod_name,
             session_id=self.session_id,
             network_policy=network_policy,
-            fqdn_supported=self._fqdn_network_policy_supported,
+            fqdn_supported=caps.fqdn_network_policy_supported,
             allow_metadata_server=self.allow_metadata_server,
             pod_uid=pod_uid,
             pod_labels=pod_labels,
             policy_key=self.job_name,
             dns_egress_extra_cidrs=self.dns_egress_extra_cidrs,
             allow_pod_ingress=self.allow_pod_ingress,
-            kube_dns_cluster_ip=(
-                cached_caps.kube_dns_cluster_ip if cached_caps else None
-            ),
+            kube_dns_cluster_ip=caps.kube_dns_cluster_ip,
         )
         self._applied_network_mode = network_policy.network_mode
         if self._pod_ready:
@@ -2866,11 +2571,9 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             container=container,
         )
 
-    async def _wait_for_container_exec_ready(
-        self, max_attempts: int = 18, container: str | None = None
-    ) -> None:
+    async def _wait_for_container_exec_ready(self, container: str | None = None) -> None:
         await self._ensure_client()
-        attempts = max(1, max_attempts)
+        attempts = _EXEC_READY_MAX_ATTEMPTS
         for attempt in range(attempts):
             if self._api is not None:
                 await check_pod_terminated(
@@ -3096,7 +2799,6 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         require_dir: bool,
         service: str | None = None,
         user: str | int | None = None,
-        timeout_sec: int = 60,
     ) -> bool:
         """Execute a direct test -d or test -f in the target container without supervision overhead."""
         command = self._path_kind_check_command(path, require_dir=require_dir)
@@ -3112,7 +2814,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     if container is not None:
                         result = await self.exec(
                             command,
-                            timeout_sec=timeout_sec,
+                            timeout_sec=_PATH_KIND_CHECK_TIMEOUT_SEC,
                             user=user,
                             supervised=False,
                             container=container,
@@ -3120,7 +2822,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     else:
                         result = await self.exec(
                             command,
-                            timeout_sec=timeout_sec,
+                            timeout_sec=_PATH_KIND_CHECK_TIMEOUT_SEC,
                             user=user,
                             supervised=False,
                         )
@@ -3134,7 +2836,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 raise RuntimeError(f"Path kind check for {path!r} produced no result")
             if result.return_code == 124:
                 raise TimeoutError(
-                    f"Path kind check for {path!r} timed out after {timeout_sec}s"
+                    f"Path kind check for {path!r} timed out after {_PATH_KIND_CHECK_TIMEOUT_SEC}s"
                 )
             return result.return_code == 0
         except TimeoutError:
@@ -3300,85 +3002,15 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         return storage_mb
 
     def _compose_needs_dind(self) -> bool:
-        """Whether this Compose task will run an in-Pod Docker daemon (Shape B).
+        """Whether this Compose task's Pod runs an in-Pod Docker daemon (Shape B or C).
 
-        Answering this requires the merged, interpolated Compose project, which
-        ``normalize_compose_project`` produces by shelling out to
-        ``docker compose config``. Two consequences shape this method:
-
-        - It is gated on ``_compose_dind_probe_enabled``, which ``start()`` sets.
-          ``__init__`` also resolves a ComputeClass, and running a subprocess
-          from a constructor is not acceptable. The constructor's answer is
-          discarded anyway: ``start()`` re-resolves the ComputeClass once the
-          cluster probe has reported whether this is an Autopilot cluster.
-        - The result is cached, because the subprocess is not cheap and this is
-          on the path of every trial.
-
-        Image references are deliberately left uninterpolated here. This runs
-        before images are built and pushed, so ``${MAIN_IMAGE_NAME}`` resolves to
-        a placeholder. That does not matter: nothing that triggers DinD
-        placement (``privileged``, a mounted Docker socket, unsafe sysctls,
-        ``init``, ``pids_limit``) depends on the image name.
-
-        Returns ``False`` when the shape cannot be determined, which preserves
-        the previous behaviour of ignoring the DinD plane entirely.
+        Read from the placement ``start()`` resolves with the same arguments it
+        passes to ``translate_compose``, so the answer always describes the Pod
+        that is built. Before ``start()`` (the constructor's ComputeClass, which
+        ``start()`` resolves again) and for non-Compose tasks it is ``False``.
         """
-        if not self._compose_mode or not self._compose_dind_probe_enabled:
-            return False
-        if self._compose_needs_dind_cached is not None:
-            return self._compose_needs_dind_cached
-
-        needs_dind = False
-        try:
-            from harbor_gke_ext.compose_spec import normalize_compose_project
-            from harbor_gke_ext.placement import classify_compose_placement
-
-            paths = []
-            if self._environment_docker_compose_path.exists():
-                paths.append(self._environment_docker_compose_path)
-            paths.extend(p for p in self.extra_docker_compose_paths if p.exists())
-            if not paths:
-                self._compose_needs_dind_cached = False
-                return False
-
-            base_dir = Path(paths[0]).resolve().parent
-            task_dir = getattr(self, "task_dir", None) or self.environment_dir.parent
-
-            mode: ComposePlacementMode = self.compose_placement
-            compose_env = resolve_compose_infra_env(
-                self,
-                use_prebuilt=bool(
-                    getattr(self, "task_env_config", None)
-                    and self.task_env_config.docker_image
-                ),
-            )
-
-            project = normalize_compose_project(
-                paths,
-                compose_env,
-                context_dir=base_dir,
-                task_dir=Path(task_dir),
-            )
-            plan = classify_compose_placement(
-                project,
-                task_dir=Path(task_dir),
-                base_dir=base_dir,
-                compose_placement=mode,
-                logger=self.logger,
-            )
-            needs_dind = plan.shape in ("B", "C") or bool(plan.dind_sidecars)
-        except Exception as exc:
-            # Includes UnsupportedComposeFeatureError for Shape C tasks. Those
-            # fail later during translation with the full diagnostic; surfacing
-            # the failure here would only move it earlier and change the error
-            # path for a decision that merely sizes storage.
-            self.logger.debug(
-                f"Could not determine Compose DinD placement for storage sizing: {exc}"
-            )
-            needs_dind = False
-
-        self._compose_needs_dind_cached = needs_dind
-        return needs_dind
+        plan = self._compose_placement
+        return plan is not None and plan.shape in ("B", "C")
 
     def _effective_total_ephemeral_storage_mb(self) -> int:
         """Estimate the Pod's total ephemeral-storage request, in MiB.
@@ -3518,12 +3150,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         machine_type, _ = self._resolve_active_machine_type_with_source()
         return machine_type
 
-    def _validate_placement(
-        self,
-        caps: ClusterCapabilities,
-        *,
-        is_autopilot: bool = False,
-    ) -> None:
+    def _validate_placement(self, caps: ClusterCapabilities) -> None:
         """Reject contradictory placement settings for the current task.
 
         Each task must resolve to one placement mechanism. Silent precedence is
@@ -3544,7 +3171,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         active_mt, mt_source = self._resolve_active_machine_type_with_source()
 
         # 1. Autopilot has no user node pools.
-        if (is_autopilot or caps.is_autopilot) and active_pool:
+        if caps.is_autopilot and active_pool:
             raise PlacementConflictError(
                 f"Task {self.environment_name!r} specifies node pool "
                 f"{active_pool!r}, but cluster {self.cluster_name!r} is a GKE "
@@ -3681,9 +3308,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 )
         return self.dind_storage_mb
 
-    def _resolve_active_compute_class(
-        self, is_autopilot: bool | None = None
-    ) -> str | None:
+    def _resolve_active_compute_class(self, *, is_autopilot: bool) -> str | None:
         """Resolve the ComputeClass for the current task.
 
         A node pool and a ComputeClass emit mutually exclusive node selectors
@@ -3719,17 +3344,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             task_key
         ) or self.task_compute_classes.get(task_base)
 
-        autopilot = (
-            is_autopilot
-            if is_autopilot is not None
-            else (
-                self._is_autopilot_cached
-                if self._is_autopilot_cached is not None
-                else False
-            )
-        )
-
-        if not autopilot:
+        if not is_autopilot:
             if task_specific_class:
                 return task_specific_class
             return self.compute_class
@@ -3832,6 +3447,10 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     name=self.pod_name,
                     namespace=self.namespace,
                 )
+                if self._is_pod_lost(pod):
+                    await self._follow_job_replacement_pod()
+                    await asyncio.sleep(poll_interval)
+                    continue
 
                 try:
                     events = await asyncio.to_thread(
@@ -4018,10 +3637,74 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             except ApiException as e:
                 if e.status != 404:
                     raise RuntimeError(f"Kubernetes API error: {e.status} - {e.reason}")
+                # The Pod is gone, for example force-deleted after its node was lost.
+                await self._follow_job_replacement_pod()
 
             await asyncio.sleep(poll_interval)
 
         raise RuntimeError(f"Pod not ready after {timeout_sec} seconds")
+
+    @staticmethod
+    def _is_pod_lost(pod: Any) -> bool:
+        """Whether the Pod is being deleted or was disrupted into ``Failed``.
+
+        Node-pressure eviction leaves a ``Failed`` Pod with ``DisruptionTarget``
+        and no deletion timestamp. The condition alone is not enough: Kubernetes
+        may set it and then not delete the Pod.
+        """
+        if GKEEnvironment._is_pod_terminating(pod):
+            return True
+        status = getattr(pod, "status", None)
+        return getattr(status, "phase", None) == "Failed" and any(
+            c.type == "DisruptionTarget" and c.status == "True"
+            for c in (getattr(status, "conditions", None) or [])
+        )
+
+    async def _follow_job_replacement_pod(self) -> None:
+        """Switch to the Pod the Job created to replace a lost one.
+
+        The Job replaces a disrupted Pod (see `build_job`), but only after the
+        lost Pod is terminal, so finding no replacement yet is normal. A terminal
+        Job creates no more Pods, so that fails at once. Only the bring-up
+        follows a replacement: once `start()` returns, the trial's state lives
+        in its Pod and a lost Pod is a lost trial.
+        """
+        pods = await asyncio.to_thread(
+            self._api.list_namespaced_pod,
+            namespace=self.namespace,
+            label_selector=self._job_pod_label_selector(),
+        )
+        for candidate in getattr(pods, "items", None) or []:
+            name = candidate.metadata.name
+            if (
+                name != self.pod_name
+                and candidate.status.phase in ("Pending", "Running")
+                and not self._is_pod_lost(candidate)
+            ):
+                self.logger.warning(
+                    f"Pod {self.pod_name} was lost before the trial started; "
+                    f"continuing with replacement Pod {name} from Job {self.job_name}."
+                )
+                self.pod = candidate
+                self.pod_name = name
+                # Earned by the lost Pod; its replacement starts from scratch.
+                self._seed_uploaded = False
+                self._dind_netpol_applied = False
+                self._main_gate_released = False
+                return
+
+        job = await asyncio.to_thread(
+            self._batch_api.read_namespaced_job,
+            name=self.job_name,
+            namespace=self.namespace,
+        )
+        for condition in getattr(job.status, "conditions", None) or []:
+            if condition.type in ("Failed", "Complete") and condition.status == "True":
+                raise TrialContainerLostError(
+                    f"Pod {self.pod_name} was lost before the trial started and "
+                    f"Job {self.job_name} will not replace it "
+                    f"({condition.type}: {condition.reason}: {condition.message})."
+                )
 
     def _pod_request_summary(self) -> str:
         """Describe what the created Pod asked the scheduler for.
@@ -4093,7 +3776,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                         )
         return "; ".join(reasons) if reasons else "No failure details available"
 
-    async def _collect_failed_container_logs(self, pod, tail_lines: int = 80) -> str:
+    async def _collect_failed_container_logs(self, pod) -> str:
         """Collect the tail of logs for every container that terminated with a non-zero exit code.
 
         Container logs are destroyed once the Pod object is deleted, so they must be
@@ -4114,7 +3797,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     name=self.pod_name,
                     namespace=self.namespace,
                     container=c.name,
-                    tail_lines=tail_lines,
+                    tail_lines=_FAILED_CONTAINER_LOG_TAIL_LINES,
                 )
             except Exception as log_err:
                 sections.append(
@@ -4123,15 +3806,13 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 continue
             body = (log_text or "").strip()
             sections.append(
-                f"--- last {tail_lines} log lines of failed container '{c.name}' "
+                f"--- last {_FAILED_CONTAINER_LOG_TAIL_LINES} log lines of failed container '{c.name}' "
                 f"(exit code {terminated.exit_code}) ---\n"
                 f"{body or '(no output)'}"
             )
         return "\n".join(sections)
 
-    async def _collect_infra_container_logs(
-        self, pod, *, limit_bytes: int = 16384
-    ) -> str:
+    async def _collect_infra_container_logs(self, pod) -> str:
         """Capture the logs of Harbor's DinD infrastructure containers on success.
 
         ``_collect_failed_container_logs`` only fires when a container exits
@@ -4147,7 +3828,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         and task output already has dedicated destinations, and duplicating it
         here would bury the infrastructure signal.
 
-        ``limit_bytes`` reads from the START of the stream rather than using
+        ``_INFRA_CONTAINER_LOG_LIMIT_BYTES`` reads from the START of the stream rather than using
         ``tail_lines``. ``dind-engine`` prints the GPU probe result and then
         hands off to a very chatty ``dockerd``, so a tail would reliably
         discard exactly the lines worth keeping.
@@ -4184,14 +3865,14 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     name=self.pod_name,
                     namespace=self.namespace,
                     container=name,
-                    limit_bytes=limit_bytes,
+                    limit_bytes=_INFRA_CONTAINER_LOG_LIMIT_BYTES,
                 )
             except Exception as log_err:
                 sections.append(f"--- '{name}' logs unavailable: {log_err} ---")
                 continue
             body = (log_text or "").strip()
             sections.append(
-                f"--- first {limit_bytes}B of DinD infrastructure container "
+                f"--- first {_INFRA_CONTAINER_LOG_LIMIT_BYTES}B of DinD infrastructure container "
                 f"'{name}' ---\n{body or '(no output)'}"
             )
         return "\n".join(sections)

@@ -6,16 +6,8 @@ from harbor_gke_ext.cloud_build import (
     check_image_exists_in_registry,
     submit_cloud_build,
     build_task_image_if_missing,
-    reset_image_registry_cache,
 )
 from pathlib import Path
-
-
-@pytest.fixture(autouse=True)
-def cleanup_cache():
-    reset_image_registry_cache()
-    yield
-    reset_image_registry_cache()
 
 
 @pytest.mark.unit
@@ -86,8 +78,6 @@ async def test_check_image_exists_in_registry_coalescing_and_exception():
     ):
         exists = await check_image_exists_in_registry("error-image", "test-proj")
         assert exists is False
-
-    reset_image_registry_cache()
 
     # Test task coalescing when two queries happen concurrently
     async def delayed_query(*args, **kwargs):
@@ -360,33 +350,33 @@ async def test_submit_cloud_build_poll_failures_and_timeout(tmp_path):
         )
         assert res is False
 
-    # 4. Timeout
-    with (
-        patch("asyncio.create_subprocess_exec") as mock_exec,
-        patch("asyncio.wait_for", side_effect=asyncio.TimeoutError()),
-    ):
+    # 4. Timeout: the build never leaves WORKING. timeout_sec=0 expires at the
+    # poll loop's first real suspension, so no wall-clock time is spent.
+    with patch("asyncio.create_subprocess_exec") as mock_exec:
         mock_submit = AsyncMock()
         mock_submit.returncode = 0
         mock_submit.communicate.return_value = (b"b-1234\n", b"")
-        mock_exec.return_value = mock_submit
 
-        with pytest.raises(RuntimeError, match="timed out"):
-            await submit_cloud_build(
-                build_context=tmp_path,
-                image_url="test-image",
-                project_id="test-proj",
-                region="us-central1",
-                reraise=True,
-            )
+        mock_poll_working = AsyncMock()
+        mock_poll_working.returncode = 0
+        mock_poll_working.communicate.return_value = (b"WORKING\n", b"")
 
-        res = await submit_cloud_build(
+        mock_exec.side_effect = lambda *cmd, **_: (
+            mock_submit if cmd[2] == "submit" else mock_poll_working
+        )
+
+        timeout_kwargs = dict(
             build_context=tmp_path,
             image_url="test-image",
             project_id="test-proj",
             region="us-central1",
-            reraise=False,
+            timeout_sec=0,
+            polling_interval_sec=0,
         )
-        assert res is False
+        with pytest.raises(RuntimeError, match="timed out"):
+            await submit_cloud_build(**timeout_kwargs, reraise=True)
+
+        assert await submit_cloud_build(**timeout_kwargs, reraise=False) is False
 
 
 @pytest.mark.unit
@@ -407,7 +397,6 @@ def test_parse_artifact_registry_url():
 async def test_ensure_artifact_registry_exists_already_present():
     from harbor_gke_ext.cloud_build import ensure_artifact_registry_exists
 
-    reset_image_registry_cache()
     mock_logger = MagicMock()
 
     with patch("asyncio.create_subprocess_exec") as mock_exec:
@@ -441,7 +430,6 @@ async def test_ensure_artifact_registry_exists_already_present():
 async def test_ensure_artifact_registry_exists_handles_already_exists_race():
     from harbor_gke_ext.cloud_build import ensure_artifact_registry_exists
 
-    reset_image_registry_cache()
     mock_logger = MagicMock()
 
     describe_proc = AsyncMock()
@@ -474,7 +462,6 @@ async def test_build_task_image_if_missing_cache_miss_calls_submit_cloud_build_w
     from harbor_gke_ext.cloud_build import build_task_image_if_missing
 
     (tmp_path / "Dockerfile").write_text("FROM alpine\n")
-    reset_image_registry_cache()
     image_url = "us-central1-docker.pkg.dev/test-proj/harbor-tasks/t1:abc"
     with (
         patch(

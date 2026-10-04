@@ -524,7 +524,7 @@ Many public benchmark images are built exclusively for `linux/amd64`. `harbor-gk
 Before creating a Pod, `_assert_ephemeral_storage_schedulable()` compares the Pod's peak `ephemeral-storage` request against the largest allocatable ephemeral storage of any schedulable node in the cluster, and fails fast with `EphemeralStorageUnschedulableError` if the request is larger.
 
 - **Peak request:** computed the way the scheduler computes it. App containers and restartable init containers (sidecars) add up; one-shot init containers count as the largest single one.
-- **Ceiling:** the larger of an estimate from the cluster configuration (every untainted node pool with `maxNodes > 0`, including pools scaled to zero, plus the NAP defaults when NAP is enabled) and the largest `status.allocatable["ephemeral-storage"]` among live nodes.
+- **Ceiling:** an estimate from the cluster configuration: every node pool without a blocking taint and with `maxNodes > 0`, including pools scaled to zero, plus the NAP defaults when NAP is enabled.
 
 The comparison is cluster-wide, not per target pool. The check is skipped when the ceiling is unknown, on Autopilot, and on clusters with Node Auto-Provisioning.
 

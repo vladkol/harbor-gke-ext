@@ -193,6 +193,11 @@ _GKE_DEFAULT_AGENT_TIMEOUT_MINUTES = 1440
 _GKE_DEFAULT_AGENT_SETUP_TIMEOUT_SEC = 360
 _GKE_DEFAULT_VERIFIER_TIMEOUT_SEC = 600
 _GKE_JOB_POD_SPAWN_TIMEOUT_SEC = 600
+# How many times the Job controller replaces a trial Pod lost to infrastructure:
+# preemption, eviction or node loss (`DisruptionTarget`), or a kubelet that
+# rejected the Pod before any container ran. A container that fails on its own
+# fails the Job at once instead. See `pod_builder.build_job`.
+_GKE_JOB_BACKOFF_LIMIT = 3
 _GKE_AUTOPILOT_MAX_GENERAL_PURPOSE_STORAGE_MB = 10240
 # Autopilot injects this ephemeral-storage request into any container that does
 # not declare one. It is a platform figure, not a Harbor choice.
@@ -260,10 +265,6 @@ class TrialContainerLostError(RuntimeError):
     the OOM killer picking a compiler process) is *not* this error. That case is
     reported as the command's non-zero exit code, as it is under Docker.
     """
-
-
-class PodPreemptedError(TrialContainerLostError):
-    """Raised when a trial Pod is preempted, evicted, or lost without an active replacement."""
 
 
 class UnsatisfiableMachineTypeError(RuntimeError):

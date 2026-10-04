@@ -96,9 +96,8 @@ class FrameParser:
     control frame completed by it. Fragmented messages are reassembled.
     """
 
-    def __init__(self, max_message_bytes: int = _MAX_MESSAGE_BYTES) -> None:
+    def __init__(self) -> None:
         self._buffer = bytearray()
-        self._max_message_bytes = max_message_bytes
         self._fragment_opcode: int | None = None
         self._fragments: list[bytes] = []
         self._fragment_bytes = 0
@@ -134,9 +133,9 @@ class FrameParser:
                     break
                 mask_key = bytes(buf[pos : pos + 4])
                 pos += 4
-            if length > self._max_message_bytes:
+            if length > _MAX_MESSAGE_BYTES:
                 raise WebSocketProtocolError(
-                    f"frame of {length} bytes exceeds the {self._max_message_bytes}-byte limit"
+                    f"frame of {length} bytes exceeds the {_MAX_MESSAGE_BYTES}-byte limit"
                 )
             if len(buf) < pos + length:
                 break
@@ -156,7 +155,7 @@ class FrameParser:
                     raise WebSocketProtocolError("continuation frame without a start")
                 self._fragments.append(payload)
                 self._fragment_bytes += len(payload)
-                if self._fragment_bytes > self._max_message_bytes:
+                if self._fragment_bytes > _MAX_MESSAGE_BYTES:
                     raise WebSocketProtocolError("fragmented message exceeds the limit")
                 if fin:
                     messages.append((self._fragment_opcode, b"".join(self._fragments)))
@@ -237,7 +236,6 @@ class ExecStream:
         self._chunks: collections.deque[tuple[int, bytes]] = collections.deque()
         self._status = bytearray()
         self._data_event = asyncio.Event()
-        self._closed_event = asyncio.Event()
         self._closed = False
         self._close_requested = False
         self._end_reason: str | None = None
@@ -252,7 +250,6 @@ class ExecStream:
         *,
         label: str,
         keepalive_ref: Any = None,
-        reactor: ExecReactor | None = None,
     ) -> ExecStream:
         """Hand a connected WebSocket's raw socket to the reactor.
 
@@ -261,7 +258,7 @@ class ExecStream:
         long as the stream exists.
         """
         stream = cls(label, asyncio.get_running_loop())
-        stream._reactor = reactor or get_exec_reactor()
+        stream._reactor = get_exec_reactor()
         stream._entry = _StreamEntry(stream, sock, stream._loop, keepalive_ref)
         stream._reactor.register(stream._entry)
         return stream
@@ -283,7 +280,6 @@ class ExecStream:
         self._end_reason = reason
         self._end_error = error
         self._data_event.set()
-        self._closed_event.set()
 
     # -- Public API -----------------------------------------------------------------
 
@@ -294,14 +290,6 @@ class ExecStream:
     @property
     def status_received(self) -> bool:
         return bool(self._status)
-
-    @property
-    def end_reason(self) -> str | None:
-        return self._end_reason
-
-    @property
-    def end_error(self) -> BaseException | None:
-        return self._end_error
 
     def describe_end(self) -> str:
         """Human-readable description of how the stream ended."""
@@ -338,17 +326,6 @@ class ExecStream:
         future: asyncio.Future[None] = self._loop.create_future()
         self._reactor.submit_write(self._entry, frame, future)
         await future
-
-    async def wait_closed(self, timeout: float | None = None) -> bool:
-        """Wait for the stream to end. Returns ``False`` if ``timeout`` elapsed first."""
-        if self._closed:
-            return True
-        try:
-            async with asyncio.timeout(timeout):
-                await self._closed_event.wait()
-        except TimeoutError:
-            return self._closed
-        return True
 
     def close(self) -> None:
         """Close the stream without blocking. Safe to call more than once."""
@@ -422,10 +399,7 @@ def _fail_future(future: asyncio.Future[None], error: BaseException) -> None:
 class ExecReactor:
     """One thread that performs all socket I/O for every registered exec stream."""
 
-    def __init__(
-        self, ping_interval_sec: float = _GKE_EXEC_STREAM_PING_INTERVAL_SEC
-    ) -> None:
-        self._ping_interval_sec = ping_interval_sec
+    def __init__(self) -> None:
         self._selector = selectors.DefaultSelector()
         self._wake_r, self._wake_w = socket.socketpair()
         self._wake_r.setblocking(False)
@@ -458,13 +432,13 @@ class ExecReactor:
     def request_close(self, entry: _StreamEntry) -> None:
         self._call(lambda: self._finish(entry, END_LOCAL_CLOSE, None))
 
-    def stop(self, join_timeout_sec: float = 2.0) -> None:
+    def stop(self) -> None:
         def _stop() -> None:
             self._stopping = True
 
         self._call(_stop)
         if threading.current_thread() is not self._thread:
-            self._thread.join(timeout=join_timeout_sec)
+            self._thread.join(timeout=2.0)
 
     def _call(self, fn: Callable[[], None]) -> None:
         with self._commands_lock:
@@ -571,7 +545,7 @@ class ExecReactor:
             self._close_socket(entry)
             self._post(entry, entry.stream._on_closed, END_CONNECTION_LOST, e)
             return
-        entry.next_ping = time.monotonic() + self._ping_interval_sec
+        entry.next_ping = time.monotonic() + _GKE_EXEC_STREAM_PING_INTERVAL_SEC
         self._entries.add(entry)
         # TLS may already hold decrypted bytes that select() cannot report.
         self._carry_over.add(entry)
@@ -690,7 +664,7 @@ class ExecReactor:
         now = time.monotonic()
         for entry in list(self._entries):
             if not entry.closed and now >= entry.next_ping:
-                entry.next_ping = now + self._ping_interval_sec
+                entry.next_ping = now + _GKE_EXEC_STREAM_PING_INTERVAL_SEC
                 self._enqueue_control(entry, _OPCODE_PING, b"")
 
     def _deliver_pending(self) -> None:

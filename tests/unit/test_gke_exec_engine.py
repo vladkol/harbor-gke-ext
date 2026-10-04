@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from kubernetes.client.rest import ApiException
 
+from harbor_gke_ext import exec_engine
 from harbor_gke_ext.constants import GKEExecStreamClosedError, TrialContainerLostError
 from harbor_gke_ext.exec_engine import (
     _enable_tcp_keepalive,
@@ -27,7 +28,6 @@ from harbor_gke_ext.exec_engine import (
     connect_exec_stream,
     download_dir,
     download_file,
-    exec_return_code,
     poll_decoupled_exec,
     read_exec_output,
     run_exec_command,
@@ -218,7 +218,7 @@ async def test_connect_exec_stream_hands_socket_to_reactor_with_keepalive():
     raw = ws_client.sock.sock
     assert raw.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) != 0
     stream.close()
-    assert await stream.wait_closed(5)
+    assert await asyncio.wait_for(stream.read(), 5) is None
     peer.close()
 
 
@@ -281,20 +281,78 @@ async def test_connect_exec_stream_status_400_with_pod_check():
     peer.close()
 
 
+def _handshake_error(status: int, reason: str, body: str | None = None) -> ApiException:
+    exc = ApiException(status=status, reason=reason)
+    exc.body = body
+    return exc
+
+
+def _unscheduled_pod() -> MagicMock:
+    pod = MagicMock()
+    pod.metadata.deletion_timestamp = None
+    pod.status.reason = None
+    pod.status.phase = "Pending"
+    pod.spec.node_name = None
+    return pod
+
+
+_POD_CHECKING_HANDSHAKE_ERRORS = {
+    "http_400": lambda: _handshake_error(400, "Bad Request"),
+    "websocket_404": lambda: _handshake_error(0, "Handshake status 404 Not Found"),
+    "kubelet_container_not_found": lambda: _handshake_error(
+        500, "Internal Server Error", 'container not found ("main")'
+    ),
+}
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_connect_exec_stream_status_400_pod_terminated():
-    api = MagicMock()
-    exc = ApiException(status=400, reason="Bad Request")
-    with (
-        patch("harbor_gke_ext.exec_engine.stream", side_effect=exc),
-        patch(
-            "harbor_gke_ext.exec_engine.check_pod_terminated",
-            side_effect=RuntimeError("Dead"),
+@pytest.mark.parametrize(
+    "make_error",
+    list(_POD_CHECKING_HANDSHAKE_ERRORS.values()),
+    ids=list(_POD_CHECKING_HANDSHAKE_ERRORS),
+)
+@pytest.mark.parametrize(
+    ("pod_read", "expected"),
+    [
+        pytest.param(
+            {"side_effect": ApiException(status=404, reason="Not Found")},
+            TrialContainerLostError,
+            id="pod_gone",
         ),
+        pytest.param(
+            {"return_value": _unscheduled_pod()},
+            ApiException,
+            id="pod_unscheduled",
+        ),
+    ],
+)
+async def test_connect_exec_stream_reports_what_the_pod_check_found(
+    make_error, pod_read, expected
+):
+    """A failed handshake against a dead Pod is a lost trial, not an API error.
+
+    Harbor's retry filter matches exception class names, so a vanished Pod must
+    surface as ``TrialContainerLostError``. An unscheduled Pod lost nothing and
+    keeps the handshake error. Neither case is worth another attempt.
+    """
+    api = MagicMock()
+    api.read_namespaced_pod.configure_mock(**pod_read)
+    handshake_error = make_error()
+    with (
+        patch(
+            "harbor_gke_ext.exec_engine.stream", side_effect=handshake_error
+        ) as mock_stream,
+        patch("asyncio.sleep", return_value=None),
+        pytest.raises(expected) as raised,
     ):
-        with pytest.raises(ApiException):
-            await connect_exec_stream(api, "pod-1", "default", ["ls"], max_attempts=2)
+        await connect_exec_stream(api, "pod-1", "default", ["ls"], max_attempts=3)
+
+    assert mock_stream.call_count == 1
+    if expected is TrialContainerLostError:
+        assert raised.value.__cause__ is handshake_error
+    else:
+        assert raised.value is handshake_error
 
 
 @pytest.mark.unit
@@ -323,7 +381,7 @@ _WARDEN_HANDSHAKE_REASON = (
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_connect_exec_stream_webhook_overload_shrinks_limiter_and_retries():
-    from harbor_gke_ext.control_plane import get_control_plane_limiter
+    from limiter_probe import free_slots
 
     api = MagicMock()
     ws_client, peer = _fake_ws_client()
@@ -337,8 +395,8 @@ async def test_connect_exec_stream_webhook_overload_shrinks_limiter_and_retries(
             api, "pod-1", "default", ["ls"], max_attempts=3
         )
     assert isinstance(stream, ExecStream)
-    assert get_control_plane_limiter().limit == 64
-    assert get_control_plane_limiter().in_flight == 0
+    # Halved once, and the handshake slot was handed back.
+    assert await free_slots() == 64
     (delay,) = [c.args[0] for c in sleep_mock.await_args_list]
     assert 1.6 <= delay <= 2.4
     stream.close()
@@ -348,7 +406,7 @@ async def test_connect_exec_stream_webhook_overload_shrinks_limiter_and_retries(
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_connect_exec_stream_konnectivity_error_does_not_shrink_limiter():
-    from harbor_gke_ext.control_plane import get_control_plane_limiter
+    from limiter_probe import free_slots
 
     api = MagicMock()
     ws_client, peer = _fake_ws_client()
@@ -361,7 +419,7 @@ async def test_connect_exec_stream_konnectivity_error_does_not_shrink_limiter():
         stream = await connect_exec_stream(
             api, "pod-1", "default", ["ls"], max_attempts=3
         )
-    assert get_control_plane_limiter().limit == 128
+    assert await free_slots() == 128
     stream.close()
     peer.close()
 
@@ -438,7 +496,7 @@ async def test_read_exec_output_collects_channels_and_exit_code(fake_kubelet):
     await read_exec_output(stream, output)
     assert output.stdout == "héllo world"
     assert output.stderr == "oops"
-    assert exec_return_code(stream) == 5
+    assert stream.returncode() == 5
     assert "".join(t for s, t in chunks if s == "stdout") == "héllo world"
 
 
@@ -466,7 +524,7 @@ async def test_exec_failure_status_without_exit_code_is_reported(fake_kubelet):
     stream = await fake_kubelet.connect(["true"])
     await read_exec_output(stream, ExecOutputAccumulator())
     with pytest.raises(GKEExecStreamClosedError, match="container not found"):
-        exec_return_code(stream)
+        stream.returncode()
 
 
 @pytest.mark.unit
@@ -837,24 +895,26 @@ async def test_stream_tar_to_pod_remote_exits_early(fake_kubelet):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_stream_tar_to_pod_times_out_when_remote_never_finishes(fake_kubelet):
+async def test_stream_tar_to_pod_times_out_when_remote_never_finishes(
+    fake_kubelet, monkeypatch
+):
+    monkeypatch.setattr(exec_engine, "_TAR_UPLOAD_MIN_TIMEOUT_SEC", 0.5)
     stream = await fake_kubelet.connect(["sleep", "10"], stdin=True)
     started = time.monotonic()
     with pytest.raises(TimeoutError, match="Timed out"):
-        await stream_tar_to_pod(
-            stream, io.BytesIO(b"x" * 1024), pod_name="pod-1", timeout_sec=0.5
-        )
+        await stream_tar_to_pod(stream, io.BytesIO(b"x" * 1024), pod_name="pod-1")
     assert time.monotonic() - started < 3
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_connect_exec_stream_reresolves_pod_on_handshake_404_and_raises_preempted_when_gone(
-    tmp_path,
-):
-    from kubernetes.client.rest import ApiException
+async def test_connect_exec_stream_never_adopts_a_replacement_pod(tmp_path):
+    """A 404 means the trial's Pod is gone; its state cannot move to another Pod.
 
-    from harbor_gke_ext.constants import PodPreemptedError
+    The Job controller replaces a disrupted Pod even mid-trial. Exec must not
+    switch to that blank Pod: the agent's work would vanish while the trial
+    carried on and produced a corrupt result. The trial is lost instead.
+    """
     from harbor_gke_ext.environment import GKEEnvironment
 
     env = GKEEnvironment(
@@ -884,49 +944,27 @@ async def test_connect_exec_stream_reresolves_pod_on_handshake_404_and_raises_pr
     env._core_api = MagicMock()
     env.pod_name = "old-pod-111"
     env.job_name = "job-d3"
-
-    # Case 1: WebSocket handshake 404 (status=0, reason="Handshake status 404 Not Found")
-    # when a replacement Running pod exists -> re-resolves self.pod_name and reconnects.
-    new_pod = MagicMock()
-    new_pod.metadata.name = "new-pod-222"
-    new_pod.metadata.deletion_timestamp = None
-    new_pod.status.phase = "Running"
-    new_pod.status.reason = None
-    env._core_api.list_namespaced_pod.return_value = MagicMock(items=[new_pod])
+    replacement = MagicMock()
+    replacement.metadata.name = "new-pod-222"
+    replacement.metadata.deletion_timestamp = None
+    replacement.status.phase = "Running"
+    replacement.status.reason = None
+    env._core_api.list_namespaced_pod.return_value = MagicMock(items=[replacement])
+    env._core_api.read_namespaced_pod.side_effect = ApiException(
+        status=404, reason="Not Found"
+    )
 
     ws_404 = ApiException(status=0, reason="Handshake status 404 Not Found")
-    ok_resp = MagicMock()
     with (
         patch.object(env, "_ensure_client", new_callable=AsyncMock),
-        patch(
-            "harbor_gke_ext.environment.connect_exec_stream",
-            new_callable=AsyncMock,
-            side_effect=[ws_404, ok_resp],
-        ) as mock_conn,
-    ):
-        resp = await env._connect_exec_stream(["true"])
-        assert resp is ok_resp
-        assert env.pod_name == "new-pod-222"
-        assert mock_conn.await_count == 2
-
-    # Case 2: All pods evicted/gone -> raises PodPreemptedError
-    evicted_pod = MagicMock()
-    evicted_pod.metadata.name = "new-pod-222"
-    evicted_pod.metadata.deletion_timestamp = None
-    evicted_pod.status.phase = "Failed"
-    evicted_pod.status.reason = "Preempted"
-    env._core_api.list_namespaced_pod.return_value = MagicMock(items=[evicted_pod])
-
-    with (
-        patch.object(env, "_ensure_client", new_callable=AsyncMock),
-        patch(
-            "harbor_gke_ext.environment.connect_exec_stream",
-            new_callable=AsyncMock,
-            side_effect=ws_404,
-        ),
-        pytest.raises(PodPreemptedError),
+        patch("harbor_gke_ext.exec_engine.stream", side_effect=ws_404) as mock_stream,
+        pytest.raises(TrialContainerLostError, match="old-pod-111"),
     ):
         await env._connect_exec_stream(["true"])
+
+    assert env.pod_name == "old-pod-111"
+    assert mock_stream.call_count == 1
+    env._core_api.list_namespaced_pod.assert_not_called()
 
 
 @pytest.mark.unit

@@ -1,5 +1,6 @@
 import pytest
-from harbor_gke_ext.pod_builder import build_direct_pod
+from harbor_gke_ext.constants import _GKE_JOB_BACKOFF_LIMIT
+from harbor_gke_ext.pod_builder import build_direct_pod, build_job
 from harbor.models.task.config import TpuSpec
 
 
@@ -267,3 +268,36 @@ def test_build_direct_pod_gpu_never_sets_path_or_ld_library_path():
     env_names = {e.name for e in (pod.spec.containers[0].env or [])}
     assert "PATH" not in env_names
     assert "LD_LIBRARY_PATH" not in env_names
+
+
+@pytest.mark.unit
+def test_build_job_replaces_disrupted_pods_and_fails_on_container_errors():
+    """The Job controller, not Harbor, replaces a Pod lost to preemption or eviction.
+
+    Kubernetes evaluates the rules in order and a disrupted Pod's containers
+    exit non-zero too, so the `DisruptionTarget` rule must come first or every
+    disruption would fail the Job. Any other container failure fails the Job,
+    as it would fail a `docker run`.
+    """
+    pod = build_direct_pod(
+        pod_name="job-pod",
+        namespace="default",
+        environment_name="env-name",
+        run_id="run-123",
+        image_url="test-image:latest",
+        startup_env={},
+    )
+    job = build_job(
+        job_name="job-pod", namespace="default", pod_spec=pod.spec, labels={}
+    )
+
+    assert job.spec.backoff_limit == _GKE_JOB_BACKOFF_LIMIT
+    disruption, container_failure = job.spec.pod_failure_policy.rules
+    assert disruption.action == "Count"
+    assert [(c.type, c.status) for c in disruption.on_pod_conditions] == [
+        ("DisruptionTarget", "True")
+    ]
+    assert container_failure.action == "FailJob"
+    assert container_failure.on_exit_codes.operator == "NotIn"
+    assert container_failure.on_exit_codes.values == [0]
+    assert container_failure.on_exit_codes.container_name is None

@@ -5,13 +5,14 @@ import logging
 import re
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
 
 from harbor.constants import MAIN_SERVICE_NAME
 from harbor.environments.base import ExecResult
+from harbor_gke_ext import compose_translator as ct_module
 from harbor_gke_ext.cluster_probe import (
     ClusterCapabilities,
     DindAvailability,
@@ -23,6 +24,9 @@ from harbor_gke_ext.compose_translator import (
     translate_compose,
 )
 from harbor_gke_ext.image_ref import ImageResolver
+
+# The suite stubs registry reads (see conftest); these tests exercise the real one.
+_real_fetch_oci_config = ct_module._fetch_oci_config_from_registry
 
 
 def _make_mock_env(tmp_path: Path) -> MagicMock:
@@ -1095,26 +1099,20 @@ def test_registry_ref_parsing():
 
 
 @contextmanager
-def _seeded_image_sizes(sizes: dict[str, int]):
-    """Seed the OCI caches so size lookups resolve without touching a registry.
+def _registry_manifests(manifests: dict[str, tuple[dict, int | None]]):
+    """Answer registry manifest reads from ``manifests`` instead of the network.
 
-    ``_resolve_oci_manifest_facts`` short-circuits on ``_OCI_CONFIG_CACHE``, so
-    both caches have to be populated for the size cache to be consulted.
+    Unknown refs read as "nothing known", like the suite-wide default.
     """
-    from harbor_gke_ext.compose_translator import (
-        _OCI_COMPRESSED_SIZE_CACHE,
-        _OCI_CONFIG_CACHE,
-    )
+    with patch(
+        "harbor_gke_ext.compose_translator._fetch_oci_config_from_registry",
+        side_effect=lambda ref: manifests.get(ref, ({}, None)),
+    ) as fetch:
+        yield fetch
 
-    for ref, size in sizes.items():
-        _OCI_CONFIG_CACHE[ref] = {}
-        _OCI_COMPRESSED_SIZE_CACHE[ref] = size
-    try:
-        yield
-    finally:
-        for ref in sizes:
-            _OCI_CONFIG_CACHE.pop(ref, None)
-            _OCI_COMPRESSED_SIZE_CACHE.pop(ref, None)
+
+def _seeded_image_sizes(sizes: dict[str, int]):
+    return _registry_manifests({ref: ({}, size) for ref, size in sizes.items()})
 
 
 @pytest.mark.unit
@@ -1818,23 +1816,7 @@ services:
 
 # ============================================================================
 # F3: OCI manifest resolution failures must be loud and must not be cached.
-#
-# `_resolve_oci_manifest_facts` short-circuits under `PYTEST_CURRENT_TEST`, so
-# each of these tests removes that variable for its duration.
 # ============================================================================
-@contextmanager
-def _oci_resolution_enabled(monkeypatch):
-    """Clear the caches and lift the pytest short-circuit for one test."""
-    from harbor_gke_ext import compose_translator as ct
-
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    ct._OCI_CONFIG_CACHE.clear()
-    ct._OCI_COMPRESSED_SIZE_CACHE.clear()
-    try:
-        yield ct
-    finally:
-        ct._OCI_CONFIG_CACHE.clear()
-        ct._OCI_COMPRESSED_SIZE_CACHE.clear()
 
 
 @pytest.mark.unit
@@ -1844,14 +1826,15 @@ def test_oci_manifest_failure_logs_warning(monkeypatch, caplog):
     At `debug` the operator sees neither a broken `--change` set nor an
     under-reserved `dind-engine`, so the level must be `warning`.
     """
-    with _oci_resolution_enabled(monkeypatch) as ct:
-        monkeypatch.setattr(
-            ct,
-            "_fetch_oci_config_from_registry",
-            MagicMock(side_effect=RuntimeError("401 Unauthorized")),
-        )
-        with caplog.at_level(logging.WARNING, logger=ct.logger.name):
-            cfg, size = ct._resolve_oci_manifest_facts("example.com/repo/img:tag")
+    from harbor_gke_ext import compose_translator as ct
+
+    monkeypatch.setattr(
+        ct,
+        "_fetch_oci_config_from_registry",
+        MagicMock(side_effect=RuntimeError("401 Unauthorized")),
+    )
+    with caplog.at_level(logging.WARNING, logger=ct.logger.name):
+        cfg, size = ct._resolve_oci_manifest_facts("example.com/repo/img:tag")
 
     assert cfg == {}
     assert size is None
@@ -1869,18 +1852,17 @@ def test_oci_manifest_failure_is_not_cached(monkeypatch):
     `harbor run` resolves many trials in one process. Negatively caching a
     single 5xx would silently degrade every later trial using that image.
     """
-    with _oci_resolution_enabled(monkeypatch) as ct:
-        fetch = MagicMock(side_effect=RuntimeError("503 Service Unavailable"))
-        monkeypatch.setattr(ct, "_fetch_oci_config_from_registry", fetch)
+    from harbor_gke_ext import compose_translator as ct
 
-        ct._resolve_oci_manifest_facts("example.com/repo/img:tag")
-        assert "example.com/repo/img:tag" not in ct._OCI_CONFIG_CACHE
-        assert "example.com/repo/img:tag" not in ct._OCI_COMPRESSED_SIZE_CACHE
+    fetch = MagicMock(side_effect=RuntimeError("503 Service Unavailable"))
+    monkeypatch.setattr(ct, "_fetch_oci_config_from_registry", fetch)
 
-        # Second call must retry rather than replay the cached failure.
-        fetch.side_effect = None
-        fetch.return_value = ({"Cmd": ["python3"]}, 1234)
-        cfg, size = ct._resolve_oci_manifest_facts("example.com/repo/img:tag")
+    ct._resolve_oci_manifest_facts("example.com/repo/img:tag")
+
+    # Second call must retry rather than replay the cached failure.
+    fetch.side_effect = None
+    fetch.return_value = ({"Cmd": ["python3"]}, 1234)
+    cfg, size = ct._resolve_oci_manifest_facts("example.com/repo/img:tag")
 
     assert fetch.call_count == 2
     assert cfg == {"Cmd": ["python3"]}
@@ -1890,12 +1872,13 @@ def test_oci_manifest_failure_is_not_cached(monkeypatch):
 @pytest.mark.unit
 def test_oci_manifest_success_is_cached(monkeypatch):
     """U3.3: the positive-caching behaviour F3 was careful not to disturb."""
-    with _oci_resolution_enabled(monkeypatch) as ct:
-        fetch = MagicMock(return_value=({"Entrypoint": ["/entry.sh"]}, 4096))
-        monkeypatch.setattr(ct, "_fetch_oci_config_from_registry", fetch)
+    from harbor_gke_ext import compose_translator as ct
 
-        first_cfg, first_size = ct._resolve_oci_manifest_facts("example.com/a:1")
-        second_cfg, second_size = ct._resolve_oci_manifest_facts("example.com/a:1")
+    fetch = MagicMock(return_value=({"Entrypoint": ["/entry.sh"]}, 4096))
+    monkeypatch.setattr(ct, "_fetch_oci_config_from_registry", fetch)
+
+    first_cfg, first_size = ct._resolve_oci_manifest_facts("example.com/a:1")
+    second_cfg, second_size = ct._resolve_oci_manifest_facts("example.com/a:1")
 
     assert fetch.call_count == 1
     assert first_cfg == second_cfg == {"Entrypoint": ["/entry.sh"]}
@@ -1922,15 +1905,13 @@ services:
 """
     )
 
-    from harbor_gke_ext.compose_translator import _OCI_CONFIG_CACHE
-
     img_ref = "us-central1-docker.pkg.dev/proj/harbor-tasks/orca:latest"
-    _OCI_CONFIG_CACHE[img_ref] = {
+    oci_config = {
         "Entrypoint": ["/app/entrypoint.sh"],
         "WorkingDir": "/app",
         "Env": ["SNAPSHOT_NAME=20260419T215712Z-3f397ba95f148ce5"],
     }
-    try:
+    with _registry_manifests({img_ref: (oci_config, None)}):
         pod = translate_compose(
             compose_paths=[compose_path],
             compose_env={},
@@ -1942,8 +1923,6 @@ services:
             image_resolver=ImageResolver(),
             task_dir=tmp_path,
         )
-    finally:
-        _OCI_CONFIG_CACHE.pop(img_ref, None)
 
     inits = {c.name: c for c in (pod.spec.init_containers or [])}
     init_names = [c.name for c in (pod.spec.init_containers or [])]
@@ -2441,13 +2420,12 @@ def test_fetch_oci_config_never_mints_gcloud_token_for_crafted_host(
 ) -> None:
     """F-01 regression: a crafted host ending in #.gcr.io must be rejected before minting a gcloud token."""
     import subprocess
-    from harbor_gke_ext import compose_translator as ct
 
     run_mock = MagicMock()
     monkeypatch.setattr(subprocess, "run", run_mock)
 
     with pytest.raises(ValueError):
-        ct._fetch_oci_config_from_registry(
+        _real_fetch_oci_config(
             "attacker.example:8443#.gcr.io/proj/img:latest"
         )
     assert run_mock.call_count == 0
@@ -2499,7 +2477,7 @@ def test_fetch_oci_config_rejects_unsafe_www_authenticate_realm(
     monkeypatch.setattr(ct, "_build_safe_https_opener", lambda: _FakeOpener(), raising=False)
 
     with pytest.raises((ValueError, urllib.error.HTTPError)):
-        ct._fetch_oci_config_from_registry("ghcr.io/org/app:latest")
+        _real_fetch_oci_config("ghcr.io/org/app:latest")
 
     # Only the initial manifest URL may have been attempted; the unsafe realm must never be opened.
     assert requested_urls == ["https://ghcr.io/v2/org/app/manifests/latest"]

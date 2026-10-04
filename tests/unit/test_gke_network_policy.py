@@ -367,8 +367,13 @@ class TestGKEEnvironmentApplyNetworkPolicy:
     async def test_apply_network_policy_settlement_when_pod_ready(self, tmp_path):
         from harbor.models.task.config import EnvironmentConfig
         from harbor.models.trial.paths import TrialPaths
+        from harbor_gke_ext import environment as env_mod
+        from harbor_gke_ext.cluster_probe import ClusterCapabilities
         from harbor_gke_ext.environment import GKEEnvironment
 
+        env_mod._CLUSTER_CAPABILITIES_CACHE[
+            ("test-project", "us-central1", "test-cluster")
+        ] = ClusterCapabilities(network_policy_enforced=True)
         env = GKEEnvironment(
             environment_dir=tmp_path,
             environment_name="test-env",

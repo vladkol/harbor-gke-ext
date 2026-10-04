@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -14,7 +16,9 @@ from harbor_gke_ext.cluster_probe import (
     parse_gcloud_cluster_describe,
     parse_gke_minor_version,
     parse_quantity_to_mib,
-    probe_max_node_ephemeral_storage_mb,
+    probe_cluster_via_gcloud,
+    probe_fqdn_network_policy_support,
+    probe_kube_dns_cluster_ip,
     probe_pod_level_resources_support,
 )
 
@@ -227,12 +231,12 @@ def test_pod_level_resources_probe_422_on_spec_resources_means_supported() -> No
 
 
 @pytest.mark.unit
-def test_pod_level_resources_probe_unknown_on_error() -> None:
-    """A failed probe is 'unknown' -- distinct from 'unsupported'."""
+def test_pod_level_resources_probe_raises_when_it_cannot_complete() -> None:
+    """A failed probe is not a verdict, so it must not read as 'unsupported'."""
     api = MagicMock()
     api.create_namespaced_pod.side_effect = RuntimeError("403 Forbidden")
-    assert probe_pod_level_resources_support(api) is None
-    assert probe_pod_level_resources_support(None) is None
+    with pytest.raises(RuntimeError, match="403 Forbidden"):
+        probe_pod_level_resources_support(api)
 
 
 
@@ -253,76 +257,48 @@ def test_parse_quantity_to_mib_handles_binary_decimal_and_bare_bytes() -> None:
     assert parse_quantity_to_mib("not-a-quantity") is None
 
 
-def _node(
-    name: str,
-    ephemeral: str | None,
-    *,
-    unschedulable: bool = False,
-    taints: list[SimpleNamespace] | None = None,
-):
-    return SimpleNamespace(
-        metadata=SimpleNamespace(name=name),
-        spec=SimpleNamespace(unschedulable=unschedulable, taints=taints),
-        status=SimpleNamespace(
-            allocatable=({"ephemeral-storage": ephemeral} if ephemeral else {})
-        ),
-    )
-
-
 @pytest.mark.unit
-def test_max_node_ephemeral_storage_takes_the_largest_schedulable_node() -> None:
-    """The maximum, not the sum: a Pod is scheduled onto exactly one node."""
-    api = MagicMock()
-    api.list_node.return_value = SimpleNamespace(
-        items=[
-            _node("small-a", "47060329472"),  # 44,880 MiB
-            _node("large", "364583615488"),  # 347,694 MiB
-            _node("small-b", "47060329472"),
-        ]
+def test_storage_ceiling_skips_system_tainted_pools_and_keeps_gpu_pools() -> None:
+    """Harbor Pods tolerate accelerator taints but not CriticalAddonsOnly."""
+    caps = parse_gcloud_cluster_describe(
+        {
+            "autopilot": {"enabled": False},
+            "networkConfig": {"datapathProvider": "ADVANCED_DATAPATH"},
+            "nodePools": [
+                {
+                    "name": "system",
+                    "initialNodeCount": 1,
+                    "config": {
+                        "machineType": "e2-standard-4",
+                        "diskSizeGb": 2000,
+                        "taints": [
+                            {
+                                "key": "CriticalAddonsOnly",
+                                "value": "true",
+                                "effect": "NO_SCHEDULE",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "name": "gpu",
+                    "initialNodeCount": 1,
+                    "config": {
+                        "machineType": "g2-standard-4",
+                        "diskSizeGb": 100,
+                        "taints": [
+                            {
+                                "key": "nvidia.com/gpu",
+                                "value": "present",
+                                "effect": "NO_SCHEDULE",
+                            }
+                        ],
+                    },
+                },
+            ],
+        }
     )
-    assert probe_max_node_ephemeral_storage_mb(api) == 347694
-
-
-@pytest.mark.unit
-def test_max_node_ephemeral_storage_skips_cordoned_nodes() -> None:
-    api = MagicMock()
-    api.list_node.return_value = SimpleNamespace(
-        items=[
-            _node("small", "47060329472"),
-            _node("large-but-cordoned", "364583615488", unschedulable=True),
-        ]
-    )
-    assert probe_max_node_ephemeral_storage_mb(api) == 44880
-
-
-@pytest.mark.unit
-def test_max_node_ephemeral_storage_skips_system_tainted_nodes_and_keeps_gpu_nodes() -> (
-    None
-):
-    api = MagicMock()
-    api.list_node.return_value = SimpleNamespace(
-        items=[
-            _node(
-                "system-default-pool",
-                "47060329472",
-                taints=[
-                    SimpleNamespace(
-                        key="CriticalAddonsOnly", value="true", effect="NoSchedule"
-                    )
-                ],
-            ),
-            _node(
-                "gpu-worker",
-                "1242560000000",
-                taints=[
-                    SimpleNamespace(
-                        key="nvidia.com/gpu", value="present", effect="NoSchedule"
-                    )
-                ],
-            ),
-        ]
-    )
-    assert probe_max_node_ephemeral_storage_mb(api) == 1184997
+    assert caps.max_node_allocatable_ephemeral_storage_mb == 44880
 
 
 @pytest.mark.unit
@@ -423,18 +399,6 @@ def test_three_tier_standard_cluster_tainted_default_and_scale_to_zero_workers()
     assert (
         caps_no_nap.max_node_allocatable_ephemeral_storage_mb == 1254544
     )  # ~1,225.1 GiB
-
-
-@pytest.mark.unit
-def test_max_node_ephemeral_storage_unknown_when_unreadable() -> None:
-    api = MagicMock()
-    api.list_node.side_effect = RuntimeError("connection refused")
-    assert probe_max_node_ephemeral_storage_mb(api) is None
-    assert probe_max_node_ephemeral_storage_mb(None) is None
-
-    empty = MagicMock()
-    empty.list_node.return_value = SimpleNamespace(items=[])
-    assert probe_max_node_ephemeral_storage_mb(empty) is None
 
 
 @pytest.mark.unit
@@ -540,40 +504,165 @@ def test_parse_gcloud_cluster_describe_network_policy_enforced() -> None:
     )
 
 
+class _ApiError(Exception):
+    def __init__(self, status: int | None) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
+def _service(cluster_ip: str) -> SimpleNamespace:
+    return SimpleNamespace(spec=SimpleNamespace(cluster_ip=cluster_ip))
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "pod_names,pod_labels,svc_ip,expected_enforced,expected_dns_ip",
+    "response,expected",
     [
-        (["anetd-abc12", "kube-dns-xyz"], [{}, {}], "34.118.224.10", True, "34.118.224.10"),
-        (["calico-node-999", "kube-proxy-1"], [{}, {}], "10.96.0.10", True, "10.96.0.10"),
-        (["custom-cni-1"], [{"k8s-app": "cilium"}], "10.28.0.10", True, "10.28.0.10"),
-        (["kube-dns-xyz", "kube-proxy-1"], [{}, {}], "10.96.0.10", False, "10.96.0.10"),
-        ([], [], "None", None, None),
+        pytest.param(_service("34.118.224.10"), "34.118.224.10", id="cluster-ip"),
+        pytest.param(_service("None"), None, id="headless"),
+        pytest.param(_ApiError(404), None, id="no-kube-dns-service"),
     ],
 )
-def test_probe_network_enforcement_and_dns_via_k8s(
-    pod_names: list[str],
-    pod_labels: list[dict[str, str]],
-    svc_ip: str,
-    expected_enforced: bool | None,
-    expected_dns_ip: str | None,
-) -> None:
-    """WP-4 (F-07): Verify K8s API fallback detects anetd/calico/cilium and kube-dns ClusterIP."""
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock
-    from harbor_gke_ext.cluster_probe import probe_network_enforcement_and_dns_via_k8s
-
+def test_probe_kube_dns_cluster_ip(response, expected) -> None:
     core_api = MagicMock()
-    core_api.list_namespaced_pod.return_value = SimpleNamespace(
-        items=[
-            SimpleNamespace(metadata=SimpleNamespace(name=n, labels=lbl))
-            for n, lbl in zip(pod_names, pod_labels, strict=True)
-        ]
-    )
-    core_api.read_namespaced_service.return_value = SimpleNamespace(
-        spec=SimpleNamespace(cluster_ip=svc_ip)
-    )
-    enforced, dns_ip = probe_network_enforcement_and_dns_via_k8s(core_api)
-    assert enforced is expected_enforced
-    assert dns_ip == expected_dns_ip
+    if isinstance(response, Exception):
+        core_api.read_namespaced_service.side_effect = response
+    else:
+        core_api.read_namespaced_service.return_value = response
+    assert probe_kube_dns_cluster_ip(core_api) == expected
 
+
+@pytest.mark.unit
+def test_probe_kube_dns_cluster_ip_raises_when_it_cannot_complete() -> None:
+    core_api = MagicMock()
+    core_api.read_namespaced_service.side_effect = _ApiError(403)
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        probe_kube_dns_cluster_ip(core_api)
+
+
+def _api_resource(name: str) -> dict:
+    return {"name": name, "kind": name, "namespaced": True, "singularName": "", "verbs": ["get"]}
+
+
+def _core_api_over_http(status: int, body: dict):
+    """A real ``CoreV1Api`` on our ``TimeoutApiClient``; only urllib3 is stubbed.
+
+    Exercising the wrapper and the library together is the point: the
+    discovery probe once failed only because of how ``TimeoutApiClient``
+    forwards ``call_api`` arguments.
+    """
+    import urllib3
+    from kubernetes import client as k8s_client
+
+    from harbor_gke_ext.client import TimeoutApiClient
+
+    api_client = TimeoutApiClient()
+    api_client.rest_client.pool_manager = MagicMock()
+    api_client.rest_client.pool_manager.request.return_value = urllib3.HTTPResponse(
+        body=json.dumps(body).encode(),
+        status=status,
+        headers={"Content-Type": "application/json"},
+    )
+    return k8s_client.CoreV1Api(api_client)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "status,body,expected",
+    [
+        pytest.param(
+            200,
+            {"groupVersion": "networking.gke.io/v1alpha1",
+             "resources": [_api_resource("fqdnnetworkpolicies")]},
+            True,
+            id="resource-listed",
+        ),
+        pytest.param(
+            200,
+            {"groupVersion": "networking.gke.io/v1alpha1",
+             "resources": [_api_resource("redirectservices")]},
+            False,
+            id="resource-not-listed",
+        ),
+        pytest.param(404, {"kind": "Status", "code": 404}, False, id="group-version-absent"),
+    ],
+)
+def test_probe_fqdn_network_policy_support(status, body, expected) -> None:
+    core_api = _core_api_over_http(status, body)
+
+    assert probe_fqdn_network_policy_support(core_api) is expected
+    call = core_api.api_client.rest_client.pool_manager.request.call_args
+    assert call.args[0] == "GET"
+    assert call.args[1].endswith("/apis/networking.gke.io/v1alpha1")
+
+
+@pytest.mark.unit
+def test_probe_fqdn_network_policy_support_raises_when_it_cannot_complete() -> None:
+    """A transient failure must not read as "unsupported"."""
+    core_api = _core_api_over_http(503, {"kind": "Status", "code": 503})
+    with pytest.raises(RuntimeError, match="503"):
+        probe_fqdn_network_policy_support(core_api)
+
+
+_DATAPLANE_V2_DESCRIBE = {
+    "autopilot": {"enabled": False},
+    "networkConfig": {"datapathProvider": "ADVANCED_DATAPATH"},
+}
+
+
+def _gcloud_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
+    return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+
+
+@pytest.mark.unit
+def test_probe_cluster_via_gcloud_parses_describe() -> None:
+    with patch(
+        "harbor_gke_ext.cluster_probe.subprocess.run",
+        return_value=_gcloud_result(stdout=json.dumps(_DATAPLANE_V2_DESCRIBE)),
+    ) as run:
+        caps = probe_cluster_via_gcloud("cl", "proj", "us-central1")
+
+    assert caps.is_autopilot is False
+    assert caps.network_policy_enforced is True
+    cmd = run.call_args.args[0]
+    assert cmd[:5] == ["gcloud", "container", "clusters", "describe", "cl"]
+    assert {"--project=proj", "--location=us-central1", "--format=json"} <= set(cmd)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "run_outcome,match",
+    [
+        pytest.param(
+            _gcloud_result(returncode=1, stderr="PERMISSION_DENIED"),
+            "PERMISSION_DENIED",
+            id="nonzero-exit",
+        ),
+        pytest.param(_gcloud_result(stdout="{not json"), "invalid JSON", id="bad-json"),
+        pytest.param(_gcloud_result(stdout="[]"), "non-object", id="not-an-object"),
+        pytest.param(
+            _gcloud_result(stdout=json.dumps({"currentMasterVersion": "1.35.1"})),
+            "NetworkPolicy enforcement cannot be determined",
+            id="no-network-config",
+        ),
+        pytest.param(FileNotFoundError("gcloud"), "gcloud", id="gcloud-missing"),
+        pytest.param(
+            subprocess.TimeoutExpired(cmd="gcloud", timeout=15),
+            "timed out",
+            id="timeout",
+        ),
+    ],
+)
+def test_probe_cluster_via_gcloud_raises_when_it_cannot_verify(
+    run_outcome, match
+) -> None:
+    kwargs = (
+        {"side_effect": run_outcome}
+        if isinstance(run_outcome, BaseException)
+        else {"return_value": run_outcome}
+    )
+    with (
+        patch("harbor_gke_ext.cluster_probe.subprocess.run", **kwargs),
+        pytest.raises(RuntimeError, match=match),
+    ):
+        probe_cluster_via_gcloud("cl", "proj", "us-central1")

@@ -26,17 +26,14 @@ For architectural background, see [Architecture](architecture.md) and [Runtime](
 
 ## Provisioning and authentication
 
-### Missing `gcloud`, missing `kubeconfig`, or missing `gke-gcloud-auth-plugin`
+### Missing `gcloud` or missing `gke-gcloud-auth-plugin`
 
 **Symptom**
 
-During `GKEEnvironment.preflight()`, setup aborts immediately with `SystemExit` if `gcloud` or `kubeconfig` is missing:
+During `GKEEnvironment.preflight()`, setup aborts immediately with `SystemExit` if `gcloud` is missing:
 
 ```text
 SystemExit: GKE requires the gcloud CLI to be installed. See https://docs.cloud.google.com/sdk/docs/install-sdk
-```
-```text
-SystemExit: GKE requires Kubernetes credentials. Run 'gcloud container clusters get-credentials <CLUSTER> --location <LOCATION>' to configure kubectl, or set the KUBECONFIG environment variable.
 ```
 
 If `gke-gcloud-auth-plugin` is missing from `PATH`, `preflight()` logs a warning and continues, after which the first Kubernetes API call fails with `HTTP 401 Unauthorized` or an exec-provider error:
@@ -47,7 +44,7 @@ WARNING  gke-gcloud-auth-plugin is not found in PATH. Modern GKE clusters (v1.26
 
 **Cause**
 
-`harbor-gke-ext` requires the Google Cloud SDK (`gcloud`), a populated kubeconfig file (`$KUBECONFIG` or `~/.kube/config`), and `gke-gcloud-auth-plugin` to mint OAuth2 bearer tokens for GKE API server authentication.
+`harbor-gke-ext` requires the Google Cloud SDK (`gcloud`) and `gke-gcloud-auth-plugin` to mint OAuth2 bearer tokens for GKE API server authentication. A kubeconfig is not required in advance: when no context matches the target cluster, the package runs `gcloud container clusters get-credentials` and writes one.
 
 **Resolution**
 
@@ -55,7 +52,7 @@ WARNING  gke-gcloud-auth-plugin is not found in PATH. Modern GKE clusters (v1.26
    ```bash
    gcloud components install gke-gcloud-auth-plugin
    ```
-2. Populate `~/.kube/config` for your target cluster:
+2. Optionally, populate `~/.kube/config` for your target cluster yourself (the package does this on first use if no context matches):
    ```bash
    gcloud container clusters get-credentials "${CLUSTER_NAME}" \
      --location="${REGION}" \
@@ -150,10 +147,7 @@ EphemeralStorageUnschedulableError: Task '<task>' requests <requested_mb> MiB of
 
 **Cause**
 
-On GKE Standard, a default `100 GB` `COS_CONTAINERD` node boot disk (`94.3 GiB` filesystem capacity after OS partitions and `ext4` metadata) provides **`43.8 GiB`** (`44,880 MiB`) of allocatable `ephemeral-storage` after GKE deducts the system reservation (`MIN(35% * D + 6 GiB, 100 GiB) = 41.0 GiB`) and the `10%` eviction threshold (`9.4 GiB`). If a Pod requests more ephemeral storage than any single node in the cluster can provide (through `task.toml` `storage_mb` on `main` or through `dind-engine`'s `/var/lib/docker` storage estimate), Kubernetes leaves the Pod `Pending` until timeout. Before submitting the Job, `harbor-gke-ext` compares the Pod's peak `ephemeral-storage` request with the largest allocatable ephemeral storage of any schedulable node and raises `EphemeralStorageUnschedulableError` instead. That ceiling is the larger of two values:
-
-- An estimate from the cluster's node pool configuration: the allocatable storage implied by the boot disk size (or, for Local SSD-backed ephemeral storage, the Local SSD count) of every untainted node pool whose maximum node count is above zero, including pools that are currently scaled to zero.
-- The largest allocatable `ephemeral-storage` among live nodes that are schedulable and have no blocking taint.
+On GKE Standard, a default `100 GB` `COS_CONTAINERD` node boot disk (`94.3 GiB` filesystem capacity after OS partitions and `ext4` metadata) provides **`43.8 GiB`** (`44,880 MiB`) of allocatable `ephemeral-storage` after GKE deducts the system reservation (`MIN(35% * D + 6 GiB, 100 GiB) = 41.0 GiB`) and the `10%` eviction threshold (`9.4 GiB`). If a Pod requests more ephemeral storage than any single node in the cluster can provide (through `task.toml` `storage_mb` on `main` or through `dind-engine`'s `/var/lib/docker` storage estimate), Kubernetes leaves the Pod `Pending` until timeout. Before submitting the Job, `harbor-gke-ext` compares the Pod's peak `ephemeral-storage` request with the largest allocatable ephemeral storage of any schedulable node and raises `EphemeralStorageUnschedulableError` instead. That ceiling is estimated from the cluster's node pool configuration: the allocatable storage implied by the boot disk size (or, for Local SSD-backed ephemeral storage, the Local SSD count) of every node pool without a blocking taint whose maximum node count is above zero, including pools that are currently scaled to zero.
 
 The comparison is cluster-wide, not per target node pool. The pre-check is skipped when the ceiling is unknown, on Autopilot clusters, and on Standard clusters with NAP enabled.
 

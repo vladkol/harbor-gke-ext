@@ -39,7 +39,7 @@ sequenceDiagram
 
 A trial runs as a Kubernetes `batch/v1` Job that wraps exactly one Pod. The environment applies specific fields to ensure trials do not leak or resurrect unexpectedly:
 
-- **`backoffLimit: 0`**: Prevents Kubernetes from replacing a failed trial Pod with a new one.
+- **`backoffLimit: 3` with a `podFailurePolicy`**: The Job replaces a Pod lost to infrastructure (the `DisruptionTarget` condition: preemption, eviction, node loss) up to `_GKE_JOB_BACKOFF_LIMIT = 3` times. Any non-zero container exit fails the Job, so a crashed or resource-exceeding task is never re-run. `_wait_for_pod_ready()` follows a replacement only during `start()`; after that, exec stays on the original Pod.
 - **`ttlSecondsAfterFinished: 120`**: Instructs the cluster control plane to garbage collect the Job and its Pod two minutes after completion.
 - **`restartPolicy: Never`**: Ensures that a crashed container terminates the Pod rather than entering a crash loop.
 - **`cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`**: This annotation prevents the cluster autoscaler from terminating a running trial during node scale-down events.
@@ -171,7 +171,7 @@ The package configures multiple timeout and keepalive parameters on the underlyi
 
 ## Readiness and failure diagnosis
 
-The environment blocks on Pod startup using `_wait_for_pod_ready()` with a default `pod_ready_timeout` of `max(1200, build_timeout_sec)` seconds. Job-to-Pod creation is bounded separately by `_GKE_JOB_POD_SPAWN_TIMEOUT_SEC` (`600` seconds). While polling for readiness, if the cluster emits a `NotTriggerScaleUp` warning event for the Pod (for example, when no node pool matches the requested GPU or resource shape), `_wait_for_pod_ready()` fails fast immediately instead of waiting for `pod_ready_timeout`.
+The environment blocks on Pod startup using `_wait_for_pod_ready()` with a default `pod_ready_timeout` of `max(1200, build_timeout_sec)` seconds. Job-to-Pod creation is bounded separately by `_GKE_JOB_POD_SPAWN_TIMEOUT_SEC` (`600` seconds). While polling for readiness, if the cluster emits a `NotTriggerScaleUp` warning event for the Pod (for example, when no node pool matches the requested GPU or resource shape), `_wait_for_pod_ready()` fails fast immediately instead of waiting for `pod_ready_timeout`. If the Pod is lost while it starts (it is being deleted, it was disrupted into `Failed`, or it no longer exists), the wait switches to the Pod the Job creates to replace it, within the same `pod_ready_timeout`. When the Job is terminal and will create no more Pods, it raises `TrialContainerLostError` at once.
 
 When the Pod reaches the **Ready** state, `_collect_infra_container_logs()` captures the first 16 KiB of logs from `dind-engine`, `dind-cache-*`, and `compose-up-gate` at debug level.
 
@@ -192,7 +192,7 @@ Transfers do not enforce explicit size caps. Memory on the host dictates the max
 
 ## Cleanup semantics
 
-The environment relies strictly on resource-scoped lifecycle fields. There is no bulk label-selector cleanup routine in the package. The only `label_selector` usages select the Job's own Pod, during spawn discovery and in `_reresolve_pod_name()` after an exec 404 or preemption: `batch.kubernetes.io/controller-uid=<Job UID>`, or `job-name=<job>` when the Job UID isn't known. Selecting by UID keeps a trial from adopting a terminating Pod left behind by an earlier Job with the same name.
+The environment relies strictly on resource-scoped lifecycle fields. There is no bulk label-selector cleanup routine in the package. The only `label_selector` usages select the Job's own Pod, during spawn discovery and in `_follow_job_replacement_pod()` when a Pod is lost during `start()`: `batch.kubernetes.io/controller-uid=<Job UID>`, or `job-name=<job>` when the Job UID isn't known. Selecting by UID keeps a trial from adopting a terminating Pod left behind by an earlier Job with the same name.
 
 > [!WARNING]
 > Because there is no bulk cleanup, terminating the Harbor process forcibly (`SIGKILL`) leaves the deletion of active trial resources to Kubernetes deadline and TTL controllers.

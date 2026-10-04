@@ -73,7 +73,6 @@ __all__ = [
     "is_plan_published",
     "plan_task_images",
     "record_planned_images",
-    "reset_planned_images",
     "was_image_planned",
 ]
 
@@ -316,7 +315,6 @@ def _plan_context(
     registry_name: str,
     registry_location: str,
     extra_compose_paths: Sequence[Path],
-    compose_env: dict[str, str] | None,
 ) -> None:
     """Plan one build context plus any compose sidecars it declares."""
     compose_paths = _compose_paths_for(context_dir, extra_compose_paths)
@@ -342,7 +340,7 @@ def _plan_context(
             discover_compose_build_services,
         )
 
-        sidecars = discover_compose_build_services(compose_paths, compose_env)
+        sidecars = discover_compose_build_services(compose_paths)
     except Exception as exc:
         plan.add(
             None,
@@ -374,11 +372,9 @@ def plan_task_images(
     registry_location: str,
     force_build: bool = False,
     task_name: str | None = None,
-    task_config: TaskConfig | None = None,
     environment_dir: Path | None = None,
     docker_image: str | None = None,
     extra_compose_paths: Sequence[Path] = (),
-    compose_env: dict[str, str] | None = None,
 ) -> TaskImagePlan:
     """Enumerate every Artifact Registry image the given task will need.
 
@@ -395,7 +391,7 @@ def plan_task_images(
     name = task_name or task_dir.name
     plan = TaskImagePlan(task_name=name, task_dir=task_dir)
 
-    config = task_config if task_config is not None else _load_task_config(task_dir)
+    config = _load_task_config(task_dir)
 
     agent_context = environment_dir
     if agent_context is None:
@@ -417,7 +413,6 @@ def plan_task_images(
         registry_name=registry_name,
         registry_location=registry_location,
         extra_compose_paths=extra_compose_paths,
-        compose_env=compose_env,
     )
 
     # Verifier environments are planned independently of the agent environment:
@@ -434,7 +429,6 @@ def plan_task_images(
             registry_name=registry_name,
             registry_location=registry_location,
             extra_compose_paths=(),
-            compose_env=compose_env,
         )
 
     return plan
@@ -467,13 +461,6 @@ def record_planned_images(image_urls: Iterable[str]) -> None:
     global _PLAN_PUBLISHED
     _PLANNED_IMAGE_URLS.update(image_urls)
     _PLAN_PUBLISHED = True
-
-
-def reset_planned_images() -> None:
-    """Clear published plan state. Intended for tests."""
-    global _PLAN_PUBLISHED
-    _PLANNED_IMAGE_URLS.clear()
-    _PLAN_PUBLISHED = False
 
 
 def is_plan_published() -> bool:

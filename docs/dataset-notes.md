@@ -44,6 +44,7 @@ The following best practices apply across all datasets unless noted otherwise:
   - On shared GKE Standard nodes, a CPU limit enforces a Linux CFS quota while leaving all host cores visible in `/proc/cpuinfo`. Toolchains that size worker pools from visible logical CPUs (`nproc`, `os.cpu_count()`, `os.cpus()`, or Go `< 1.25`) spawn too many workers for their 1–2 CPU quota and memory cap. Running capped trials on a static-CPU node pool (`cpuManagerPolicy: static`, such as the `harbor-static-cpu` ComputeClass) assigns exclusive physical cores so the container sees only its allocated CPUs. See [Task sizing and placement](task-sizing-and-placement.md).
 - **Use `--max-retries 2` to recover from transient node or network preemption**:
   - Harbor's `--max-retries` option retries transient infrastructure exceptions such as `TrialContainerLostError` and `GKEExecStreamClosedError`.
+  - A Pod lost to preemption, eviction, or node loss before the trial starts is replaced by its Job without a retry. `--max-retries` covers losses after that.
   - By default, Harbor excludes evaluation and model errors from retry (`AgentTimeoutError`, `VerifierTimeoutError`, `RewardFileNotFoundError`, `RewardFileEmptyError`, `VerifierOutputParseError`, `ApiUsageLimitError`, `AgentSafetyRefusalError`, `AgentAuthenticationError`, and `ModelNotFoundError`), and completed trials that return `reward = 0.0` are never retried.
 
 ---

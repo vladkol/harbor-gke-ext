@@ -115,7 +115,7 @@ Artifact Registry repositories are touched **only when an image must actually be
 
 For Compose Pods (built by `translate_compose()`), the module enforces a strict invariant: every container image string placed on the Pod's `initContainers`, `containers`, or `ephemeralContainers` must be issued by an `ImageResolver` instance. Single-container direct Pods don't go through `ImageResolver` and aren't checked.
 
-Before a Compose Pod is created, `assert_pod_images_resolved()` verifies this condition and raises an `UnresolvedPodImageError` if an unregistered image string appears in the Pod specification. The resolver issues an `ImageRef` and classifies the image's `ImageOrigin` (such as `MAIN_BUILT`, `MAIN_PREBUILT`, `VERIFIER`, `SIDECAR_BUILT`, `SIDECAR_EXTERNAL`, or `INFRA`).
+Before a Compose Pod is created, `assert_pod_images_resolved()` verifies this condition and raises an `UnresolvedPodImageError` if an unregistered image string appears in the Pod specification. The resolver issues an `ImageRef` and classifies the image's `ImageOrigin` (such as `MAIN_BUILT`, `SIDECAR_BUILT`, `SIDECAR_EXTERNAL`, or `INFRA`).
 
 For Compose Pods, this single chokepoint guarantees that all images are accounted for, audited for Image Streaming eligibility (`streaming_report()`), and ready for prefix rewriting when pull-through caching is enabled.
 

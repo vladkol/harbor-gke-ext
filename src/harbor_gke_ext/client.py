@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent.futures
-import inspect
+import contextlib
+import functools
 import os
 import re
 import shutil
 import subprocess
 import threading
-from typing import TYPE_CHECKING, Any, ClassVar, override
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any, override
 
 from harbor_gke_ext.constants import (
     _GKE_API_CONNECT_TIMEOUT_SEC,
@@ -69,20 +71,21 @@ def _shutdown_exec_executor() -> None:
         _GKE_EXEC_EXECUTOR = None
 
 
-def _ensure_file_descriptor_limit(target: int = 65536) -> None:
+def _ensure_file_descriptor_limit() -> None:
     """Ensure RLIMIT_NOFILE soft limit has sufficient headroom for high concurrency.
 
     At -n 1000 with the exec handshake limit at its 128 maximum, Harbor requires file descriptors for:
     - 1,000 active trial.log files (1 per active trial)
     - Up to 128 active socket descriptors during exec launch bursts
     - Runtime handles and standard streams (~50)
-    Total minimum needed is ~1,200. Target defaults to 65,536 (or system hard limit).
+    Total minimum needed is ~1,200. The target is 65,536 (or the system hard limit).
 
     Invariants:
     - Never lowers the limit if already higher.
     - Caps at the system hard limit.
     - Swallows exceptions with a warning log so failure never blocks execution.
     """
+    target = 65536
     try:
         import resource
     except ImportError:
@@ -123,63 +126,45 @@ def derive_region(location: str) -> str:
     return location.rsplit("-", 1)[0] if is_gcp_zone(location) else location
 
 
-_GCLOUD_CHECK_LOCK = threading.Lock()
-_GCLOUD_VERIFIED: bool = False
-_PROJECT_ID_LOCK = threading.Lock()
-_CACHED_DEFAULT_PROJECT_ID: str | None = None
+@functools.cache
+def ensure_gcloud_ready() -> None:
+    """Verify once per process that gcloud CLI is installed and authenticated.
 
-
-def reset_gcloud_cache() -> None:
-    """Reset process-wide gcloud verification and default project caches."""
-    global _GCLOUD_VERIFIED, _CACHED_DEFAULT_PROJECT_ID
-    with _GCLOUD_CHECK_LOCK:
-        _GCLOUD_VERIFIED = False
-    with _PROJECT_ID_LOCK:
-        _CACHED_DEFAULT_PROJECT_ID = None
-
-
-def ensure_gcloud_ready(*, force_probe: bool = False) -> None:
-    """Verify once per process that gcloud CLI is installed and authenticated."""
-    global _GCLOUD_VERIFIED
+    A failed check raises, and ``functools.cache`` does not store raised calls,
+    so a later call checks again.
+    """
     if not shutil.which("gcloud"):
         raise SystemExit(
             "GKE requires the gcloud CLI to be installed. "
             "See https://docs.cloud.google.com/sdk/docs/install-sdk"
         )
-    if _GCLOUD_VERIFIED and not force_probe:
+    adc_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if adc_path and os.path.isfile(adc_path):
         return
-    with _GCLOUD_CHECK_LOCK:
-        if _GCLOUD_VERIFIED and not force_probe:
-            return
-        adc_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-        if adc_path and os.path.isfile(adc_path):
-            _GCLOUD_VERIFIED = True
-            return
-        try:
-            res = subprocess.run(
-                [
-                    "gcloud",
-                    "auth",
-                    "list",
-                    "--filter=status:ACTIVE",
-                    "--format=value(account)",
-                    "--quiet",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            if res.returncode != 0 or not res.stdout.strip():
-                raise SystemExit(
-                    "GKE requires an active authenticated gcloud account. "
-                    "Run 'gcloud auth login' or 'gcloud auth activate-service-account' to authenticate."
-                )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SystemExit(
-                f"Failed to verify gcloud authentication status: {exc}"
-            ) from exc
-        _GCLOUD_VERIFIED = True
+    try:
+        res = subprocess.run(
+            [
+                "gcloud",
+                "auth",
+                "list",
+                "--filter=status:ACTIVE",
+                "--format=value(account)",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit(
+            f"Failed to verify gcloud authentication status: {exc}"
+        ) from exc
+    if res.returncode != 0 or not res.stdout.strip():
+        raise SystemExit(
+            "GKE requires an active authenticated gcloud account. "
+            "Run 'gcloud auth login' or 'gcloud auth activate-service-account' to authenticate."
+        )
 
 
 def parse_gke_context_identifier(identifier: str) -> tuple[str, str, str] | None:
@@ -215,7 +200,6 @@ def get_active_gke_context() -> tuple[str, str, str] | None:
 
 def resolve_default_project_id() -> str:
     """Resolve default GCP project from env vars or once-per-process gcloud config."""
-    global _CACHED_DEFAULT_PROJECT_ID
     env_proj = (
         os.environ.get("GOOGLE_CLOUD_PROJECT")
         or os.environ.get("CLOUDSDK_CORE_PROJECT")
@@ -223,31 +207,29 @@ def resolve_default_project_id() -> str:
     )
     if env_proj and env_proj.strip():
         return env_proj.strip()
+    return _gcloud_default_project_id()
 
-    if _CACHED_DEFAULT_PROJECT_ID:
-        return _CACHED_DEFAULT_PROJECT_ID
 
-    with _PROJECT_ID_LOCK:
-        if _CACHED_DEFAULT_PROJECT_ID:
-            return _CACHED_DEFAULT_PROJECT_ID
-        try:
-            result = subprocess.run(
-                ["gcloud", "config", "get-value", "project", "-q"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            project = result.stdout.strip()
-            if project and project != "(unset)":
-                _CACHED_DEFAULT_PROJECT_ID = project
-                return project
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-        raise ValueError(
-            "No GCP project specified. Set project_id parameter, "
-            "GOOGLE_CLOUD_PROJECT / GCP_PROJECT environment variable, "
-            "an active GKE kubectl context, or configure gcloud default project."
+@functools.cache
+def _gcloud_default_project_id() -> str:
+    """Read the gcloud default project. Raises (uncached) when none is set."""
+    try:
+        result = subprocess.run(
+            ["gcloud", "config", "get-value", "project", "-q"],
+            capture_output=True,
+            text=True,
+            check=True,
         )
+        project = result.stdout.strip()
+        if project and project != "(unset)":
+            return project
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    raise ValueError(
+        "No GCP project specified. Set project_id parameter, "
+        "GOOGLE_CLOUD_PROJECT / GCP_PROJECT environment variable, "
+        "an active GKE kubectl context, or configure gcloud default project."
+    )
 
 
 def resolve_gke_target(
@@ -361,17 +343,7 @@ class TimeoutApiClient(_ApiClientBase):
     indefinitely, causing thread pool exhaustion and preventing Python from shutting down.
     """
 
-    def __init__(
-        self,
-        *args: Any,
-        default_timeout: tuple[float, float] = (
-            _GKE_API_CONNECT_TIMEOUT_SEC,
-            _GKE_API_READ_TIMEOUT_SEC,
-        ),
-        **kwargs: Any,
-    ):
-        super().__init__(*args, **kwargs)
-        self.default_timeout = default_timeout
+    _DEFAULT_TIMEOUT = (_GKE_API_CONNECT_TIMEOUT_SEC, _GKE_API_READ_TIMEOUT_SEC)
 
     @override
     def call_api(self, *args: Any, **kwargs: Any) -> Any:
@@ -386,7 +358,7 @@ class TimeoutApiClient(_ApiClientBase):
         original exception is re-raised instead.
         """
         if kwargs.get("_request_timeout") is None:
-            kwargs["_request_timeout"] = self.default_timeout
+            kwargs["_request_timeout"] = self._DEFAULT_TIMEOUT
         try:
             return super().call_api(*args, **kwargs)
         except AttributeError as exc:
@@ -408,7 +380,7 @@ class TimeoutApiClient(_ApiClientBase):
 
 class KubernetesClientManager:
     """
-    Singleton manager for the Kubernetes client configuration.
+    Process-wide manager for the Kubernetes client configuration.
 
     Handles kubeconfig loading, credential setup, and reference counting.
     Each caller of ``get_client()`` receives its own ``CoreV1Api`` backed by a
@@ -416,24 +388,15 @@ class KubernetesClientManager:
     ``stream()`` function (used for exec/attach) temporarily monkey-patches
     ``ApiClient.request`` with a WebSocket handler, which is not thread-safe
     when multiple environments share the same ``ApiClient``.
+
+    Configuration is synchronous and guarded by a ``threading.Lock`` so it can
+    be reached both from the event loop (through ``asyncio.to_thread``) and
+    from synchronous code such as ``GKEEnvironment.capabilities``, which Harbor
+    reads from the environment constructor.
     """
 
     _instance: KubernetesClientManager | None = None
-    _lock: asyncio.Lock | None = None
-    _fqdn_supported: ClassVar[bool | None] = None
-    _fqdn_supported_by_cluster: ClassVar[dict[tuple[str, str, str], bool]] = {}
-
-    @classmethod
-    def reset_fqdn_cache(cls) -> None:
-        """Reset the cached FQDN network policy and cluster capability status."""
-        cls._fqdn_supported = None
-        cls._fqdn_supported_by_cluster.clear()
-        try:
-            from harbor_gke_ext.environment import _CLUSTER_CAPABILITIES_CACHE
-
-            _CLUSTER_CAPABILITIES_CACHE.clear()
-        except Exception:
-            pass
+    _instance_lock = threading.Lock()
 
     @staticmethod
     def _find_matching_kube_context(
@@ -478,120 +441,12 @@ class KubernetesClientManager:
         ]
         return subprocess.run(get_creds_cmd, capture_output=True, text=True)
 
-    @classmethod
-    def _resolve_cluster_api_client(
-        cls,
-        cluster_name: str | None = None,
-        region: str | None = None,
-        project_id: str | None = None,
-    ) -> k8s_client.ApiClient:
-        """Resolve an ApiClient for a specific GKE cluster without mutating global kubeconfig state."""
-        if cluster_name and region and project_id:
-            try:
-                _, _, matched_ctx = cls._find_matching_kube_context(
-                    cluster_name, project_id, region
-                )
-                if matched_ctx:
-                    return k8s_config.new_client_from_config(context=matched_ctx)
-            except Exception:
-                pass
-
-            # Context not in kubeconfig yet; fetch credentials for target cluster
-            try:
-                cls._fetch_gke_kube_credentials(cluster_name, region, project_id)
-                _, _, matched_ctx = cls._find_matching_kube_context(
-                    cluster_name, project_id, region
-                )
-                if matched_ctx:
-                    return k8s_config.new_client_from_config(context=matched_ctx)
-            except Exception:
-                pass
-
-        try:
-            k8s_config.load_kube_config()
-        except Exception:
-            pass
-        return k8s_client.ApiClient()
-
-    @classmethod
-    def is_fqdn_network_policy_supported(
-        cls,
-        api_client: k8s_client.ApiClient | None = None,
-        *,
-        cluster_name: str | None = None,
-        region: str | None = None,
-        project_id: str | None = None,
-    ) -> bool:
-        """Check if FQDNNetworkPolicy CRD exists on the target cluster."""
-        cluster_key = (project_id or "", region or "", cluster_name or "")
-        has_cluster_identity = bool(cluster_name and region and project_id)
-
-        if has_cluster_identity and cluster_key in cls._fqdn_supported_by_cluster:
-            return cls._fqdn_supported_by_cluster[cluster_key]
-        if cls._fqdn_supported is not None and not has_cluster_identity:
-            return cls._fqdn_supported
-        if (
-            cls._fqdn_supported is not None
-            and has_cluster_identity
-            and not cls._fqdn_supported_by_cluster
-        ):
-            return cls._fqdn_supported
-
-        created_temp_client = False
-        cacheable = True
-        try:
-            if api_client is None:
-                api_client = cls._resolve_cluster_api_client(
-                    cluster_name=cluster_name,
-                    region=region,
-                    project_id=project_id,
-                )
-                created_temp_client = True
-            sig = inspect.signature(api_client.call_api).parameters
-            call_kwargs: dict[str, Any] = {"auth_settings": ["BearerToken"]}
-            if "response_types_map" in sig:
-                call_kwargs["response_types_map"] = {200: "object"}
-            else:
-                call_kwargs["response_type"] = "object"
-            resp, _, _ = api_client.call_api(
-                "/apis/networking.gke.io/v1alpha1",
-                "GET",
-                **call_kwargs,
-            )
-            if isinstance(resp, dict) and "resources" in resp:
-                supported = any(
-                    isinstance(r, dict) and r.get("name") == "fqdnnetworkpolicies"
-                    for r in resp["resources"]
-                )
-            else:
-                supported = False
-        except ApiException as exc:
-            logger.debug("Failed to probe GKE FQDNNetworkPolicy CRD support: %s", exc)
-            supported = False
-            cacheable = exc.status == 404
-        except Exception as exc:
-            logger.debug("Failed to probe GKE FQDNNetworkPolicy CRD support: %s", exc)
-            supported = False
-            cacheable = False
-        finally:
-            if created_temp_client and api_client is not None:
-                try:
-                    api_client.close()
-                except Exception:
-                    pass
-
-        if cacheable:
-            cls._fqdn_supported = supported
-            if has_cluster_identity:
-                cls._fqdn_supported_by_cluster[cluster_key] = supported
-        return supported
-
     def __init__(self):
         if not _HAS_KUBERNETES:
             raise MissingExtraError(package="kubernetes", extra="gke")
         self._core_api = None
         self._reference_count = 0
-        self._client_lock = asyncio.Lock()
+        self._lock = threading.Lock()
         self._initialized = False
         self._cleanup_registered = False
         self._logger = logger.getChild(__name__)
@@ -601,18 +456,12 @@ class KubernetesClientManager:
         self._project_id: str | None = None
 
     @classmethod
-    async def get_instance(cls) -> "KubernetesClientManager":
+    def get_instance(cls) -> KubernetesClientManager:
         """Get or create the singleton instance."""
-        if cls._lock is None:
-            cls._lock = asyncio.Lock()
         if cls._instance is None:
-            async with cls._lock:
+            with cls._instance_lock:
                 if cls._instance is None:
                     cls._instance = cls()
-
-        if cls._instance is None:
-            raise RuntimeError("Failed to create KubernetesClientManager instance")
-
         return cls._instance
 
     def _init_client(self, cluster_name: str, region: str, project_id: str):
@@ -662,6 +511,60 @@ class KubernetesClientManager:
         self._region = region
         self._project_id = project_id
 
+    def configure(self, cluster_name: str, region: str, project_id: str) -> None:
+        """Load the client configuration for a cluster, once per process.
+
+        Blocking: may read kubeconfig and run ``gcloud container clusters
+        get-credentials``. Later calls only verify that the same cluster is
+        requested, because the kubernetes client configuration is global.
+        """
+        with self._lock:
+            if not self._initialized:
+                self._logger.debug("Creating new Kubernetes client")
+                self._init_client(cluster_name, region, project_id)
+                if not self._cleanup_registered:
+                    atexit.register(self._cleanup_sync)
+                    self._cleanup_registered = True
+            elif (
+                self._cluster_name != cluster_name
+                or self._region != region
+                or self._project_id != project_id
+            ):
+                raise ValueError(
+                    f"KubernetesClientManager already initialized for cluster "
+                    f"'{self._cluster_name}' in {self._region} (project: {self._project_id}). "
+                    f"Cannot connect to cluster '{cluster_name}' in {region} "
+                    f"(project: {project_id}). Use separate processes for different clusters."
+                )
+
+    @staticmethod
+    def _new_core_api() -> k8s_client.CoreV1Api:
+        # A dedicated TimeoutApiClient per caller avoids the stream()
+        # monkey-patching race and enforces socket timeouts.
+        return k8s_client.CoreV1Api(TimeoutApiClient())
+
+    @staticmethod
+    def _close_core_api(api: k8s_client.CoreV1Api | None) -> None:
+        api_client = getattr(api, "api_client", None)
+        if api_client is None:
+            return
+        try:
+            api_client.close()
+        except Exception:
+            pass
+
+    @contextlib.contextmanager
+    def scoped_client(
+        self, cluster_name: str, region: str, project_id: str
+    ) -> Iterator[k8s_client.CoreV1Api]:
+        """Yield a short-lived ``CoreV1Api`` for synchronous, one-off calls."""
+        self.configure(cluster_name, region, project_id)
+        api = self._new_core_api()
+        try:
+            yield api
+        finally:
+            self._close_core_api(api)
+
     async def get_client(self, cluster_name: str, region: str, project_id: str):
         """
         Get a Kubernetes CoreV1Api client, creating the shared config if necessary.
@@ -672,79 +575,35 @@ class KubernetesClientManager:
         temporarily monkey-patches ApiClient.request with a WebSocket handler,
         which is not safe when multiple threads share one ApiClient.
         """
-        async with self._client_lock:
-            if not self._initialized:
-                self._logger.debug("Creating new Kubernetes client")
-                await asyncio.to_thread(
-                    self._init_client, cluster_name, region, project_id
-                )
-
-                if not self._cleanup_registered:
-                    atexit.register(self._cleanup_sync)
-                    self._cleanup_registered = True
-            else:
-                # Validate cluster config matches
-                if (
-                    self._cluster_name != cluster_name
-                    or self._region != region
-                    or self._project_id != project_id
-                ):
-                    raise ValueError(
-                        f"KubernetesClientManager already initialized for cluster "
-                        f"'{self._cluster_name}' in {self._region} (project: {self._project_id}). "
-                        f"Cannot connect to cluster '{cluster_name}' in {region} "
-                        f"(project: {project_id}). Use separate processes for different clusters."
-                    )
-
+        await asyncio.to_thread(self.configure, cluster_name, region, project_id)
+        with self._lock:
             self._reference_count += 1
             self._logger.debug(
                 f"Kubernetes client reference count incremented to {self._reference_count}"
             )
+        return self._new_core_api()
 
-            # Return a per-caller CoreV1Api with its own TimeoutApiClient to avoid
-            # the stream() monkey-patching race condition and enforce socket timeouts.
-            api_client = (
-                TimeoutApiClient() if _HAS_KUBERNETES else k8s_client.ApiClient()
-            )
-            return k8s_client.CoreV1Api(api_client)
-
-    async def release_client(self, api: k8s_client.CoreV1Api | None = None):
+    def release_client(self, api: k8s_client.CoreV1Api | None = None) -> None:
         """Decrement the reference count for the client and clean up connections."""
-        if (
-            api is not None
-            and hasattr(api, "api_client")
-            and api.api_client is not None
-        ):
-            try:
-                api.api_client.close()
-            except Exception:
-                pass
-        async with self._client_lock:
+        self._close_core_api(api)
+        with self._lock:
             if self._reference_count > 0:
                 self._reference_count -= 1
                 self._logger.debug(
                     f"Kubernetes client reference count decremented to {self._reference_count}"
                 )
 
-    def _cleanup_sync(self):
-        """Synchronous cleanup wrapper for atexit."""
+    def _cleanup_sync(self) -> None:
+        """Clean up the Kubernetes client and background thread pools at exit."""
         try:
-            asyncio.run(self._cleanup())
-        except Exception as e:
-            self._logger.error(f"Error during Kubernetes client cleanup: {e}")
-
-    async def _cleanup(self):
-        """Clean up the Kubernetes client and background thread pools if they exist."""
-        _shutdown_exec_executor()
-        async with self._client_lock:
-            if self._initialized:
-                try:
+            _shutdown_exec_executor()
+            with self._lock:
+                if self._initialized:
                     self._logger.debug("Cleaning up Kubernetes client at program exit")
                     self._core_api = None
                     self._initialized = False
-                    self._logger.debug("Kubernetes client cleaned up successfully")
-                except Exception as e:
-                    self._logger.error(f"Error cleaning up Kubernetes client: {e}")
+        except Exception as e:
+            self._logger.error(f"Error during Kubernetes client cleanup: {e}")
 
 
 # Auto-raise FD limit on module load

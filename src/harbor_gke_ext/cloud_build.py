@@ -9,7 +9,6 @@ Provides shared primitives for:
 from __future__ import annotations
 
 import asyncio
-import functools
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -72,15 +71,6 @@ def mark_image_exists_in_registry(
         _REPO_EXISTS_CACHE.add(parsed_repo)
 
 
-def reset_image_registry_cache() -> None:
-    """Clear cached image existence entries (for testing and reset)."""
-    _REGISTRY_EXISTS_CACHE.clear()
-    _REGISTRY_EXISTS_TASKS.clear()
-    _REPO_EXISTS_CACHE.clear()
-    _REPO_ENSURE_TASKS.clear()
-
-
-@functools.lru_cache(maxsize=2048)
 def resolve_task_image_url(
     *,
     digest: str,
@@ -580,17 +570,14 @@ async def build_task_image_if_missing(
     machine_type: str | None = None,
     disk_size_gb: int | None = None,
     worker_pool: str | None = None,
-    polling_interval_sec: int = 30,
     semaphore: asyncio.Semaphore | None = None,
     reraise: bool = False,
-    logger_instance: Any = None,
 ) -> bool:
     """Check if image exists in registry; if missing (or force_build=True), build and push via Cloud Build."""
-    _logger = logger_instance or logger
     if not force_build and await check_image_exists_in_registry(
         image_url, project_id=project_id
     ):
-        _logger.debug(f"[CACHE HIT] Image already exists in registry: {image_url}")
+        logger.debug(f"[CACHE HIT] Image already exists in registry: {image_url}")
         return True
 
     return await submit_cloud_build(
@@ -603,8 +590,6 @@ async def build_task_image_if_missing(
         machine_type=machine_type,
         disk_size_gb=disk_size_gb,
         worker_pool=worker_pool,
-        polling_interval_sec=polling_interval_sec,
         semaphore=semaphore,
         reraise=reraise,
-        logger_instance=_logger,
     )

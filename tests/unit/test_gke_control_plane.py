@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from kubernetes.client.rest import ApiException
+from limiter_probe import free_slots
 
+from harbor_gke_ext import control_plane
+from harbor_gke_ext.constants import (
+    _GKE_CONTROL_PLANE_LIMIT_MAX,
+    _GKE_EXEC_SEMAPHORE_LIMIT,
+)
 from harbor_gke_ext.control_plane import (
     AdaptiveConcurrencyLimiter,
     get_control_plane_limiter,
@@ -33,8 +40,26 @@ class _FakeClock:
     def __init__(self, now: float = 1000.0) -> None:
         self.now = now
 
-    def __call__(self) -> float:
+    def monotonic(self) -> float:
         return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch) -> _FakeClock:
+    """Drive the limiter's cooldowns without touching the event loop's clock."""
+    fake = _FakeClock()
+    monkeypatch.setattr(control_plane, "time", fake)
+    return fake
+
+
+async def _fill(limiter: AdaptiveConcurrencyLimiter) -> None:
+    for _ in range(_GKE_CONTROL_PLANE_LIMIT_MAX):
+        await limiter.acquire()
+
+
+def _release(limiter: AdaptiveConcurrencyLimiter, count: int) -> None:
+    for _ in range(count):
+        limiter.release()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,13 +138,20 @@ def test_non_api_exceptions_are_not_overload():
     ("attempt", "nominal"),
     [(0, 2.0), (1, 4.0), (2, 8.0), (3, 16.0), (4, 20.0), (10, 20.0)],
 )
-def test_jitter_bounds_follow_capped_exponential_schedule(attempt, nominal):
-    low = jittered_backoff_delay(attempt, uniform=lambda a, b: a)
-    high = jittered_backoff_delay(attempt, uniform=lambda a, b: b)
-    mid = jittered_backoff_delay(attempt, uniform=lambda a, b: (a + b) / 2)
-    assert low == pytest.approx(nominal * 0.8)
-    assert high == pytest.approx(nominal * 1.2)
-    assert mid == pytest.approx(nominal)
+@pytest.mark.parametrize(
+    ("draw", "factor"),
+    [
+        (lambda a, b: a, 0.8),
+        (lambda a, b: (a + b) / 2, 1.0),
+        (lambda a, b: b, 1.2),
+    ],
+    ids=["low", "mid", "high"],
+)
+def test_jitter_follows_capped_exponential_schedule(
+    monkeypatch, attempt, nominal, draw, factor
+):
+    monkeypatch.setattr(control_plane, "random", SimpleNamespace(uniform=draw))
+    assert jittered_backoff_delay(attempt) == pytest.approx(nominal * factor)
 
 
 @pytest.mark.unit
@@ -134,76 +166,56 @@ def test_jitter_default_rng_stays_in_bounds():
 
 
 @pytest.mark.unit
-def test_limiter_rejects_invalid_configuration():
-    with pytest.raises(ValueError):
-        AdaptiveConcurrencyLimiter(minimum=0, maximum=4)
-    with pytest.raises(ValueError):
-        AdaptiveConcurrencyLimiter(minimum=8, maximum=4)
-    with pytest.raises(ValueError):
-        AdaptiveConcurrencyLimiter(minimum=1, maximum=4, decrease_factor=1.0)
-
-
-@pytest.mark.unit
-def test_limiter_starts_at_maximum_and_default_matches_exec_pool():
-    assert AdaptiveConcurrencyLimiter(minimum=2, maximum=16).limit == 16
-    assert get_control_plane_limiter().limit == 128
+@pytest.mark.asyncio
+async def test_limiter_starts_at_exec_pool_size_and_is_process_wide():
+    assert await free_slots(AdaptiveConcurrencyLimiter()) == _GKE_EXEC_SEMAPHORE_LIMIT
     assert get_control_plane_limiter() is get_control_plane_limiter()
 
 
 @pytest.mark.unit
-def test_limiter_overload_halves_once_per_cooldown_and_respects_minimum():
-    clock = _FakeClock()
-    lim = AdaptiveConcurrencyLimiter(
-        minimum=4, maximum=128, decrease_cooldown_sec=5.0, clock=clock
-    )
+@pytest.mark.asyncio
+async def test_limiter_overload_halves_once_per_cooldown_and_respects_minimum(clock):
+    lim = AdaptiveConcurrencyLimiter()
     lim.record_overload()
-    assert lim.limit == 64
+    assert await free_slots(lim) == 64
     # A burst of failures inside the cooldown is one overload episode.
     clock.now += 4.9
     lim.record_overload()
     lim.record_overload()
-    assert lim.limit == 64
+    assert await free_slots(lim) == 64
     for expected in (32, 16, 8, 4, 4):
         clock.now += 5.0
         lim.record_overload()
-        assert lim.limit == expected
+        assert await free_slots(lim) == expected
 
 
 @pytest.mark.unit
-def test_limiter_success_increases_additively_after_cooldown():
-    clock = _FakeClock()
-    lim = AdaptiveConcurrencyLimiter(
-        minimum=4,
-        maximum=10,
-        decrease_cooldown_sec=5.0,
-        increase_interval_sec=1.0,
-        clock=clock,
-    )
+@pytest.mark.asyncio
+async def test_limiter_success_increases_additively_after_cooldown(clock):
+    lim = AdaptiveConcurrencyLimiter()
     lim.record_overload()
-    assert lim.limit == 5
     # No growth during the cooldown after a decrease.
     clock.now += 4.0
     lim.record_success()
-    assert lim.limit == 5
+    assert await free_slots(lim) == 64
     clock.now += 1.0
     lim.record_success()
-    assert lim.limit == 6
+    assert await free_slots(lim) == 65
     # At most one slot per increase interval, however many successes.
     lim.record_success()
     lim.record_success()
-    assert lim.limit == 6
-    for _ in range(10):
+    assert await free_slots(lim) == 65
+    for _ in range(_GKE_CONTROL_PLANE_LIMIT_MAX):
         clock.now += 1.0
         lim.record_success()
-    assert lim.limit == 10  # capped at maximum
+    assert await free_slots(lim) == _GKE_CONTROL_PLANE_LIMIT_MAX
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_limiter_bounds_concurrency_and_serves_waiters_fifo():
-    lim = AdaptiveConcurrencyLimiter(minimum=1, maximum=2)
-    await lim.acquire()
-    await lim.acquire()
+    lim = AdaptiveConcurrencyLimiter()
+    await _fill(lim)
     order: list[str] = []
 
     async def waiter(name: str) -> None:
@@ -214,32 +226,22 @@ async def test_limiter_bounds_concurrency_and_serves_waiters_fifo():
     await asyncio.sleep(0)
     t2 = asyncio.create_task(waiter("b"))
     await asyncio.sleep(0)
-    assert lim.in_flight == 2
-    assert lim.waiting == 2
-    lim.release()
-    lim.release()
+    assert order == []
+    _release(lim, 2)
     await asyncio.gather(t1, t2)
     assert order == ["a", "b"]
-    assert lim.in_flight == 0
-    assert lim.waiting == 0
+    _release(lim, _GKE_CONTROL_PLANE_LIMIT_MAX - 2)
+    assert await free_slots(lim) == _GKE_CONTROL_PLANE_LIMIT_MAX
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_limiter_shrink_does_not_interrupt_in_flight_and_growth_wakes_waiters():
-    clock = _FakeClock()
-    lim = AdaptiveConcurrencyLimiter(
-        minimum=1,
-        maximum=4,
-        decrease_cooldown_sec=5.0,
-        increase_interval_sec=1.0,
-        clock=clock,
-    )
-    for _ in range(4):
-        await lim.acquire()
+async def test_limiter_shrink_does_not_interrupt_in_flight_and_growth_wakes_waiters(
+    clock,
+):
+    lim = AdaptiveConcurrencyLimiter()
+    await _fill(lim)
     lim.record_overload()
-    assert lim.limit == 2
-    assert lim.in_flight == 4
 
     acquired = asyncio.Event()
 
@@ -250,56 +252,41 @@ async def test_limiter_shrink_does_not_interrupt_in_flight_and_growth_wakes_wait
     task = asyncio.create_task(waiter())
     await asyncio.sleep(0)
     # Releasing down to the new limit must not admit the waiter yet.
-    lim.release()
-    lim.release()
+    _release(lim, 64)
     await asyncio.sleep(0)
     assert not acquired.is_set()
-    assert lim.in_flight == 2
     # Recovery raises the limit and admits the waiter immediately.
     clock.now += 5.0
     lim.record_success()
     await asyncio.wait_for(task, timeout=1.0)
-    assert acquired.is_set()
-    assert lim.limit == 3
-    assert lim.in_flight == 3
+    assert await free_slots(lim) == 0
+    _release(lim, 65)
+    assert await free_slots(lim) == 65
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_limiter_cancelled_waiter_does_not_leak_a_slot():
-    lim = AdaptiveConcurrencyLimiter(minimum=1, maximum=1)
-    await lim.acquire()
+@pytest.mark.parametrize(
+    "grant_before_cancel",
+    [False, True],
+    ids=["cancelled-while-waiting", "granted-then-cancelled-same-tick"],
+)
+async def test_limiter_cancelled_waiter_does_not_leak_a_slot(grant_before_cancel):
+    lim = AdaptiveConcurrencyLimiter()
+    await _fill(lim)
     task = asyncio.create_task(lim.acquire())
     await asyncio.sleep(0)
-    assert lim.waiting == 1
+    if grant_before_cancel:
+        lim.release()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert lim.waiting == 0
-    lim.release()
-    assert lim.in_flight == 0
-    await asyncio.wait_for(lim.acquire(), timeout=1.0)
-    assert lim.in_flight == 1
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_limiter_slot_granted_then_cancelled_is_returned():
-    lim = AdaptiveConcurrencyLimiter(minimum=1, maximum=1)
-    await lim.acquire()
-    task = asyncio.create_task(lim.acquire())
-    await asyncio.sleep(0)
-    # Grant the slot and cancel in the same tick, before the waiter resumes.
-    lim.release()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert lim.in_flight == 0
-    assert lim.waiting == 0
+    if not grant_before_cancel:
+        lim.release()
+    assert await free_slots(lim) == 1
 
 
 @pytest.mark.unit
 def test_limiter_release_without_acquire_is_an_error():
-    lim = AdaptiveConcurrencyLimiter(minimum=1, maximum=1)
     with pytest.raises(RuntimeError, match="released more than acquired"):
-        lim.release()
+        AdaptiveConcurrencyLimiter().release()
