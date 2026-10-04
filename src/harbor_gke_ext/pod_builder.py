@@ -55,17 +55,18 @@ def build_direct_pod(
     ``budget_limits`` is populated only from explicitly supplied ``cpu_limit``
     and ``memory_limit`` arguments. Under ``GKEEnvironment``'s default
     ``ResourceMode.AUTO`` policy (``_GKE_DEFAULT_RESOURCE_AUTO_MODE =
-    ResourceMode.GUARANTEE``), both ``requests`` and ``limits`` equal the
-    task's declared ``cpus`` and ``memory_mb`` (matching Docker's capped
-    default). Passing ``--cpus request --memory request`` omits the limits so
-    a direct task can burst up to node capacity.
+    ResourceMode.REQUEST``), direct Pods set ``requests`` to the task's
+    declared ``cpus`` and ``memory_mb`` and omit ``limits`` (unless
+    ``cpu_limit_multiplier`` or ``memory_limit_multiplier`` is set), so tasks
+    can burst into idle node capacity. Passing ``--cpus guarantee --memory
+    guarantee`` sets ``requests == limits == declared budget``.
 
     **Where the CPU/memory budget lives.** When both CPU and memory are set
-    with ``request == limit`` (a Guaranteed budget, produced by the default
-    ``auto`` mode or ``--cpus guarantee --memory guarantee`` without limit
-    multipliers), the budget goes on the ``main`` container so kubelet's
-    static CPU Manager and Memory Manager can grant exclusive cores. Otherwise
-    (when limits are omitted via ``request`` mode or raised via
+    with ``request == limit`` (a Guaranteed budget, produced by
+    ``--cpus guarantee --memory guarantee`` or multiplier ``1.0``), the budget
+    goes on the ``main`` container so kubelet's static CPU Manager and Memory
+    Manager can grant exclusive cores. Otherwise (when limits are omitted via
+    the default ``auto`` / ``request`` mode or raised via
     ``cpu_limit_multiplier`` / ``memory_limit_multiplier``), the budget goes on
     the Pod (``spec.resources``).
     """

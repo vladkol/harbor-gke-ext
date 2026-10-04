@@ -19,6 +19,7 @@ from kubernetes.client.rest import ApiException
 from harbor_gke_ext import exec_engine
 from harbor_gke_ext.constants import GKEExecStreamClosedError, TrialContainerLostError
 from harbor_gke_ext.exec_engine import (
+    _SUPERVISED_ZERO_EXIT_CODE,
     _enable_tcp_keepalive,
     build_decoupled_launch_script,
     build_kill_script,
@@ -32,6 +33,7 @@ from harbor_gke_ext.exec_engine import (
     read_exec_output,
     run_exec_command,
     stream_tar_to_pod,
+    unwrap_supervised_exit_code,
     upload_dir,
     upload_file,
 )
@@ -1076,17 +1078,31 @@ def _wait_until(predicate, timeout: float = 5.0) -> bool:
 
 
 @pytest.mark.unit
-def test_supervised_script_streams_output_and_exit_code(tmp_path):
-    w = str(tmp_path / "harbor_sup")
-    script = build_supervised_script(w, "echo out-line; echo err-line >&2; exit 7")
+@pytest.mark.parametrize(
+    "cmd_rc,expected_wire_rc",
+    [
+        (0, _SUPERVISED_ZERO_EXIT_CODE),
+        (7, 7),
+        (_SUPERVISED_ZERO_EXIT_CODE, 0),
+    ],
+)
+def test_supervised_script_streams_output_and_exit_code(
+    tmp_path, cmd_rc, expected_wire_rc
+):
+    w = str(tmp_path / f"harbor_sup_{cmd_rc}")
+    script = build_supervised_script(
+        w, f"echo out-line; echo err-line >&2; exit {cmd_rc}"
+    )
     proc = subprocess.run(["sh", "-c", script], capture_output=True, timeout=20)
     assert (proc.returncode, proc.stdout, proc.stderr) == (
-        7,
+        expected_wire_rc,
         b"out-line\n",
         b"err-line\n",
     )
-    assert not Path(w).exists()
-    assert Path(f"{w}.status").read_text().strip() == "7"
+    if cmd_rc != _SUPERVISED_ZERO_EXIT_CODE:
+        assert not Path(w).exists()
+        assert unwrap_supervised_exit_code(proc.returncode) == cmd_rc
+    assert Path(f"{w}.status").read_text().strip() == str(cmd_rc)
 
 
 @pytest.mark.unit
@@ -1102,7 +1118,7 @@ def test_supervised_script_survives_workdir_wipe(tmp_path):
     script = build_supervised_script(w, command)
     start = time.monotonic()
     proc = subprocess.run(["sh", "-c", script], capture_output=True, timeout=30)
-    assert proc.returncode == 0, proc.stderr
+    assert unwrap_supervised_exit_code(proc.returncode) == 0, proc.stderr
     assert time.monotonic() - start >= 2.0, (
         "supervisor returned before the command ended"
     )

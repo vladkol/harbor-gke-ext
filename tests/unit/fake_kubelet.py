@@ -88,6 +88,10 @@ class FakeKubelet:
         self.connections: list[FakeConnection] = []
         # Called with the argv; returns N to drop that stream after N stdout bytes.
         self.drop_stream_after: Callable[[list[str]], int | None] = lambda argv: None
+        # When True, a dropped stream sends channel-3 StatusSuccess + OP_CLOSE
+        # before closing, matching kube-apiserver StreamTranslatorHandler when
+        # the backend SPDY tunnel to kubelet closes on EOF.
+        self.fabricate_success_on_drop: bool = False
         # Called with the argv; returns a status payload to send instead of the
         # process exit code (e.g. an exec Failure without an ExitCode cause).
         self.status_override: Callable[[list[str]], bytes | None] = lambda argv: None
@@ -185,9 +189,12 @@ class FakeKubelet:
                             if room > 0:
                                 sock.sendall(channel_frame(1, chunk[:room]))
                                 conn.stdout_sent += room
-                            # Vanish: no status, no CLOSE. The command keeps running,
-                            # and its output pipes break, as they do for a real exec.
                             conn.dropped = True
+                            if self.fabricate_success_on_drop:
+                                sock.sendall(channel_frame(3, status_payload(0)))
+                                sock.sendall(
+                                    server_frame(OP_CLOSE, struct.pack("!H", 1000))
+                                )
                             sock.close()
                             proc.stdout.close()
                             proc.stderr.close()

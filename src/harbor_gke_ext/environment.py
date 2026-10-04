@@ -126,6 +126,7 @@ from harbor_gke_ext.exec_engine import (
     read_exec_output,
     run_best_effort,
     run_exec_command,
+    unwrap_supervised_exit_code,
 )
 from harbor_gke_ext.exec_engine import (
     download_dir as ft_download_dir,
@@ -236,10 +237,11 @@ _PATH_KIND_CHECK_TIMEOUT_SEC = 60
 _FAILED_CONTAINER_LOG_TAIL_LINES = 80
 _INFRA_CONTAINER_LOG_LIMIT_BYTES = 16384
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-# Provisional default for ResourceMode.AUTO (Option A: capped by default,
-# request == limit == declared budget, matching Docker). Switch to
-# ResourceMode.REQUEST to restore uncapped-by-default if post-eval gate requires.
-_GKE_DEFAULT_RESOURCE_AUTO_MODE: ResourceMode = ResourceMode.GUARANTEE
+# Default for ResourceMode.AUTO: request the declared budget without hard
+# container limits on direct Pods (Burstable QoS), so single-CPU/4-GiB tasks
+# can burst onto idle node capacity during build and test spikes. Compose Pods
+# always set a Pod-level ceiling via build_pod_level_resources().
+_GKE_DEFAULT_RESOURCE_AUTO_MODE: ResourceMode = ResourceMode.REQUEST
 
 
 # Process-wide cluster capabilities and admission control, keyed by
@@ -2456,7 +2458,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 deadline = asyncio.timeout(timeout_sec if timeout_sec else None)
                 try:
                     async with deadline:
-                        await read_exec_output(stream, output)
+                        await read_exec_output(stream, output, finish=not supervised)
                 except TimeoutError:
                     if not deadline.expired():
                         raise
@@ -2491,7 +2493,12 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                         )
                         await asyncio.sleep(wait_time)
                         continue
+                    await output.finish()
                     raise
+
+                if supervised:
+                    return_code = unwrap_supervised_exit_code(return_code, stream.label)
+                    await output.finish()
 
                 if return_code != 0:
                     await self._raise_if_container_lost(container)

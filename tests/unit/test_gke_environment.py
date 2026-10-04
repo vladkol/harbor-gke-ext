@@ -381,33 +381,37 @@ def test_get_default_project_fails_without_any_source(monkeypatch, tmp_path):
 
 @pytest.mark.unit
 def test_init_memory_limit_multiplier_and_direct_limit(tmp_path):
-    # Default (auto) caps both CPU and memory to the declared budget (Guaranteed QoS)
+    # Default (auto) requests the declared budget without limits (Burstable QoS)
     env_default = make_gke_env(
         tmp_path,
         task_env_config=EnvironmentConfig(cpus=2, memory_mb=2048),
     )
     assert env_default.cpu_request == "2"
-    assert env_default.cpu_limit == "2"
+    assert env_default.cpu_limit is None
     assert env_default.memory_request == "2048Mi"
-    assert env_default.memory_limit == "2048Mi"
+    assert env_default.memory_limit is None
     pod_default = env_default._build_direct_pod()
-    assert pod_default.spec.resources is None
-    assert pod_default.spec.containers[0].resources.requests["cpu"] == "2"
-    assert pod_default.spec.containers[0].resources.limits["cpu"] == "2"
-    assert pod_default.spec.containers[0].resources.requests["memory"] == "2048Mi"
-    assert pod_default.spec.containers[0].resources.limits["memory"] == "2048Mi"
+    assert pod_default.spec.resources is not None
+    assert pod_default.spec.resources.requests == {"cpu": "2", "memory": "2048Mi"}
+    assert pod_default.spec.resources.limits is None
 
-    # Explicit request mode omits limits (uncapped)
-    env_req = make_gke_env(
+    # Explicit guarantee mode caps both CPU and memory on the main container
+    env_guar = make_gke_env(
         tmp_path,
         task_env_config=EnvironmentConfig(cpus=2, memory_mb=2048),
-        cpu_enforcement_policy="request",
-        memory_enforcement_policy="request",
+        cpu_enforcement_policy="guarantee",
+        memory_enforcement_policy="guarantee",
     )
-    assert env_req.cpu_request == "2"
-    assert env_req.cpu_limit is None
-    assert env_req.memory_request == "2048Mi"
-    assert env_req.memory_limit is None
+    assert env_guar.cpu_request == "2"
+    assert env_guar.cpu_limit == "2"
+    assert env_guar.memory_request == "2048Mi"
+    assert env_guar.memory_limit == "2048Mi"
+    pod_guar = env_guar._build_direct_pod()
+    assert pod_guar.spec.resources is None
+    assert pod_guar.spec.containers[0].resources.requests["cpu"] == "2"
+    assert pod_guar.spec.containers[0].resources.limits["cpu"] == "2"
+    assert pod_guar.spec.containers[0].resources.requests["memory"] == "2048Mi"
+    assert pod_guar.spec.containers[0].resources.limits["memory"] == "2048Mi"
 
     # Multipliers in auto mode override the default cap
     env = make_gke_env(
@@ -1989,7 +1993,10 @@ async def test_exec_user_and_cwd(tmp_path):
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("supervised", [True, False])
-async def test_exec_streams_output_and_exit_code(local_exec_env, tmp_path, supervised):
+@pytest.mark.parametrize("exit_code", [0, 3, 242])
+async def test_exec_streams_output_and_exit_code(
+    local_exec_env, tmp_path, supervised, exit_code
+):
     chunks: list[tuple[str, str]] = []
 
     async def callback(text, stream_name):
@@ -1997,11 +2004,15 @@ async def test_exec_streams_output_and_exit_code(local_exec_env, tmp_path, super
 
     with local_exec_env.scoped_output_callback(callback):
         res = await local_exec_env.exec(
-            "printf 'héllo '; printf warn >&2; printf world; exit 3",
+            f"printf 'héllo '; printf warn >&2; printf world; exit {exit_code}",
             cwd=str(tmp_path),
             supervised=supervised,
         )
-    assert (res.stdout, res.stderr, res.return_code) == ("héllo world", "warn", 3)
+    assert (res.stdout, res.stderr, res.return_code) == (
+        "héllo world",
+        "warn",
+        exit_code,
+    )
     assert "".join(t for s, t in chunks if s == "stdout") == "héllo world"
     assert "".join(t for s, t in chunks if s == "stderr") == "warn"
 
@@ -2067,10 +2078,12 @@ async def test_exec_supervised_timeout_kills_command(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fabricate_success", [False, True])
 async def test_exec_supervised_recovers_after_stream_drop(
-    local_exec_env, fake_kubelet, tmp_path
+    local_exec_env, fake_kubelet, tmp_path, fabricate_success
 ):
     fake_kubelet.drop_stream_after = lambda argv: 6 if _is_supervisor(argv) else None
+    fake_kubelet.fabricate_success_on_drop = fabricate_success
     res = await local_exec_env.exec(
         "printf first-; sleep 0.5; printf second; exit 3",
         cwd=str(tmp_path),
@@ -2079,9 +2092,7 @@ async def test_exec_supervised_recovers_after_stream_drop(
     )
     assert any(c.dropped for c in fake_kubelet.connections)
     assert res.return_code == 3
-    # Output produced after the drop may be lost once the supervisor removed its
-    # workdir; everything streamed before the drop must be kept.
-    assert (res.stdout or "").startswith("first-")
+    assert res.stdout == "first-second"
     probes = [c for c in fake_kubelet.connections if "DONE_NO_OUTPUT" in c.command[-1]]
     assert probes, "recovery must probe the workdir"
     # Probes run as the supervisor's identity: no su/cd wrapping.

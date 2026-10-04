@@ -34,24 +34,24 @@ templates, see [Dataset notes](dataset-notes.md).
 
 What a single-container (direct) task actually gets under each configuration:
 
-| | Docker (Harbor default) | GKE default (`--cpus auto --memory auto` or `guarantee`) on shared nodes | GKE default (`guarantee`) on a node with the `static` CPU manager | GKE uncapped (`--cpus request --memory request`) |
+| | Docker (Harbor default) | GKE default (`--cpus auto --memory auto` or `request`) on shared nodes | GKE capped (`--cpus guarantee --memory guarantee`) on shared nodes | GKE capped (`guarantee`) on a node with the `static` CPU manager |
 | --- | --- | --- | --- | --- |
-| CPU | Capped at the declared amount by a CFS quota (`cpu.max = 100000 100000` for 1 CPU) | Capped by a CFS quota (`requests = limits = declared budget`) | One or more exclusive cores (`cpuset`), no CFS quota throttling | Reserved, not capped: can burst onto idle node cores |
-| Memory | Capped (`memory.max`) | Capped (`requests = limits = declared budget`) | Capped (`requests = limits = declared budget`) | Reserved, not capped |
-| CPUs the task sees (`nproc`, affinity) | All host CPUs | All node CPUs | Only its own allocated cores (`nproc = 1` for 1 CPU) | All node CPUs |
-| Kubernetes QoS class | – | `Guaranteed` (container-level on direct Pods) | `Guaranteed` (container-level on direct Pods) | `Burstable` (`pod.spec.resources`) |
-
-> [!NOTE]
-> **Open evaluation question:** Whether CPU and memory limits remain enabled by default (`--cpus auto --memory auto` resolving to `guarantee`, where `requests = limits`) versus request-only (`auto` resolving to `request`, with limits opt-in via `--cpus guarantee --memory guarantee`) is an open question currently under final benchmark evaluation.
+| CPU | Capped at the declared amount by a CFS quota (`cpu.max = 100000 100000` for 1 CPU) | Reserved, not capped: can burst onto idle node cores | Capped by a CFS quota (`requests = limits = declared budget`) | One or more exclusive cores (`cpuset`), no CFS quota throttling |
+| Memory | Capped (`memory.max`) | Reserved, not capped | Capped (`requests = limits = declared budget`) | Capped (`requests = limits = declared budget`) |
+| CPUs the task sees (`nproc`, affinity) | All host CPUs | All node CPUs | All node CPUs | Only its own allocated cores (`nproc = 1` for 1 CPU) |
+| Kubernetes QoS class | – | `Burstable` (`pod.spec.resources`) | `Guaranteed` (container-level on direct Pods) | `Guaranteed` (container-level on direct Pods) |
 
 Key implementation details:
 
 - **Default mode (`--cpus auto --memory auto`):** `GKEEnvironment` resolves `auto` to
-  `guarantee` (`_GKE_DEFAULT_RESOURCE_AUTO_MODE = ResourceMode.GUARANTEE`), setting
-  `requests = limits = declared budget` for both CPU and memory to match Docker's capped
-  default.
+  `request` (`_GKE_DEFAULT_RESOURCE_AUTO_MODE = ResourceMode.REQUEST`), setting
+  `requests = declared budget` for both CPU and memory without hard limits on direct Pods so
+  short compilation and test spikes can burst into idle node capacity while other trials wait
+  on LLM turns. Passing `--cpus guarantee --memory guarantee` sets `requests = limits =
+  declared budget`.
 - **Direct Pods vs. Compose Pods:**
-  - On **direct (single-container) Pods** where both CPU and memory have `request == limit`,
+  - On **direct (single-container) Pods** where both CPU and memory have `request == limit`
+    (`--cpus guarantee --memory guarantee` or multiplier `1.0`),
     `build_direct_pod()` places the CPU and memory `requests` and `limits` directly on the
     `main` container (`spec.containers[0].resources`) rather than `pod.spec.resources`. This
     gives the Pod the Kubernetes `Guaranteed` QoS class and makes it eligible for exclusive
@@ -62,11 +62,12 @@ Key implementation details:
     [Kubernetes feature gates reference](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/)
     and
     [Pod-level resources limitations](https://kubernetes.io/docs/tasks/configure-pod-container/assign-pod-level-resources/#limitations)).
-  - On **direct Pods** where limits are omitted (`--cpus request --memory request`) or scaled
-    above requests (via `--ek cpu_limit_multiplier=<float>` or
-    `--ek memory_limit_multiplier=<float>`, which apply only under the default
-    `--cpus auto` / `--memory auto` and are ignored with explicit `guarantee` or `request`),
-    `build_direct_pod()` places the budget on `pod.spec.resources` (`Burstable` QoS).
+  - On **direct Pods** where limits are omitted (default `--cpus auto --memory auto` or
+    `--cpus request --memory request`) or scaled above requests (via
+    `--ek cpu_limit_multiplier=<float>` or `--ek memory_limit_multiplier=<float>`, which
+    apply only under the default `--cpus auto` / `--memory auto` and are ignored with explicit
+    `guarantee` or `request`), `build_direct_pod()` places the budget on `pod.spec.resources`
+    (`Burstable` QoS).
   - On **Compose (multi-container) Pods** (Shapes A, B and C), the task budget sits on `main`
     (container-level in Shapes A and B, inner Compose `deploy.resources` in Shape C), and
     `build_pod_level_resources()` sets `pod.spec.resources` as the Docker host's size: the
@@ -252,9 +253,10 @@ denominator. Keep flaky tasks, and report them separately or as pass@k.
 
 ### Step 2. Choose the resource policy for each task
 
-Start from Docker parity: the default `--cpus auto --memory auto` (or explicit
-`--cpus guarantee --memory guarantee`) enforces `requests = limits = declared budget`.
-Deviate only when calibration evidence requires it, and record why:
+For strict Docker parity, `--cpus guarantee --memory guarantee` enforces `requests = limits =
+declared budget` (whereas the default `--cpus auto --memory auto` resolves to `request` on
+direct Pods so bursty compilation and test phases can use idle cores on shared nodes). When
+enforcing strict caps, deviate only when calibration evidence requires it, and record why:
 
 | Condition (from the profile) | Decision |
 | --- | --- |
@@ -317,11 +319,11 @@ trials concurrently so long-tail verifiers do not trail at the end of the batch.
 
 ## Recommendations
 
-- **Keep capped resources enabled for scored runs** (the default `--cpus auto --memory auto`
-  or explicit `--cpus guarantee --memory guarantee`). It matches Docker's cgroup semantics
-  and keeps the declared task budget honest. Use `--cpus request --memory request` for
-  calibration runs or exploratory development; it removes limits from direct tasks, while
-  Compose tasks keep a Pod-level limit equal to the request.
+- **Use `--cpus guarantee --memory guarantee` when you require strict per-task cgroup caps**,
+  matching Docker's `--cpus` and `--memory` semantics. Under the default `--cpus auto --memory
+  auto` (which resolves to `request`), direct tasks reserve their declared budget for
+  scheduling without hard limits so short compilation and test bursts can use idle node
+  capacity, while Compose tasks always keep a Pod-level limit at least equal to the request.
 - **Use static-CPU placement (`cpuManagerPolicy: static`)** for datasets with
   timing-sensitive tests or runtimes that size parallelism from `nproc` (such as Go `< 1.25`).
   For 1-CPU / 4-GiB tasks on standard 1:4 CPU-to-memory node shapes, static-CPU placement
@@ -485,12 +487,6 @@ for `scale-ai/swe-bench-pro` and `terminal-bench@2.0`.
 
 ## Open questions
 
-- **Default resource mode (`auto -> guarantee` vs `auto -> request`):** Under the current
-  default (`_GKE_DEFAULT_RESOURCE_AUTO_MODE = ResourceMode.GUARANTEE`), `--cpus auto` and
-  `--memory auto` resolve to `guarantee` (`requests = limits = declared budget`). Whether
-  CPU and memory limits remain enabled by default or switch to request-only (`auto -> request`,
-  with limits opt-in via `--cpus guarantee --memory guarantee`) is under final benchmark
-  evaluation.
 - **Pod-level resource managers (`PodLevelResourceManagers`):** When the Kubernetes
   `PodLevelResourceManagers` feature gate becomes available and enabled on GKE, the kubelet's
   `static` CPU manager will also be able to allocate exclusive cores from Pod-level

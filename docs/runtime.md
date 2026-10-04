@@ -105,17 +105,19 @@ Use `decoupled=true` for very long-running commands where WebSocket stream longe
 
 ### Disconnect recovery
 
-When the environment uses Mode A for a supervised command, it implements an automatic recovery path. If the direct WebSocket stream raises a `GKEExecStreamClosedError` mid-command (such as a load balancer or Konnectivity tunnel dropping a connection), the environment transitions into `_poll_decoupled_exec()` and follows the command through its work directory.
+When the environment uses Mode A for a supervised command, it implements an automatic recovery path. If the direct WebSocket stream raises a `GKEExecStreamClosedError` mid-command, the environment transitions into `_poll_decoupled_exec()` and follows the command through its work directory.
 
-Recovery uses a read-only status probe:
+Two protocol details make this recovery reliable:
+- **Detecting fabricated `StatusSuccess` on backend stream drops**: When the backend SPDY/Konnectivity stream between `kube-apiserver` and `kubelet` drops with `EOF` on the error channel while the container process is still running, `kube-apiserver`'s `StreamTranslatorHandler` (`k8s.io/apiserver/pkg/util/proxy/streamtranslator.go`) writes a synthetic `{"metadata":{},"status":"Success"}` (exit code `0`) on WebSocket channel 3 before closing the WebSocket. To distinguish a genuine zero exit from a fabricated `StatusSuccess` without an extra round-trip exec on the happy path, `build_supervised_script()` swaps exit codes `0` and `242` (`_SUPERVISED_ZERO_EXIT_CODE`) at the end of the supervisor shell, and `unwrap_supervised_exit_code()` maps `242` back to `0` while treating wire exit code `0` as an unverified stream closure (`GKEExecStreamClosedError`).
+- **Preventing work-directory deletion by an orphaned supervisor**: When a recovery probe sees `RUNNING`, it touches `<workdir>/recovered` (`: > <workdir>/recovered`). Before deleting `<workdir>` on completion, the Mode A supervisor checks `[ ! -f <workdir>/recovered ] && [ "$rc" -ne 242 ]`, so an orphaned supervisor shell never deletes `<workdir>` while `_poll_decoupled_exec()` is polling for the final output.
+
+Recovery uses a status probe (`build_recovery_probe_script()`):
 - Each probe reports one of `DONE:<rc>`, `DONE_NO_OUTPUT:<rc>`, `RUNNING`, `DEAD`, or `LOST`, and streams any output bytes written beyond the offset already received.
 - If `<workdir>/exitcode` exists, the probe reports `DONE:<rc>` and returns the remaining output.
-- If the Mode A supervisor already finished, it has recorded the wrapper's `wait` status (for example, `137` after `SIGKILL`) in `<workdir>.status` and removed the work directory. The probe then reports `DONE_NO_OUTPUT:<rc>`.
+- If the Mode A supervisor already finished and removed `<workdir>` (when `rc != 0` and no prior probe touched `<workdir>/recovered`), it has recorded the wrapper's `wait` status (for example, `137` after `SIGKILL`) in `<workdir>.status`. The probe then reports `DONE_NO_OUTPUT:<rc>`.
 - If the command wrapper process (PID in `<workdir>/pid`) is gone, the work directory still exists, and neither `<workdir>/exitcode` nor `<workdir>.status` exists, the probe reports `DEAD`, and the environment returns a synthetic exit code of `1`. The probe checks only the wrapper PID, not the supervisor.
 - If neither the work directory nor the `.status` file exists, the probe reports `LOST`, which raises `GKEExecStreamClosedError`.
-- Because the status probe is read-only, a probe whose response is lost in transit can be safely retried; `_poll_decoupled_exec()` removes the work directory and its `.status` file via a separate exec only after `DONE`, `DONE_NO_OUTPUT`, or `DEAD` is parsed. Probes run as raw execs with the supervisor's identity (no `su` or `cd` wrapping), so process liveness checks see the same process table and permissions as the supervisor.
-
-While the Pod remains alive, the exit code is recovered. Output recovery has a narrow race window if the Mode A supervisor is still running after its stream drops: after the command exits, the supervisor waits for its `tail --pid` followers to exit in the GNU path (bounded by the polling interval of `tail`), or `1.1` seconds in the portable fallback loop, and then removes the work directory. If the supervisor deletes the work directory between two recovery probes, the next probe sees the cached exit code and reports `DONE_NO_OUTPUT:<rc>`, preserving the exact exit code and logging a warning with the recovered byte counts.
+- Because the status probe only touches `<workdir>/recovered` when `RUNNING` and never deletes state, a probe whose response is lost in transit can be safely retried; `_poll_decoupled_exec()` removes the work directory and its `.status` file via a separate exec only after `DONE`, `DONE_NO_OUTPUT`, or `DEAD` is parsed. Probes run as raw execs with the supervisor's identity (no `su` or `cd` wrapping), so process liveness checks see the same process table and permissions as the supervisor.
 
 ### Command timeouts and process-tree termination
 

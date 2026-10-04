@@ -389,19 +389,52 @@ async def connect_exec_stream(
     raise RuntimeError(f"Exec connection to pod {pod_name} was never attempted")
 
 
-async def read_exec_output(stream: ExecStream, output: ExecOutputAccumulator) -> None:
+# Wire exit code returned by ``build_supervised_script`` when the inner command
+# exits with 0. ``kube-apiserver``'s ``StreamTranslatorHandler`` fabricates a
+# channel-3 ``StatusSuccess`` (exit code 0) whenever the backend SPDY stream to
+# the kubelet closes with EOF on ``errorStream`` (for example, when a
+# Konnectivity tunnel resets during a silent multi-minute verifier run). By
+# swapping 0 and ``_SUPERVISED_ZERO_EXIT_CODE`` on supervisor exit, a genuine 0
+# travels over channel 3 as ``NonZeroExitCode(242)``—which
+# ``StreamTranslatorHandler`` never fabricates—while any channel-3
+# ``StatusSuccess`` (0) on a supervised stream is unambiguously routed to
+# ``poll_decoupled_exec`` to recover the true state from ``workdir``.
+_SUPERVISED_ZERO_EXIT_CODE = 242
+
+
+def unwrap_supervised_exit_code(raw_rc: int, label: str = "") -> int:
+    """Decode the wire exit code of ``build_supervised_script``."""
+    if raw_rc == _SUPERVISED_ZERO_EXIT_CODE:
+        return 0
+    if raw_rc == 0:
+        target = f" {label}" if label else ""
+        raise GKEExecStreamClosedError(
+            f"Kubernetes exec stream{target} closed with unverified "
+            "StatusSuccess (0) on a supervised command"
+        )
+    return raw_rc
+
+
+async def read_exec_output(
+    stream: ExecStream,
+    output: ExecOutputAccumulator,
+    *,
+    finish: bool = True,
+) -> None:
     """Feed a command's stdout and stderr into ``output`` until the stream ends.
 
-    On a normal end the decoders are flushed. Raises ``GKEExecStreamClosedError``
-    if the stream ended before the command's exit status arrived; ``output`` then
-    holds everything received so far and can be resumed by recovery polling.
+    On a normal end (when ``finish=True``) the decoders are flushed. Raises
+    ``GKEExecStreamClosedError`` if the stream ended before the command's exit
+    status arrived; ``output`` then holds everything received so far and can be
+    resumed by recovery polling.
     """
     while (item := await stream.read()) is not None:
         await output.feed_channel(*item)
     stream.raise_unless_completed(
         f"Kubernetes exec stream {stream.label} ended before the command completed"
     )
-    await output.finish()
+    if finish:
+        await output.finish()
 
 
 async def collect_exec_bytes(stream: ExecStream) -> tuple[bytes, bytes]:
@@ -521,7 +554,7 @@ def build_recovery_probe_script(
         f'echo "DONE_NO_OUTPUT:$(cat {status_file})"; '
         f"elif [ ! -d {w} ]; then echo LOST; "
         f'elif [ "$alive" = 0 ] && [ -f {w}/pid ]; then echo DEAD; {tail_out}; {tail_err}; '
-        f"else echo RUNNING; {tail_out}; {tail_err}; "
+        f"else : > {w}/recovered; echo RUNNING; {tail_out}; {tail_err}; "
         "fi"
     )
 
@@ -569,9 +602,11 @@ def build_supervised_script(workdir: str, full_command: str) -> str:
 
     The supervisor tails the command's output files to its own stdout/stderr,
     waits for the wrapper, records its exit code in ``<workdir>.status``, removes
-    the workdir, and exits with the command's exit code. If the exec stream is
-    lost, the command keeps running and ``poll_decoupled_exec`` recovers its
-    status from the workdir.
+    the workdir (unless recovery polling has marked ``<workdir>/recovered`` or
+    the command exited with ``_SUPERVISED_ZERO_EXIT_CODE``), and exits with
+    0 and ``_SUPERVISED_ZERO_EXIT_CODE`` swapped so that a genuine 0 exit code
+    cannot be confused with a ``StatusSuccess`` fabricated by
+    ``kube-apiserver``'s ``StreamTranslatorHandler`` on a broken SPDY tunnel.
 
     The exit code comes from ``wait`` on the wrapper, which is the supervisor's
     own child, not from files: a task that empties ``/tmp`` cannot corrupt it or
@@ -581,6 +616,7 @@ def build_supervised_script(workdir: str, full_command: str) -> str:
     """
     w = shlex.quote(workdir)
     status_file = shlex.quote(f"{workdir}.status")
+    zero_code = _SUPERVISED_ZERO_EXIT_CODE
     return (
         _build_background_launch(workdir, full_command)
         + "if tail --pid=$$ -n0 /dev/null 2>/dev/null; then "
@@ -603,8 +639,10 @@ def build_supervised_script(workdir: str, full_command: str) -> str:
         "wait $tail_out_pid $tail_err_pid 2>/dev/null; "
         "fi; "
         f'[ -d {w} ] && echo "$rc" > {status_file} 2>/dev/null; '
-        f"rm -rf {w}; "
-        "exit $rc"
+        f'[ -f {w}/recovered ] || [ "$rc" -eq {zero_code} ] || rm -rf {w}; '
+        f'if [ "$rc" -eq 0 ]; then exit {zero_code}; '
+        f'elif [ "$rc" -eq {zero_code} ]; then exit 0; '
+        'else exit "$rc"; fi'
     )
 
 

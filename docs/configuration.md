@@ -101,8 +101,8 @@ If no compatible GKE `kubectl` context is active (or when `project_id`, `cluster
 | `dind_storage_mb` | integer | — | Explicit `requests.ephemeral-storage` for the `dind-engine` container, in MiB. Overrides the automatic estimate described below. |
 | `task_dind_storage_mb` | string, list, or dict | `{}` | Per-task `dind_storage_mb` mapping, for example `task-a=61440,task-b=20480`. Also accepts `task:mib`. Overrides `dind_storage_mb` for the tasks it names. |
 | `max_storage_request_mb` | integer | — | Caps `requests.ephemeral-storage` while leaving runtime limits unconstrained. |
-| `cpu_limit_multiplier` | float | — | Sets `limits.cpu = requests.cpu × multiplier` (in millicores) instead of `limits.cpu = requests.cpu`. Applies only when `--cpus` is `auto` (the default), the task declares `cpus`, and the multiplier is greater than `0`. |
-| `memory_limit_multiplier` | float | — | Sets `limits.memory = requests.memory × multiplier` instead of `limits.memory = requests.memory`. Applies only when `--memory` is `auto` (the default), the task declares `memory_mb`, and the multiplier is greater than `0`. |
+| `cpu_limit_multiplier` | float | — | Sets `limits.cpu = requests.cpu × multiplier` (in millicores). Applies only when `--cpus` is `auto` (the default), the task declares `cpus`, and the multiplier is greater than `0`. |
+| `memory_limit_multiplier` | float | — | Sets `limits.memory = requests.memory × multiplier`. Applies only when `--memory` is `auto` (the default), the task declares `memory_mb`, and the multiplier is greater than `0`. |
 | `service_account_name` | string | — | Kubernetes ServiceAccount for the Pod, used with Workload Identity. |
 | `runtime_class_name` | string | — | Sets `spec.runtimeClassName`, for example `gvisor`. |
 | `override_entrypoint` | boolean | `false` | Replaces the image entrypoint with `sleep infinity` and disables stdin and TTY. |
@@ -114,24 +114,22 @@ Harbor budgets a **task**, not an individual sidecar. `task.toml` declares `cpus
 single-container task or a Compose project on a workstation.
 
 Under Harbor's default `--cpus auto --memory auto`, `GKEEnvironment` resolves `auto` to
-`guarantee` (`_GKE_DEFAULT_RESOURCE_AUTO_MODE = ResourceMode.GUARANTEE`), setting
-`requests = limits = declared budget` for both CPU and memory. Passing
-`--cpus request --memory request` sets requests only: a direct Pod then runs with no
-cgroup CPU or memory limit, while a Compose Pod (Shapes A, B and C) still receives a Pod-level
-`pod.spec.resources.limits` at least equal to its requests. Harbor also accepts `limit`
-(limit only, no request) and `ignore` (no CPU or memory value). To allow
-controlled bursting above the request while remaining in `auto` mode, pass
+`request` (`_GKE_DEFAULT_RESOURCE_AUTO_MODE = ResourceMode.REQUEST`), setting
+`requests = declared budget` for both CPU and memory without hard limits on direct Pods (so
+short compilation and test spikes can burst into idle node capacity while LLM turns are idle),
+while a Compose Pod (Shapes A, B and C) still receives a Pod-level `pod.spec.resources.limits`
+at least equal to its requests. Passing `--cpus guarantee --memory guarantee` sets
+`requests = limits = declared budget` for both CPU and memory. Harbor also accepts `request`
+(explicit request-only), `limit` (limit only, no request), and `ignore` (no CPU or memory
+value). To set a scaled burst ceiling above the request while remaining in `auto` mode, pass
 `--ek cpu_limit_multiplier=<float>` and/or `--ek memory_limit_multiplier=<float>`.
-
-> [!NOTE]
-> **Open evaluation question:** Whether CPU and memory limits remain enabled by default (`--cpus auto --memory auto` resolving to `guarantee`, where `requests = limits`) or become request-only (`auto` resolving to `request`, with limits opt-in through `--cpus guarantee --memory guarantee`) is under final benchmark evaluation.
 
 Where the CPU and memory budget is attached on the Pod specification depends on the Pod type:
 
 | Pod type | Condition | Where CPU and memory are set | Why |
 | :--- | :--- | :--- | :--- |
-| **Direct Pod** (`build_direct_pod`) | Both CPU and memory have `request == limit` (default `--cpus auto --memory auto` or `--cpus guarantee --memory guarantee`) | `spec.containers[0].resources` (`main` container) | Gives the Pod `Guaranteed` QoS and makes it eligible for exclusive CPU pinning on `cpuManagerPolicy: static` node pools (the kubelet's static CPU manager ignores `pod.spec.resources` unless the `PodLevelResourceManagers` feature gate is enabled). |
-| **Direct Pod** (`build_direct_pod`) | Limits are omitted (`--cpus request --memory request`) or differ from requests (e.g. via `cpu_limit_multiplier` / `memory_limit_multiplier`) | `pod.spec.resources` | Enforces the task-wide request and/or burst ceiling at the Pod cgroup level (`Burstable` QoS). |
+| **Direct Pod** (`build_direct_pod`) | Both CPU and memory have `request == limit` (`--cpus guarantee --memory guarantee` or multiplier `1.0`) | `spec.containers[0].resources` (`main` container) | Gives the Pod `Guaranteed` QoS and makes it eligible for exclusive CPU pinning on `cpuManagerPolicy: static` node pools (the kubelet's static CPU manager ignores `pod.spec.resources` unless the `PodLevelResourceManagers` feature gate is enabled). |
+| **Direct Pod** (`build_direct_pod`) | Limits are omitted (default `--cpus auto --memory auto` or `--cpus request --memory request`) or differ from requests (e.g. via `cpu_limit_multiplier` / `memory_limit_multiplier`) | `pod.spec.resources` | Enforces the task-wide request and/or burst ceiling at the Pod cgroup level (`Burstable` QoS). |
 | **Compose Pod, Shapes A, B and C** (`build_pod_level_resources`) | All resource modes | The task budget on `main` (native container in Shapes A and B, inner Compose `deploy.resources` in Shape C); every other service keeps what its Compose definition declares (`deploy.resources.*`, `cpus`, `mem_limit`); `dind-engine` requests the daemon baseline plus the DinD services' reservations, with no limit of its own; `pod.spec.resources` requests the larger of the budget and the aggregate container requests, and caps the Pod at the aggregate of container ceilings (limit, else request; for `dind-engine`, the daemon baseline plus the DinD services' ceilings), never below the request | Mirrors Harbor's Docker environment, where the budget applies to `services.main` and other services get what they declare. The Pod plays the Docker host; its ceiling keeps a task that outgrows its declared size from taking memory the scheduler gave to other Pods, and so makes `memory_mb` bound the whole DinD environment (see below). See [Docker-in-Docker](docker-in-docker.md#resource-model-and-volume-topology). |
 
 For storage and accelerators:
