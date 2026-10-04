@@ -24,6 +24,7 @@ Why this module exists
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
 import subprocess
@@ -90,6 +91,8 @@ class ClusterCapabilities:
     max_node_allocatable_ephemeral_storage_mb: int | None = None
 
     network_policy_enforced: bool | None = None
+    kube_dns_cluster_ip: str | None = None
+
 
 
 _TOLERATED_TAINT_KEYS: frozenset[str] = frozenset(
@@ -428,6 +431,7 @@ def evaluate_autopilot_dind_capability(
     node_pool_machine_types: Sequence[tuple[str, str]] = (),
     max_node_allocatable_ephemeral_storage_mb: int | None = None,
     network_policy_enforced: bool | None = None,
+    kube_dns_cluster_ip: str | None = None,
 ) -> ClusterCapabilities:
     """Evaluate DinD availability and cluster capabilities from GKE control-plane metadata.
 
@@ -450,6 +454,7 @@ def evaluate_autopilot_dind_capability(
         ),
         "max_node_allocatable_ephemeral_storage_mb": max_node_allocatable_ephemeral_storage_mb,
         "network_policy_enforced": network_policy_enforced,
+        "kube_dns_cluster_ip": kube_dns_cluster_ip,
     }
 
     if not is_autopilot:
@@ -640,7 +645,7 @@ def probe_cluster_via_gcloud(
             timeout=15,
         )
         if res.returncode != 0:
-            logger.debug(
+            logger.warning(
                 f"gcloud cluster describe failed (exit {res.returncode}): {res.stderr.strip()}"
             )
             return None
@@ -649,8 +654,58 @@ def probe_cluster_via_gcloud(
             return None
         return parse_gcloud_cluster_describe(data)
     except Exception as exc:
-        logger.debug(f"Failed to probe GKE cluster capabilities via gcloud: {exc}")
+        logger.warning(f"Failed to probe GKE cluster capabilities via gcloud: {exc}")
         return None
+
+
+def probe_network_enforcement_and_dns_via_k8s(
+    core_api: Any,
+) -> tuple[bool | None, str | None]:
+    """Probe CNI NetworkPolicy enforcement and kube-dns ClusterIP via the Kubernetes API.
+
+    Used as a fallback for NetworkPolicy enforcement when ``gcloud container clusters describe``
+    is unavailable or lacks IAM permissions, and to discover the exact ``kube-dns`` Service
+    ClusterIP for scoped DNS egress rules.
+    """
+    if core_api is None:
+        return None, None
+
+    enforced: bool | None = None
+    try:
+        pods_resp = core_api.list_namespaced_pod(namespace="kube-system")
+        items = getattr(pods_resp, "items", None)
+        if isinstance(items, list) and items:
+            found_enforcer = False
+            for pod in items:
+                meta = getattr(pod, "metadata", None)
+                name = str(getattr(meta, "name", "") or "")
+                labels = getattr(meta, "labels", None) or {}
+                k8s_app = str(labels.get("k8s-app") or "")
+                if name.startswith(("anetd-", "cilium-", "calico-node-")) or k8s_app in (
+                    "anetd",
+                    "cilium",
+                    "calico-node",
+                ):
+                    found_enforcer = True
+                    break
+            enforced = found_enforcer
+    except Exception as exc:
+        logger.debug(
+            f"Could not list kube-system pods for CNI enforcement probe: {exc}"
+        )
+
+    dns_ip: str | None = None
+    try:
+        svc = core_api.read_namespaced_service(name="kube-dns", namespace="kube-system")
+        raw_ip = str(getattr(getattr(svc, "spec", None), "cluster_ip", "") or "").strip()
+        if raw_ip and raw_ip.lower() != "none":
+            ipaddress.ip_address(raw_ip)
+            dns_ip = raw_ip
+    except Exception as exc:
+        logger.debug(f"Could not read kube-system/kube-dns service ClusterIP: {exc}")
+
+    return enforced, dns_ip
+
 
 
 def probe_pod_level_resources_support(
@@ -677,6 +732,10 @@ def probe_pod_level_resources_support(
     try:
         from kubernetes import client as k8s_client
 
+        # Use 500m CPU / 2Gi memory so GKE Autopilot's default container
+        # resource mutator (`autopilot-default-resources-mutator`, which defaults
+        # unspecified container requests to 500m / 2Gi) does not push aggregate
+        # container requests above `spec.resources.requests`.
         probe_pod = k8s_client.V1Pod(
             metadata=k8s_client.V1ObjectMeta(
                 generate_name="harbor-podlevel-probe-",
@@ -685,8 +744,8 @@ def probe_pod_level_resources_support(
             spec=k8s_client.V1PodSpec(
                 restart_policy="Never",
                 resources=k8s_client.V1ResourceRequirements(
-                    requests={"cpu": "100m", "memory": "128Mi"},
-                    limits={"cpu": "100m", "memory": "128Mi"},
+                    requests={"cpu": "500m", "memory": "2Gi"},
+                    limits={"cpu": "500m", "memory": "2Gi"},
                 ),
                 containers=[
                     k8s_client.V1Container(
@@ -700,6 +759,12 @@ def probe_pod_level_resources_support(
             namespace=namespace, body=probe_pod, dry_run="All"
         )
     except Exception as exc:
+        status = getattr(exc, "status", None)
+        body = str(getattr(exc, "body", "") or "")
+        if status == 422 and "spec.resources." in body:
+            # A 422 validation error referencing `spec.resources.*` only occurs
+            # when the API server retained and validated `spec.resources`.
+            return True
         logger.debug(f"Pod-level resources dry-run probe did not complete: {exc}")
         return None
 

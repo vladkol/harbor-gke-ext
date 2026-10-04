@@ -363,29 +363,37 @@ harbor: main: docker pull us-central1-docker.pkg.dev/<project>/harbor-tasks/task
 
 See [Cluster setup](cluster-setup.md) and [Docker-in-Docker](docker-in-docker.md) for details.
 
-### `OOMKilled` (exit code 137) in DinD workloads
+### `OOMKilled` (exit code 137) or a dead Docker host in DinD workloads
 
 **Symptom**
 
-A Shape B or Shape C DinD task fails during `dind-cache-<svc>`, `compose-up-gate`, or inner container execution with `OOMKilled` (`exit code 137`) or `TrialContainerLostError`.
+A Shape B or Shape C DinD task fails with `OOMKilled` (`exit code 137`) in `main` or an inner container, its Docker services stop responding, the Pod stays `Pending` until it fails with `Pod not ready after N seconds`, or the teardown log carries an OOM WARNING (or a "DinD usage report ... could not be read" WARNING) from the DinD usage report.
 
 **Cause**
 
-In `dind-engine`, `/var/lib/docker` is mounted on the `harbor-dind-storage` volume — a disk-backed `emptyDir` (or a generic ephemeral Persistent Disk when `--ek scratch_volume_size` is set). Unpacked image layers consume ephemeral disk storage, not RAM. However, unlike a local workstation where `docker run` spawns sibling containers under the host daemon's root cgroup, every container inside `dind-engine` (along with `dockerd`, `containerd`, `docker compose`, and kernel page cache during layer extraction) runs inside the **Pod's memory cgroup**.
+A DinD Pod is the task's Docker host, with a ceiling: the task budget (`memory_mb`) caps `main`, each other service is capped by what it declares, and the Pod's `spec.resources` caps everything together at the task budget plus what the DinD services declare and a 64 MiB daemon baseline. `/var/lib/docker` is on disk (`harbor-dind-storage`), so unpacked layers cost ephemeral storage, not RAM. Every nested container runs inside `dind-engine`'s cgroup, so it counts toward the Pod ceiling, and an OOM stays inside the Pod: neighbours on the node are not affected.
 
-To prevent tasks with small declared budgets (such as `memory_mb = 2048`) from OOM-killing during `dockerd` startup, `build_pod_level_resources()` enforces a Pod-level memory limit floor of `8,192 MiB` (`DIND_POD_MEMORY_LIMIT_FLOOR_MB = 8192`) while keeping `spec.resources.requests.memory` at the task's declared budget. Tasks that run memory-heavy inner builds or multiple large nested services can still exceed `8 GiB`.
+Four cases follow:
+
+- **`main` is OOM-killed.** It reached the task's own memory limit, exactly as `docker run --memory` would on a workstation. The task needs more memory.
+- **The Pod ceiling was reached.** Containers a task starts at runtime through `/var/run/docker.sock` are in no Compose file, so they count against the task's `memory_mb`. On a Docker host they would be bounded only by the machine; on GKE `memory_mb` bounds the whole environment, as on Harbor's Daytona and Modal DinD sandboxes. A task whose workload outgrows `memory_mb` needs a larger `memory_mb` here.
+- **The workload stalls at the ceiling.** Instead of an OOM kill, the Pod can sit at its ceiling while the kernel reclaims memory, startup scripts retry, and readiness never comes. The Pod stays `Pending` (its init containers, including `compose-up-gate`, are still running) until `Pod not ready after N seconds`. Exec into `dind-engine` can hang in this state, so the teardown report may be unreadable.
+- **The whole Docker host died.** On cgroup v2 nodes without `singleProcessOOMKill`, the kubelet makes every OOM kill a whole-container kill, so one kill inside `dind-engine` takes the daemon and every nested container with it.
+
+Kubernetes (containerd) marks a container `OOMKilled` when any process in it was OOM-killed, not only when the container itself was killed. The exit code tells them apart: `OOMKilled` with exit code 137 means the container was killed; with any other exit code, processes inside it were killed and the container exited on its own. The teardown report applies this rule when it falls back to the Pod status.
 
 **Resolution**
 
-1. Raise the task's memory budget for the run with `--override-memory-mb <MiB>` (or increase `memory_mb` in `task.toml`):
+1. If `main` was OOM-killed, raise the task's memory budget with `--override-memory-mb <MiB>` (or `memory_mb` in `task.toml`):
    ```bash
    uv run harbor run ... \
      -e harbor_gke_ext:GKEEnvironment \
      --override-memory-mb 16384
    ```
-2. When `--memory` is in `auto` mode (`ResourceMode.AUTO`), you can also raise the Pod memory limit above the request with `--ek memory_limit_multiplier=<float>`. Note that `memory_limit_multiplier` is ignored when `--memory guarantee` is passed explicitly, and any computed limit below `8192 MiB` has no effect on a DinD Pod because of the `8,192 MiB` DinD floor.
+2. If the teardown report warned that the Pod ceiling was reached, or the Pod timed out at its ceiling, the task's Docker workload (including containers it starts through `/var/run/docker.sock`) needs more memory than the task declares. Raise `memory_mb` in `task.toml` or pass `--override-memory-mb`. If it instead warned that a container reached its own memory limit, raise that service's Compose limit.
+3. If the teardown report warned that the kernel OOM-killed whole containers, or that the Docker daemon was killed (`dind-engine` `OOMKilled`, exit code 137), the node likely runs the kubelet with `singleProcessOOMKill: false` (the cgroup v2 default), so one OOM kill took down the Docker daemon and everything it ran. Enable per-process OOM kills, the recommended setting for DinD nodes: `singleProcessOomKill: true` in the node pool's system config, or `singleProcessOOMKill: true` in the ComputeClass; see [Per-process OOM kills for Docker-in-Docker](cluster-setup.md#5-per-process-oom-kills-for-docker-in-docker-singleprocessoomkill). The task still needs a `memory_mb` that covers its workload.
 
-See [Compose translation](compose-translation.md) and [Docker-in-Docker](docker-in-docker.md) for details.
+See [Docker-in-Docker](docker-in-docker.md#resource-model-and-volume-topology) for details.
 
 ### Minimal or distroless sidecar images without `/bin/sh`
 

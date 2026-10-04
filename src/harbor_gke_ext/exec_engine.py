@@ -429,25 +429,69 @@ async def collect_exec_bytes(stream: ExecStream) -> tuple[bytes, bytes]:
     return bytes(out), bytes(err)
 
 
+_TRANSIENT_EXEC_STATUS_MARKERS: tuple[str, ...] = (
+    "no agent available",
+    "error dialing backend",
+    "error sending request",
+    "failed calling webhook",
+    "dial tcp",
+    "i/o timeout",
+    "tls handshake timeout",
+    "connection refused",
+)
+
+
+def is_transient_exec_status_error(exc: BaseException) -> bool:
+    """Return True if an ERROR_CHANNEL status failure reflects a transient proxy/tunnel error.
+
+    When the Kubernetes API server accepts the HTTP 101 WebSocket upgrade before
+    dialing the kubelet via Konnectivity (or before a webhook call completes),
+    dial failures such as ``No agent available`` arrive on WebSocket channel 3
+    (``ERROR_CHANNEL``) as ``status: Failure`` without an ``ExitCode`` cause.
+    Because the request never reached the container runtime, the command never
+    started and can be safely retried from scratch.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_EXEC_STATUS_MARKERS)
+
+
 async def run_exec_command(
     connect: ConnectFn,
     command: list[str],
     *,
     container: str | None = None,
     timeout_sec: float,
+    max_attempts: int = 1,
 ) -> tuple[bytes, bytes, int]:
     """Run a short command to completion and return ``(stdout, stderr, exit_code)``.
 
     Raises ``TimeoutError`` if it does not finish within ``timeout_sec`` and
     ``GKEExecStreamClosedError`` if the stream ended without an exit status.
     """
-    stream = await connect(command, container=container)
-    try:
-        async with asyncio.timeout(timeout_sec):
-            out, err = await collect_exec_bytes(stream)
-        return out, err, stream.returncode()
-    finally:
-        stream.close()
+    attempts = max(1, max_attempts)
+    for attempt in range(attempts):
+        out = b""
+        err = b""
+        stream = await connect(command, container=container)
+        try:
+            async with asyncio.timeout(timeout_sec):
+                out, err = await collect_exec_bytes(stream)
+            return out, err, stream.returncode()
+        except GKEExecStreamClosedError as exc:
+            if (
+                attempt < attempts - 1
+                and stream.status_received
+                and not out
+                and not err
+                and is_transient_exec_status_error(exc)
+            ):
+                wait_time = jittered_backoff_delay(attempt)
+                await asyncio.sleep(wait_time)
+                continue
+            raise
+        finally:
+            stream.close()
+    raise RuntimeError("run_exec_command made no attempts")
 
 
 def build_recovery_probe_script(

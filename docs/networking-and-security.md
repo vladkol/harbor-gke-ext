@@ -56,19 +56,18 @@ When evaluating a non-empty allowlist:
 - The base `NetworkPolicy` includes `ipBlock` peers for every CIDR and bare IP address (normalized to `/32` for IPv4 and `/128` for IPv6), plus a unified DNS egress rule (UDP/TCP port 53). If `allow_metadata_server=True`, it also appends explicit egress rules for `169.254.169.254/32` (TCP ports `80` and `8080`) and `169.254.169.252/32` (TCP ports `988` and `987`, required when Workload Identity runs on Legacy Datapath + Calico).
 - The `FQDNNetworkPolicy` includes `matches` blocks for exact hostnames and wildcard patterns.
 
-#### Unified port-53 DNS egress rule
+#### Scoped port-53 DNS egress rule
 
-In `allowlist` (when non-empty) and `public` (metadata-blocked) modes, `_dns_egress_rule()` emits a single UDP/TCP port-53 egress rule that covers GKE's in-cluster and VPC DNS resolvers (`kube-dns`, `NodeLocal DNSCache`, and `Cloud DNS for GKE`) without requiring extra control-plane probes. Direct port-53 DNS queries to public internet resolvers (`8.8.8.8`/`8.8.4.4`) are never allowed on either native or DinD Pods (`dind-engine` inherits the Pod's cluster `/etc/resolv.conf` directly):
+In `allowlist` (when non-empty) and `public` (metadata-blocked) modes, `_dns_egress_rule()` emits a tightly scoped UDP/TCP port-53 egress rule that covers only GKE's in-cluster and node-local DNS resolvers (`kube-dns`, `NodeLocal DNSCache`, and `Cloud DNS for GKE`). Broad RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), CGNAT (`100.64.0.0/10`), and public internet resolvers (`8.8.8.8`/`8.8.4.4`) are never opened by default:
 
 | Allowed Port-53 Peer | Scope | Purpose |
 |---|---|---|
-| `namespaceSelector: {kubernetes.io/metadata.name: kube-system}` | All Pods | In-cluster `kube-dns` / `NodeLocal DNSCache` Pods |
-| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | All Pods | RFC 1918 VPC / cluster / Docker bridge DNS |
-| `169.254.0.0/16` | All Pods | Link-local GKE `NodeLocal DNSCache` (`169.254.20.10`) & Cloud DNS (`169.254.169.254` port 53) |
-| `100.64.0.0/10` | All Pods | RFC 6598 Shared / CGNAT range used in non-RFC1918 GKE Pod/Service allocations |
-| `34.118.224.0/20` | All Pods | GKE default reserved ClusterIP Service CIDR (where `kube-dns` ClusterIP e.g. `34.118.224.10` lives) |
+| `namespaceSelector: {kubernetes.io/metadata.name: kube-system}` + `podSelector: k8s-app in (kube-dns, node-local-dns)` | All Pods | In-cluster `kube-dns` / `NodeLocal DNSCache` Pods |
+| `169.254.20.10/32` | All Pods | Link-local GKE `NodeLocal DNSCache` |
+| `169.254.169.254/32` | All Pods | GKE `Cloud DNS` local resolver (UDP/TCP port 53 only) |
+| `<kube-dns-cluster-ip>/32` | All Pods | Auto-discovered `kube-system/kube-dns` Service `ClusterIP` |
 
-If your cluster routes DNS queries to custom forwarders or VPC resolvers outside these ranges, pass `--ek dns_egress_extra_cidrs=<cidr>[,<cidr>...]` to append additional `ipBlock` peers to the port-53 rule.
+If your cluster routes DNS queries to custom forwarders or VPC resolvers outside these peers, pass `--ek dns_egress_extra_cidrs=<cidr>[,<cidr>...]` to append additional `ipBlock` peers to the port-53 rule.
 
 **Example `NetworkPolicy` (IP allowlist + port-53 DNS egress):**
 ```yaml
@@ -95,9 +94,17 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchExpressions:
+              - key: k8s-app
+                operator: In
+                values: [kube-dns, node-local-dns]
         - ipBlock:
-            cidr: 10.0.0.0/8
-        # ... plus default_dns_cidrs ...
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: <kube-dns-cluster-ip>/32
       ports:
         - protocol: UDP
           port: 53
@@ -123,9 +130,9 @@ spec:
 ```
 
 ### `public`
-This mode grants egress to the public internet while isolating the Pod from other trial Pods and from the GKE metadata server by default.
+This mode grants egress to the public internet (and any routable VPC/cluster IP except the metadata server) while isolating the Pod from other trial Pods and from the GKE metadata server by default.
 
-By default (`allow_metadata_server=False`), the environment creates a `NetworkPolicy` that blocks all Pod ingress (`ingress: []`) and permits all IPv4 (`0.0.0.0/0` except `169.254.169.254/32` and `169.254.169.252/32`) traffic while blocking the GCE metadata server and GKE Workload Identity metadata proxy on non-DNS ports, accompanied by the unified DNS egress rule on port 53.
+By default (`allow_metadata_server=False`), the environment creates a `NetworkPolicy` that blocks all Pod ingress (`ingress: []`) and permits IPv4 (`0.0.0.0/0` except `169.254.169.254/32` and `169.254.169.252/32`) traffic while blocking the GCE metadata server and GKE Workload Identity metadata proxy on non-DNS ports, accompanied by the scoped DNS egress rule on port 53.
 
 If you set `allow_metadata_server=True`, **no `NetworkPolicy` is created at start** (and if switched to `public` with `allow_metadata_server=True` at runtime via `_apply_network_policy()`, any existing `harbor-netpol-<job-name>` and `harbor-fqdn-<job-name>` objects are deleted).
 
@@ -133,18 +140,19 @@ If you set `allow_metadata_server=True`, **no `NetworkPolicy` is created at star
 
 A critical footgun in Kubernetes is that `networking.k8s.io/v1` `NetworkPolicy` is a declarative API resource: **the Kubernetes API server always accepts `NetworkPolicy` objects (`HTTP 201 Created`), even when the cluster has no CNI network policy controller installed to enforce them.** On a GKE Standard cluster created on the Legacy Datapath without `--enable-dataplane-v2` or `--enable-network-policy`, creating a `NetworkPolicy` succeeds in etcd while having **zero effect on Pod packets**.
 
-To prevent silent policy non-enforcement or metadata server exposure, `harbor-gke-ext` inspects the cluster's dataplane configuration during `probe_cluster_capabilities()` (`gcloud container clusters describe` in `cluster_probe.py`) and sets `ClusterCapabilities.network_policy_enforced`:
+To prevent silent policy non-enforcement or metadata server exposure, `harbor-gke-ext` inspects the cluster's dataplane configuration during `_get_cluster_capabilities()` (`gcloud container clusters describe` with a Kubernetes API fallback inspecting `kube-system` CNI Pods `anetd`/`cilium`/`calico-node`) and sets `ClusterCapabilities.network_policy_enforced`:
 
 1. **GKE Autopilot (`autopilot.enabled: true`):** Always runs GKE Dataplane V2 (`network_policy_enforced=True`).
-2. **GKE Dataplane V2 (`networkConfig.datapathProvider == "ADVANCED_DATAPATH"`):** Enforces `NetworkPolicy` in-kernel via Cilium eBPF (`network_policy_enforced=True`), and optionally supports `FQDNNetworkPolicy` when `/apis/networking.gke.io/v1alpha1` (`fqdnnetworkpolicies`) is registered on the cluster.
-3. **Legacy Datapath + Calico (`networkPolicy.enabled: true` and `addonsConfig.networkPolicyConfig.disabled != true`):** Enforces L3/L4 `NetworkPolicy` via `calico-node` (`network_policy_enforced=True`, `fqdn_supported=False`).
+2. **GKE Dataplane V2 (`networkConfig.datapathProvider == "ADVANCED_DATAPATH"` or `anetd`/`cilium` in `kube-system`):** Enforces `NetworkPolicy` in-kernel via Cilium eBPF (`network_policy_enforced=True`), and optionally supports `FQDNNetworkPolicy` when `/apis/networking.gke.io/v1alpha1` (`fqdnnetworkpolicies`) is registered on the cluster.
+3. **Legacy Datapath + Calico (`networkPolicy.enabled: true` and `addonsConfig.networkPolicyConfig.disabled != true`, or `calico-node` in `kube-system`):** Enforces L3/L4 `NetworkPolicy` via `calico-node` (`network_policy_enforced=True`, `fqdn_supported=False`).
 4. **Legacy Datapath without Calico:** Sets `network_policy_enforced=False` and disables network-policy capabilities in `GKEEnvironment.capabilities`.
 
 ### Fail-closed startup verification
 
 In `GKEEnvironment.start()`, whenever a trial requires network policy enforcement (`network_mode` is `no-network` or `allowlist`, or `allow_metadata_server=False` in `public` mode), `_verify_network_enforcement()` checks `ClusterCapabilities.network_policy_enforced`:
 
-- If the cluster is known to have **no active `NetworkPolicy` enforcer (`network_policy_enforced=False`)**, `start()` fails closed immediately with a `RuntimeError` explaining how to enable Dataplane V2 (`--enable-dataplane-v2 --enable-fqdn-network-policy`) or Calico (`--enable-network-policy`), or how to opt out explicitly (`--ek allow_metadata_server=true` for unrestricted `public` tasks).
+- If the cluster has **no active `NetworkPolicy` enforcer (`network_policy_enforced=False`)**, `start()` fails closed immediately with a `RuntimeError` explaining how to enable Dataplane V2 (`--enable-dataplane-v2 --enable-fqdn-network-policy`) or Calico (`--enable-network-policy`), or how to opt out explicitly (`--ek allow_metadata_server=true` for unrestricted `public` tasks).
+- If enforcement **could not be verified (`network_policy_enforced=None`)** because neither `gcloud container clusters describe` nor `kube-system` Pod listing succeeded, `start()` also fails closed rather than failing open, unless the operator explicitly passes `--ek assume_network_policy_enforced=true`.
 - If a task requests hostname or wildcard allowlisting on a cluster without `FQDNNetworkPolicy` support, deployment fails closed during capability validation (`ValueError`) or policy application (`RuntimeError`).
 
 ### Why GKE Dataplane V2 is strongly recommended over Calico
@@ -170,16 +178,16 @@ On GKE nodes with Workload Identity (`GKE_METADATA`) enabled on the Legacy Datap
 
 ### Automatic DinD Artifact Registry token scrubbing (`Shape B` and `Shape C`)
 
-In Docker-in-Docker Pods (`Shape B` and `Shape C`), `dind-engine` and the one-shot `dind-cache-<service>` initContainers automatically pull `main` and all sidecar images into `dind-engine` before locking down credentials and starting the Compose stack:
-1. **Automatic DinD image pulling during Pod init (`dind-cache-<service>`):** While `dind-engine` and the `dind-cache-<service>` initContainers run, `dind-engine` fetches a short-lived OAuth token from `169.254.169.254` and writes `/harbor/dind-images/.docker/config.json` (scoped strictly to Google-owned registry hosts `*.pkg.dev` and `*gcr.io`) so every `dind-cache-<service>` initContainer can automatically pull built task and sidecar images via `docker pull` (even when `allow_metadata_server=False`).
-2. **Pre-`main` credential scrubbing and metadata lockdown (`compose-up-gate`):** At the very start of the `compose-up-gate` initContainer—after all `dind-cache-<service>` containers have exited and **before `docker compose up --pull never` starts any pre-`main` sidecar or `main` container**—`compose-up-gate` touches `/harbor/dind-images/.auth-scrubbed` (permanently halting `dind-engine`'s background token refresh loop) and executes `rm -rf /harbor/dind-images/.docker` so no cached registry token remains on the shared volume when any Compose container starts. When `allow_metadata_server=False` (default), `dind-engine` simultaneously installs `unreachable` routes for `169.254.169.254/32` and `169.254.169.252/32` in the Pod network namespace before `compose-up-gate` launches any Compose service, and the Pod `NetworkPolicy` is applied as soon as Pod initialization completes.
+In Docker-in-Docker Pods (`Shape B` and `Shape C`), `dind-engine` and the trusted `dind-pull` initContainer (`docker:27-dind`) pull `main` and all sidecar images into `dind-engine` before locking down credentials and starting any task or sidecar container:
+1. **Trusted DinD image pulling (`dind-pull`):** While `dind-engine` starts, `dind-engine` fetches a short-lived OAuth token from `169.254.169.254` and writes `/harbor/dind-images/.docker/config.json` (scoped strictly to Google-owned registry hosts `*.pkg.dev` and `*gcr.io`). Only the trusted `dind-pull` initContainer mounts `/harbor/dind-images` and uses those credentials to pull `main` and sidecar images into `dind-engine`.
+2. **Pre-task credential scrubbing, metadata lockdown, and `NetworkPolicy` gate (`dind-pull`):** Immediately after pulling, `dind-pull` touches `/harbor/dind-images/.auth-scrubbed`, deletes `/harbor/dind-images/.docker`, waits for `dind-engine` to block non-DNS traffic to `169.254.169.254/32` and `169.254.169.252/32` (`.metadata-blocked`), and signals `.ready-for-netpol` so the Harbor controller applies the restrictive Pod `NetworkPolicy` (`.netpol-applied`) **before** any untrusted `dind-cache-<service>`, native sidecar, `compose-up-gate`, or `main` container starts.
 
 ## Policy lifecycle, naming stability, and settlement
 
 NetworkPolicy and FQDNNetworkPolicy objects are named deterministically using the trial's stable Job name (`policy_key = self.job_name` -> `harbor-netpol-<job-name>` / `harbor-fqdn-<job-name>`):
 
-- **At start-up:** For Direct Pods and Shape A native Compose Pods, initial policies are created *before* the Job spawns its Pod so ingress and egress enforcement is active from the first container. For DinD Pods (`Shape B` and `Shape C`), initial Pod `NetworkPolicy` is applied right after `dind-cache-<service>` image materialization and `compose-up-gate` finish (while `dind-engine` blocks `169.254.169.254/32` and `169.254.169.252/32` before `docker compose up` starts any Compose container).
-- **Runtime updates (`_apply_network_policy()`):** When Harbor core updates the network policy mid-trial on a live Pod (where `pod_name` and `pod_uid` are known), the existing policy object (`harbor-netpol-<job-name>`) is replaced in place with a Pod `ownerReference` attached, and (if the Pod is already Ready) the environment sleeps for `--ek network_policy_settlement_sec` (default `2.0` s) to allow the GKE dataplane to program the new rules.
+- **At start-up:** For Direct Pods and Shape A native Compose Pods, initial policies are created *before* the Job spawns its Pod so ingress and egress enforcement is active from the first container. For DinD Pods (`Shape B` and `Shape C`), the Pod `NetworkPolicy` is applied during the `dind-pull` handshake before any untrusted container starts.
+- **Runtime updates (`_apply_network_policy()`):** When Harbor core updates the network policy mid-trial on a live Pod (where `pod_name` and `pod_uid` are known), the existing policy object (`harbor-netpol-<job-name>`) is replaced in place with a Pod `ownerReference` attached. When narrowing network access on a Ready Pod (e.g., `public` -> `allowlist` or `no-network`), `harbor-gke-ext` flushes active sockets/conntrack flows (`ss -K` / `conntrack -F`), waits `--ek network_policy_settlement_sec` (default `2.0` s), and probes metadata unreachability when entering `no-network`.
 - **Deletion:** Policies are deleted explicitly when the environment calls `stop(delete=True)` (and by Kubernetes garbage collection if a runtime update attached a Pod `ownerReference`).
 
 ## Container security contexts and Service Accounts
@@ -278,9 +286,9 @@ You should be aware of the following limitations:
 - **Port-53 DNS in `allowlist` mode:** In `allowlist` mode, port 53 is opened to `kube-system` (`kube-dns` / `NodeLocal DNSCache` / Cloud DNS) so the Pod can resolve allowlisted FQDNs. Standard Kubernetes `NetworkPolicy` cannot filter DNS queries by domain name at Layer 7; blocking DNS tunneling in `allowlist` mode requires `no-network` mode or a Cloud DNS Response Policy that restricts recursive resolution to approved domains.
 - **Layer 7 filtering:** `NetworkPolicy` and `FQDNNetworkPolicy` operate at Layer 3/4 (IP, port, and DNS-resolved IP). Allowed IPs or FQDNs expose all HTTP paths and server-side features on those remote endpoints unless mediated by an L7 proxy.
 - **Node service account exposure on host escape:** Any cloud resource accessible to the Node's service account is reachable if a container runtime escape occurs. Always provision worker pools with a dedicated, least-privilege node service account (`roles/container.defaultNodeServiceAccount` + `roles/artifactregistry.reader`) and use `--ek runtime_class_name=gvisor` for untrusted workloads.
-- **Privileged containers are not sandboxes:** On GKE Standard without gVisor, the `dind-engine` container in Shape B and Shape C runs with `privileged: true` to operate a nested Docker daemon. A kernel or runtime escape inside `dind-engine` compromises the worker node.
+- **Privileged containers are not sandboxes:** On GKE Standard without gVisor, the `dind-engine` container in Shape B and Shape C runs with `privileged: true` to operate a nested Docker daemon. A kernel or runtime escape inside `dind-engine` compromises the worker node; isolate DinD workloads on a dedicated node pool (`--ek dind_node_pool=<pool>`) or run under gVisor (`--ek runtime_class_name=gvisor`).
 - **GPU device isolation inside DinD:** In Shape B and Shape C (DinD) deployments, the `dind-engine` container enumerates and mounts every `/dev/nvidia*` device on the Node. Consequently, device-level isolation between co-tenant Pods on a shared GPU Node is not provided inside the DinD plane.
-- **Compose environment variable interpolation:** Compose variable interpolation evaluates `${VAR}` references in the Compose file against the orchestrator host's `os.environ` at translation time. If a task author references a host environment variable in `docker-compose.yml`, that value is baked into the translated Pod spec.
+- **Compose environment variable interpolation:** Harbor's Compose normalizer exposes minimal system variables (`PATH`, `HOME`, `TMPDIR`, `TEMP`, `TMP`, `DOCKER_*`, `LANG`, `LC_ALL`, `USER`), the host variables the task's Compose files reference (`$VAR`, `${VAR}` with any modifier, including nested defaults; `$$` escapes are ignored), Harbor's synthetic Compose variables (`MAIN_IMAGE_NAME`, `CONTEXT_DIR`, `HOST_VERIFIER_LOGS_PATH`, `HOST_AGENT_LOGS_PATH`, `HOST_ARTIFACTS_PATH`, `ENV_VERIFIER_LOGS_PATH`, `ENV_AGENT_LOGS_PATH`, `ENV_ARTIFACTS_PATH`, `CPUS`, `MEMORY`) and the variables listed in `task.toml` `[environment.env]`. This is the set Harbor's Modal environment passes, and it gives the same `${VAR}` results as Harbor's Docker environment. Host variables no Compose file mentions (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AWS_SECRET_ACCESS_KEY`, etc.) are never exposed to `docker compose config`. A referenced host value that lands in a service's `environment` is written into the Pod spec as a plain environment variable, readable by anyone who can read Pods in the namespace; on Docker it lands only in the container's environment.
 
 For more details on task architecture, see the [Architecture reference](architecture.md). For resolving common failures, check [Troubleshooting](troubleshooting.md).
 For environment configuration, see the [Configuration reference](configuration.md).

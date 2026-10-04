@@ -182,7 +182,7 @@ def test_evaluate_carries_inventory_through_every_branch() -> None:
 def test_pod_level_resources_probe_detects_retention() -> None:
     echoed = SimpleNamespace(
         spec=SimpleNamespace(
-            resources=SimpleNamespace(requests={"cpu": "100m"}, limits=None)
+            resources=SimpleNamespace(requests={"cpu": "500m"}, limits=None)
         )
     )
     api = MagicMock()
@@ -191,6 +191,11 @@ def test_pod_level_resources_probe_detects_retention() -> None:
     assert probe_pod_level_resources_support(api) is True
     # Must be a dry run: the probe may never create anything.
     assert api.create_namespaced_pod.call_args.kwargs["dry_run"] == "All"
+    submitted_pod = api.create_namespaced_pod.call_args.kwargs["body"]
+    # Must meet Autopilot's default container mutation floor (500m CPU / 2Gi memory)
+    # so autopilot-default-resources-mutator does not trigger a 422 mismatch.
+    assert parse_quantity_to_mib(submitted_pod.spec.resources.requests["memory"]) >= 2048
+    assert submitted_pod.spec.resources.requests["cpu"] in ("500m", "1")
 
 
 @pytest.mark.unit
@@ -204,12 +209,31 @@ def test_pod_level_resources_probe_detects_pruning() -> None:
 
 
 @pytest.mark.unit
+def test_pod_level_resources_probe_422_on_spec_resources_means_supported() -> None:
+    """If an admission mutator raises container requests above the probe's Pod-level
+    requests, Kubernetes 1.34+ returns 422 referencing `spec.resources.requests`,
+    which proves the API server retained and validated `spec.resources`."""
+    from kubernetes.client.rest import ApiException
+
+    exc = ApiException(status=422, reason="Unprocessable Entity")
+    exc.body = (
+        '{"kind":"Status","status":"Failure","reason":"Invalid",'
+        '"message":"spec.resources.requests[cpu]: Invalid value: \\"500m\\": '
+        'must be greater than or equal to aggregate container requests of 1"}'
+    )
+    api = MagicMock()
+    api.create_namespaced_pod.side_effect = exc
+    assert probe_pod_level_resources_support(api) is True
+
+
+@pytest.mark.unit
 def test_pod_level_resources_probe_unknown_on_error() -> None:
     """A failed probe is 'unknown' -- distinct from 'unsupported'."""
     api = MagicMock()
     api.create_namespaced_pod.side_effect = RuntimeError("403 Forbidden")
     assert probe_pod_level_resources_support(api) is None
     assert probe_pod_level_resources_support(None) is None
+
 
 
 # ============================================================================
@@ -514,4 +538,42 @@ def test_parse_gcloud_cluster_describe_network_policy_enforced() -> None:
         ).network_policy_enforced
         is False
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "pod_names,pod_labels,svc_ip,expected_enforced,expected_dns_ip",
+    [
+        (["anetd-abc12", "kube-dns-xyz"], [{}, {}], "34.118.224.10", True, "34.118.224.10"),
+        (["calico-node-999", "kube-proxy-1"], [{}, {}], "10.96.0.10", True, "10.96.0.10"),
+        (["custom-cni-1"], [{"k8s-app": "cilium"}], "10.28.0.10", True, "10.28.0.10"),
+        (["kube-dns-xyz", "kube-proxy-1"], [{}, {}], "10.96.0.10", False, "10.96.0.10"),
+        ([], [], "None", None, None),
+    ],
+)
+def test_probe_network_enforcement_and_dns_via_k8s(
+    pod_names: list[str],
+    pod_labels: list[dict[str, str]],
+    svc_ip: str,
+    expected_enforced: bool | None,
+    expected_dns_ip: str | None,
+) -> None:
+    """WP-4 (F-07): Verify K8s API fallback detects anetd/calico/cilium and kube-dns ClusterIP."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from harbor_gke_ext.cluster_probe import probe_network_enforcement_and_dns_via_k8s
+
+    core_api = MagicMock()
+    core_api.list_namespaced_pod.return_value = SimpleNamespace(
+        items=[
+            SimpleNamespace(metadata=SimpleNamespace(name=n, labels=lbl))
+            for n, lbl in zip(pod_names, pod_labels, strict=True)
+        ]
+    )
+    core_api.read_namespaced_service.return_value = SimpleNamespace(
+        spec=SimpleNamespace(cluster_ip=svc_ip)
+    )
+    enforced, dns_ip = probe_network_enforcement_and_dns_via_k8s(core_api)
+    assert enforced is expected_enforced
+    assert dns_ip == expected_dns_ip
 

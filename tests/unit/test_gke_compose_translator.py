@@ -1,11 +1,14 @@
 """Unit tests for src/harbor/environments/gke/compose_translator.py."""
 
+import base64
 import logging
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 
 from harbor.constants import MAIN_SERVICE_NAME
 from harbor.environments.base import ExecResult
@@ -39,6 +42,22 @@ def _make_mock_env(tmp_path: Path) -> MagicMock:
     env._persistent_env = {"PERSISTENT_KEY": "persist_val"}
     env.logger = MagicMock()
     return env
+
+
+def _inner_compose(pod) -> dict:
+    """Decode the inner Compose document that `compose-up-gate` hands to dockerd.
+
+    This is the artifact the in-Pod Docker daemon actually runs, so DinD
+    assertions are made against it rather than against translator internals.
+    """
+    gate = next(c for c in pod.spec.init_containers if c.name == "compose-up-gate")
+    gate_script = (gate.command or ["", "", ""])[2]
+    m = re.search(
+        r"echo\s+['\"]?([A-Za-z0-9+/=]+)['\"]?\s*\|\s*base64\s+-d\s*>\s*/harbor/dind-compose\.yaml",
+        gate_script,
+    )
+    assert m is not None, f"No inner compose payload in gate script: {gate_script}"
+    return yaml.safe_load(base64.b64decode(m.group(1)).decode("utf-8"))
 
 
 # ============================================================================
@@ -540,29 +559,28 @@ services:
 
     init_names = [c.name for c in (pod.spec.init_containers or [])]
     init_by_name = {c.name: c for c in (pod.spec.init_containers or [])}
-    assert init_names.index("dind-engine") < init_names.index("dind-cache-docker-proxy")
-    assert init_names.index("dind-cache-docker-proxy") < init_names.index(
-        "compose-up-gate"
-    )
+    assert not any(n.startswith("dind-cache-") for n in init_names)
+    assert init_names.index("dind-engine") < init_names.index("dind-pull")
+    assert init_names.index("dind-pull") < init_names.index("compose-up-gate")
 
     # Host containerd socket is never mounted anywhere on the Pod
     pod_vol_names = {v.name for v in (pod.spec.volumes or [])}
     assert "harbor-host-containerd-sock" not in pod_vol_names
 
-    cache_cmd = " ".join(init_by_name["dind-cache-docker-proxy"].command or [])
+    pull_cmd = " ".join(init_by_name["dind-pull"].command or [])
     gate_cmd = " ".join(init_by_name["compose-up-gate"].command or [])
     dind_cmd = " ".join(init_by_name["dind-engine"].command or [])
 
-    assert "2>/dev/null || true" not in cache_cmd
-    assert "tar -cf -" in cache_cmd
-    assert 'import "$@" - "$IMG"' in cache_cmd
-    assert "WORKDIR ${WORKDIR}" in cache_cmd
-    assert "ENV ${K}=" in cache_cmd
+    assert 'DOCKER_CONFIG="/harbor/dind-images/.docker"' in pull_cmd
+    assert '"$DCLI" pull -q "$IMG"' in pull_cmd
     assert "--pull never" in gate_cmd
     assert gate_cmd.index("load_image docker-proxy") < gate_cmd.index("docker compose")
     assert "--host=unix:///var/run/harbor-dind/docker.sock" in dind_cmd
     assert "tcp://" not in dind_cmd
-    assert "--dns" not in dind_cmd
+    assert "--dns=" not in dind_cmd and "--dns " not in dind_cmd
+    assert "--dns-opt=ndots:1" in dind_cmd
+    assert "--dns-opt=timeout:2" in dind_cmd
+    assert "--dns-opt=attempts:1" in dind_cmd
     assert "/harbor/dind-images/.auth-scrubbed" in dind_cmd
     assert "rm -rf /harbor/dind-images/.docker" in gate_cmd
 
@@ -964,11 +982,6 @@ def test_normalize_dind_tmpfs_entries_invariants():
 @pytest.mark.unit
 def test_translate_compose_dind_tmpfs_not_double_mounted_in_inner_compose(tmp_path):
     """End-to-end: decode inner compose YAML from compose-up-gate and verify no duplicate /tmp mount."""
-    import base64
-    import re
-
-    import yaml
-
     compose_file = tmp_path / "docker-compose.yaml"
     compose_file.write_text(
         """
@@ -1013,17 +1026,7 @@ services:
     pod_vol_names = {v.name for v in (pod.spec.volumes or [])}
     assert not any(v.startswith("tmpfs-worker") for v in pod_vol_names)
 
-    gate = next(c for c in pod.spec.init_containers if c.name == "compose-up-gate")
-    gate_script = gate.command[2]
-    m = re.search(
-        r"echo\s+['\"]?([A-Za-z0-9+/=]+)['\"]?\s*\|\s*base64\s+-d\s*>\s*/harbor/dind-compose\.yaml",
-        gate_script,
-    )
-    assert m is not None, (
-        f"Could not find base64 compose payload in gate script: {gate_script}"
-    )
-    inner_doc = yaml.safe_load(base64.b64decode(m.group(1)).decode("utf-8"))
-    worker_spec = inner_doc["services"]["worker"]
+    worker_spec = _inner_compose(pod)["services"]["worker"]
 
     # /tmp and /run must appear in worker_spec["tmpfs"] with explicit size=,
     # and must NOT appear as bind mounts in worker_spec.get("volumes").
@@ -1068,14 +1071,11 @@ def test_build_security_context_pss_baseline_allowlist():
 
 
 # ============================================================================
-# 13. Defect D1: OCI Image Config Resolution and docker import --change Flags
+# 13. Registry Image Reference Parsing
 # ============================================================================
 @pytest.mark.unit
-def test_format_oci_config_changes_and_registry_ref_parsing():
-    from harbor_gke_ext.compose_translator import (
-        _format_oci_config_changes,
-        _parse_registry_image_ref,
-    )
+def test_registry_ref_parsing():
+    from harbor_gke_ext.compose_translator import _parse_registry_image_ref
 
     assert _parse_registry_image_ref("python:3.12-slim") == (
         "registry-1.docker.io",
@@ -1087,83 +1087,11 @@ def test_format_oci_config_changes_and_registry_ref_parsing():
         "proj/repo/app",
         "v1",
     )
+    valid_digest = "sha256:" + "a" * 64
     assert _parse_registry_image_ref(
-        "public.ecr.aws/docker/library/python:3.13@sha256:abcdef"
-    ) == ("public.ecr.aws", "docker/library/python", "sha256:abcdef")
+        f"public.ecr.aws/docker/library/python:3.13@{valid_digest}"
+    ) == ("public.ecr.aws", "docker/library/python", valid_digest)
 
-    oci_cfg = {
-        "Entrypoint": ["/docker-entrypoint.sh"],
-        "Cmd": ["postgres", "-c", "max_connections=200"],
-        "ExposedPorts": {"5432/tcp": {}, "8080/tcp": {}},
-        "Labels": {"org.opencontainers.image.title": "postgres"},
-        "StopSignal": "SIGINT",
-        "Healthcheck": {
-            "Test": ["CMD-SHELL", "pg_isready -U postgres"],
-            "Interval": 10000000000,
-            "Timeout": 5000000000,
-            "Retries": 5,
-        },
-    }
-    changes = _format_oci_config_changes(oci_cfg)
-    assert 'ENTRYPOINT ["/docker-entrypoint.sh"]' in changes
-    assert 'CMD ["postgres", "-c", "max_connections=200"]' in changes
-    assert "EXPOSE 5432/tcp" in changes
-    assert "EXPOSE 8080/tcp" in changes
-    assert 'LABEL "org.opencontainers.image.title"="postgres"' in changes
-    assert "STOPSIGNAL SIGINT" in changes
-    assert (
-        "HEALTHCHECK --interval=10000000000ns --timeout=5000000000ns --retries=5 CMD pg_isready -U postgres"
-        in changes
-    )
-
-
-@pytest.mark.unit
-def test_translate_compose_dind_cache_emits_oci_config_changes(tmp_path: Path):
-    from harbor_gke_ext.compose_translator import _OCI_CONFIG_CACHE
-
-    sidecar_img = "us-central1-docker.pkg.dev/proj/repo/custom-db:v1"
-    _OCI_CONFIG_CACHE[sidecar_img] = {
-        "Entrypoint": ["/usr/local/bin/db-entry.sh"],
-        "Cmd": ["run-server", "--port", "9000"],
-        "ExposedPorts": {"9000/tcp": {}},
-        "StopSignal": "SIGTERM",
-    }
-    try:
-        compose_file = tmp_path / "docker-compose.yaml"
-        compose_file.write_text(
-            f"""
-services:
-  main:
-    image: python:3.12-slim
-    command: ["sleep", "infinity"]
-  db:
-    image: {sidecar_img}
-    privileged: true
-"""
-        )
-        pod = translate_compose(
-            compose_paths=[compose_file],
-            compose_env={
-                "MAIN_IMAGE_NAME": "us-central1-docker.pkg.dev/proj/repo/main:latest"
-            },
-            pod_name="d1-oci-pod",
-            namespace="default",
-            labels={},
-            main_image="us-central1-docker.pkg.dev/proj/repo/main:latest",
-            is_autopilot=False,
-            image_resolver=ImageResolver(),
-            task_dir=tmp_path,
-        )
-        cache_c = next(
-            c for c in (pod.spec.init_containers or []) if c.name == "dind-cache-db"
-        )
-        script = cache_c.command[2]
-        assert 'ENTRYPOINT ["/usr/local/bin/db-entry.sh"]' in script
-        assert 'CMD ["run-server", "--port", "9000"]' in script
-        assert "EXPOSE 9000/tcp" in script
-        assert "STOPSIGNAL SIGTERM" in script
-    finally:
-        _OCI_CONFIG_CACHE.pop(sidecar_img, None)
 
 
 @contextmanager
@@ -1389,26 +1317,72 @@ def test_build_pod_level_resources_never_falls_below_container_aggregate():
 
 
 @pytest.mark.unit
-def test_build_pod_level_resources_raises_ceiling_and_warns_when_declared_exceeds_budget(
-    caplog,
+@pytest.mark.parametrize(
+    ("apps", "host_ceilings", "expected_request", "expected_limit"),
+    [
+        pytest.param(
+            [_container("main", mem_req="1024Mi", mem_lim="1024Mi"), _container("svc")],
+            None,
+            "1024Mi",
+            "1024Mi",
+            id="undeclared-service-shares-the-budget",
+        ),
+        pytest.param(
+            # Rule 2 as well: the 8192Mi container limit must fit the Pod.
+            [
+                _container("main", mem_req="1024Mi", mem_lim="1024Mi"),
+                _container("greedy", mem_lim="8192Mi"),
+            ],
+            None,
+            "9216Mi",
+            "9216Mi",
+            id="declared-limit-adds-to-the-ceiling",
+        ),
+        pytest.param(
+            [
+                _container("main", mem_req="1024Mi", mem_lim="1024Mi"),
+                _container("svc", mem_req="256Mi"),
+            ],
+            None,
+            "1280Mi",
+            "1280Mi",
+            id="request-without-limit-counts-as-its-ceiling",
+        ),
+        pytest.param(
+            [
+                _container("main", mem_req="1024Mi", mem_lim="1024Mi"),
+                _container("dind-engine", mem_req="320Mi"),
+            ],
+            {"dind-engine": {"memory": 2240}},
+            "1344Mi",
+            "3264Mi",
+            id="host-ceiling-replaces-the-daemon-request",
+        ),
+    ],
+)
+def test_build_pod_level_resources_ceiling_covers_what_runs_inside(
+    apps, host_ceilings, expected_request, expected_limit
 ):
-    """The user-chosen max(budget, declared) rule, with the required warning."""
-    import logging
+    """The Pod is the task's Docker host: its ceiling is the sum of ceilings.
 
+    A container's ceiling is its limit, else its request. Undeclared containers
+    add nothing and share what is left, as on Docker. ``host_ceilings`` carries
+    what only the caller knows: the daemon's own spec has no limit, but its
+    cgroup holds every nested container.
+    """
     from harbor_gke_ext.compose_translator import build_pod_level_resources
 
-    apps = [_container("main"), _container("greedy", mem_lim="8192Mi")]
-    with caplog.at_level(logging.WARNING):
-        res = build_pod_level_resources(
-            [],
-            apps,
-            task_cpu_m=None,
-            task_mem_mb=1024,
-        )
+    res = build_pod_level_resources(
+        [],
+        apps,
+        task_cpu_m=None,
+        task_mem_mb=1024,
+        task_mem_limit_mb=1024,
+        host_ceilings=host_ceilings,
+    )
     assert res is not None
-    # Rule 2: no single container limit may exceed the Pod limit.
-    assert res.limits["memory"] == "8192Mi"
-    assert "exceed the task budget" in caplog.text
+    assert res.requests == {"memory": expected_request}
+    assert res.limits == {"memory": expected_limit}
 
 
 @pytest.mark.unit
@@ -1682,25 +1656,54 @@ services:
         "main"
     ]
 
+    assert pod.spec.share_process_namespace is None
+
     init_names = [c.name for c in (pod.spec.init_containers or [])]
     assert "dind-engine" in init_names
-    assert "dind-cache-main" in init_names
-    assert "compose-up-gate" in init_names
+    assert "dind-main-rootfs" in init_names
+    assert "dind-pull" in init_names
+    assert init_names.index("dind-engine") < init_names.index("dind-main-rootfs") < init_names.index("dind-pull") < init_names.index("compose-up-gate")
+    assert not any(n.startswith("dind-cache-") for n in init_names)
+
+    holder = next(c for c in pod.spec.init_containers if c.name == "dind-main-rootfs")
+    assert holder.restart_policy == "Always"
+    assert holder.image == "python:3.12-slim"
+    assert holder.command[:2] == [
+        "/harbor/dind-images/ld-musl.so.1",
+        "/harbor/dind-images/busybox",
+    ]
+    assert holder.security_context is not None
+    assert holder.security_context.privileged is True
+    holder_img_mount = next(
+        vm for vm in (holder.volume_mounts or []) if vm.name == "harbor-dind-images"
+    )
+    assert holder_img_mount.mount_propagation == "Bidirectional"
+    holder_script = holder.command[4]
+    assert "mount --bind / /harbor/dind-images/main-rootfs" in holder_script
+    assert "umount -l /harbor/dind-images/main-rootfs" in holder_script
+    assert "/harbor/dind-images/.main-rootfs-ready" in holder_script
+
+    engine = next(c for c in pod.spec.init_containers if c.name == "dind-engine")
+    engine_img_mount = next(
+        vm for vm in (engine.volume_mounts or []) if vm.name == "harbor-dind-images"
+    )
+    assert engine_img_mount.mount_propagation == "HostToContainer"
+    engine_script = (engine.command or ["", "", ""])[2]
+    assert "--feature containerd-snapshotter=true" not in engine_script
+    assert "--max-concurrent-downloads=10" in engine_script
+    assert "mount --bind /harbor/dind-images/main-rootfs /tmp/harbor-main-rootfs" in engine_script
+    assert "/harbor/dind-images/.main-rootfs-captured" in engine_script
+
+    pull_ctr = next(c for c in pod.spec.init_containers if c.name == "dind-pull")
+    pull_script = (pull_ctr.command or ["", "", ""])[2]
+    assert "/harbor/dind-images/.main-rootfs-captured" in pull_script
+    assert '"$DCLI" import' in pull_script
+    assert '"$DCLI" pull -q "$IMG"' in pull_script
 
     gate = next(c for c in pod.spec.init_containers if c.name == "compose-up-gate")
     gate_script = (gate.command or ["", "", ""])[2]
-    import base64
-    import re
-
-    import yaml
-
-    m = re.search(
-        r"echo\s+'?([A-Za-z0-9+/=]+)'?\s+\|\s+base64\s+-d\s+>\s+/harbor/dind-compose\.yaml",
-        gate_script,
-    )
-    assert m is not None
-    inner_compose = yaml.safe_load(base64.b64decode(m.group(1)).decode("utf-8"))
-    inner_main = inner_compose["services"]["main"]
+    assert 'printf "%s\\n" "$GD" > /harbor/dind-images/.main-layers' in gate_script
+    inner_main = _inner_compose(pod)["services"]["main"]
     assert inner_main["stdin_open"] is True
     assert inner_main["tty"] is True
     assert inner_main["working_dir"] == "/workspace"
@@ -1778,11 +1781,6 @@ def test_translate_compose_shape_c_inner_main_gets_keepalive(tmp_path: Path):
     inner `main` that exits immediately collapses the whole Pod rather than just
     one container.
     """
-    import base64
-    import re
-
-    import yaml
-
     compose_file = tmp_path / "docker-compose.yaml"
     compose_file.write_text(
         """
@@ -1811,15 +1809,7 @@ services:
         ),
     )
 
-    gate = next(c for c in pod.spec.init_containers if c.name == "compose-up-gate")
-    gate_script = (gate.command or ["", "", ""])[2]
-    m = re.search(
-        r"echo\s+'?([A-Za-z0-9+/=]+)'?\s+\|\s+base64\s+-d\s+>\s+/harbor/dind-compose\.yaml",
-        gate_script,
-    )
-    assert m is not None
-    inner_compose = yaml.safe_load(base64.b64decode(m.group(1)).decode("utf-8"))
-    assert inner_compose["services"]["main"]["command"] == [
+    assert _inner_compose(pod)["services"]["main"]["command"] == [
         "sh",
         "-c",
         "sleep infinity",
@@ -1916,10 +1906,10 @@ def test_oci_manifest_success_is_cached(monkeypatch):
 def test_dind_cache_prefers_authenticated_docker_pull_before_rootfs_tar(
     tmp_path: Path,
 ) -> None:
-    """D9: `dind-cache-*` must try `docker pull` (with GCE metadata-server auth
-    staged by `dind-engine`) before falling back to `tar -cf - / | docker import`,
-    so GKE Image Streaming (`gcfs`) `st_nlink = 1` does not inflate hard-linked
-    OCI layers 5.5x during materialization."""
+    """D9 / WP-3: `dind-pull` (running on trusted `docker:dind`) must materialize
+    DinD images via `docker pull` (with GCE metadata-server auth staged by
+    `dind-engine`), scrub `.docker` on both success and failure, and omit
+    `dind-cache-*` init containers so Kubelet never double-pulls DinD task images."""
     compose_path = tmp_path / "docker-compose.yaml"
     compose_path.write_text(
         """
@@ -1932,37 +1922,52 @@ services:
 """
     )
 
-    pod = translate_compose(
-        compose_paths=[compose_path],
-        compose_env={},
-        pod_name="d9-pull-pod",
-        namespace="default",
-        labels={},
-        main_image="us-central1-docker.pkg.dev/proj/harbor-tasks/orca:latest",
-        is_autopilot=False,
-        image_resolver=ImageResolver(),
-        task_dir=tmp_path,
-    )
+    from harbor_gke_ext.compose_translator import _OCI_CONFIG_CACHE
+
+    img_ref = "us-central1-docker.pkg.dev/proj/harbor-tasks/orca:latest"
+    _OCI_CONFIG_CACHE[img_ref] = {
+        "Entrypoint": ["/app/entrypoint.sh"],
+        "WorkingDir": "/app",
+        "Env": ["SNAPSHOT_NAME=20260419T215712Z-3f397ba95f148ce5"],
+    }
+    try:
+        pod = translate_compose(
+            compose_paths=[compose_path],
+            compose_env={},
+            pod_name="d9-pull-pod",
+            namespace="default",
+            labels={},
+            main_image=img_ref,
+            is_autopilot=False,
+            image_resolver=ImageResolver(),
+            task_dir=tmp_path,
+        )
+    finally:
+        _OCI_CONFIG_CACHE.pop(img_ref, None)
+
     inits = {c.name: c for c in (pod.spec.init_containers or [])}
+    init_names = [c.name for c in (pod.spec.init_containers or [])]
     dind_script = inits["dind-engine"].command[2]
-    cache_script = inits["dind-cache-main"].command[2]
+    pull_script = inits["dind-pull"].command[2]
 
     assert "harbor_refresh_gcr_auth" in dind_script
     assert "us-central1-docker.pkg.dev" in dind_script
     assert "/harbor/dind-images/.docker/config.json" in dind_script
-    assert 'DOCKER_CONFIG="/harbor/dind-images/.docker"' in cache_script
-    assert '"$DCLI" pull -q "$IMG"' in cache_script
-    assert cache_script.index('"$DCLI" pull -q "$IMG"') < cache_script.index(
-        "tar -cf -"
-    )
+    assert not any(n.startswith("dind-cache-") for n in init_names)
+    assert 'ENTRYPOINT ["/app/entrypoint.sh"]' in pull_script
+    assert "WORKDIR /app" in pull_script
+    assert "SNAPSHOT_NAME=" in pull_script
+    assert 'DOCKER_CONFIG="/harbor/dind-images/.docker"' in pull_script
+    assert '"$DCLI" pull -q "$IMG"' in pull_script
+    assert "HARBOR_ERROR: could not pull image" in pull_script
+    assert "exit 1" in pull_script
 
 
 @pytest.mark.unit
-def test_dind_nested_compose_support_and_pod_memory_limit_floor(
+def test_dind_nested_compose_support(
     tmp_path: Path,
 ) -> None:
     """Verify DinD Shape C support for nested compose workloads (e.g. orca-bench):
-    - Pod memory limit floor is raised to 8192Mi while keeping Pod memory request at 1024Mi.
     - Pod volumes mounted into DinD services are symlinked at their mount_path in dind-engine.
     - Empty SNAPSHOT_CACHE_HOST_DIR is defaulted to /app.
     - compose-up-gate waits for /tmp/env-ready when /app/entrypoint.sh references it.
@@ -1997,8 +2002,6 @@ services:
         cpu_request="2000m",
         memory_request="1024Mi",
     )
-    assert pod.spec.resources.requests["memory"] == "1024Mi"
-    assert pod.spec.resources.limits["memory"] == "8192Mi"
 
     inits = {c.name: c for c in (pod.spec.init_containers or [])}
     dind_script = inits["dind-engine"].command[2]
@@ -2007,6 +2010,321 @@ services:
     assert "/workspace/ctx" in dind_script
     assert "/tmp/harbor-main-rootfs/app" in dind_script
     assert "/tmp/env-ready" in gate_script
+
+
+# ============================================================================
+# DinD resource model.
+#
+# Harbor's reference Docker environment applies the task budget to
+# `services.main` only; every other container gets what it declares, and
+# undeclared ones are bounded only by the host. On GKE the Pod is that host.
+# `dind-engine` holds the daemon and every container it starts: it requests the
+# daemon baseline plus what the DinD services reserve and carries no CPU or
+# memory limit of its own. The Pod ceiling counts its true ceiling -- baseline
+# plus the services' ceilings -- so one task cannot take memory the scheduler
+# gave to another Pod.
+# ============================================================================
+_DIND_SHAPE_C_COMPOSE = """
+services:
+  main:
+    image: us-central1-docker.pkg.dev/proj/harbor-tasks/orca:latest
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+{main_resources}
+"""
+
+_DIND_SHAPE_B_COMPOSE = """
+services:
+  main:
+    image: us-central1-docker.pkg.dev/proj/repo/main:latest
+    command: ["sleep", "infinity"]
+  db:
+    image: postgres:16
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+        limits:
+          memory: 2G
+  cache:
+    image: redis:7
+    privileged: true
+    mem_limit: 128m
+"""
+
+_SHAPE_A_COMPOSE = """
+services:
+  main:
+    image: us-central1-docker.pkg.dev/proj/repo/main:latest
+    command: ["sleep", "infinity"]
+  cache:
+    image: redis:7
+    mem_limit: 128m
+"""
+
+_MAIN_DECLARES_DEPLOY = """    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M"""
+
+_MAIN_DECLARES_LEGACY = """    cpus: 1
+    mem_limit: 512m
+    mem_reservation: 256m"""
+
+_GUARANTEE_2CPU_1GI = {
+    "cpu_request": "2",
+    "cpu_limit": "2",
+    "memory_request": "1024Mi",
+    "memory_limit": "1024Mi",
+}
+_REQUEST_2CPU_1GI = {"cpu_request": "2", "memory_request": "1024Mi"}
+
+
+def _translate_dind(tmp_path: Path, compose_yaml: str, **kwargs):
+    compose_path = tmp_path / "docker-compose.yaml"
+    compose_path.write_text(compose_yaml)
+    image = "us-central1-docker.pkg.dev/proj/harbor-tasks/orca:latest"
+    return translate_compose(
+        compose_paths=[compose_path],
+        compose_env={},
+        pod_name="dind-resources-pod",
+        namespace="default",
+        labels={},
+        main_image=image,
+        image_resolver=ImageResolver(),
+        task_dir=tmp_path,
+        compose_placement="auto",
+        cluster_capabilities=ClusterCapabilities(
+            is_autopilot=False,
+            gke_version="1.35.1-gke.100",
+            dind_availability=DindAvailability.DIND_AVAILABLE,
+        ),
+        **kwargs,
+    )
+
+
+def _pod_container(pod, name: str):
+    return next(
+        c
+        for c in [*(pod.spec.init_containers or []), *pod.spec.containers]
+        if c.name == name
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    (
+        "compose_yaml",
+        "budget",
+        "expected_engine_requests",
+        "expected_inner_main",
+        "expected_native_main",
+        "expected_pod",
+    ),
+    [
+        pytest.param(
+            _DIND_SHAPE_C_COMPOSE.format(main_resources=_MAIN_DECLARES_DEPLOY),
+            _GUARANTEE_2CPU_1GI,
+            # Baseline 100m / 64Mi plus inner main's reservation.
+            {"cpu": "2100m", "memory": "1088Mi"},
+            {
+                "limits": {"cpus": "2", "memory": "1024M"},
+                "reservations": {"cpus": "2", "memory": "1024M"},
+            },
+            None,
+            # The host is main's budget plus the daemon baseline: the socket
+            # workload `main` starts shares that, as on a Docker host.
+            {
+                "requests": {"cpu": "2100m", "memory": "1088Mi"},
+                "limits": {"cpu": "2100m", "memory": "1088Mi"},
+            },
+            id="shape-c-guarantee-task-budget-overrides-main-declaration",
+        ),
+        pytest.param(
+            _DIND_SHAPE_C_COMPOSE.format(main_resources=_MAIN_DECLARES_LEGACY),
+            _REQUEST_2CPU_1GI,
+            {"cpu": "1100m", "memory": "576Mi"},
+            {
+                # Request mode carries no task limit, so main keeps its own
+                # declared ceiling, moved off the legacy keys. Docker refuses a
+                # memory reservation above the limit, and reserving more than
+                # main may use would only withhold it from the node, so the
+                # reservation (and the host's share of it) stops at the ceiling.
+                "limits": {"cpus": "1", "memory": "512M"},
+                "reservations": {"cpus": "1", "memory": "512M"},
+            },
+            None,
+            # The Pod still reserves the full task request.
+            {
+                "requests": {"cpu": "2000m", "memory": "1024Mi"},
+                "limits": {"cpu": "2000m", "memory": "1024Mi"},
+            },
+            id="shape-c-request-mode-keeps-declared-ceiling",
+        ),
+        pytest.param(
+            _DIND_SHAPE_C_COMPOSE.format(main_resources=""),
+            {},
+            {"cpu": "100m", "memory": "64Mi"},
+            None,
+            None,
+            # Harbor reads an absent budget as unlimited.
+            None,
+            id="shape-c-no-task-budget",
+        ),
+        pytest.param(
+            _DIND_SHAPE_B_COMPOSE,
+            _GUARANTEE_2CPU_1GI,
+            # Only reservations are requested: `db` reserves 250m / 256Mi, while
+            # `cache` declares a ceiling only, which reserves nothing.
+            {"cpu": "350m", "memory": "320Mi"},
+            None,
+            {
+                "requests": {"cpu": "2000m", "memory": "1024Mi"},
+                "limits": {"cpu": "2000m", "memory": "1024Mi"},
+            },
+            # Ceiling: main 2000m / 1024Mi + baseline 100m / 64Mi + `db` (no CPU
+            # limit, so its 250m reservation; 2048Mi limit) + `cache` (128Mi).
+            {
+                "requests": {"cpu": "2350m", "memory": "1344Mi"},
+                "limits": {"cpu": "2350m", "memory": "3264Mi"},
+            },
+            id="shape-b-guarantee",
+        ),
+        pytest.param(
+            _DIND_SHAPE_B_COMPOSE,
+            _REQUEST_2CPU_1GI,
+            {"cpu": "350m", "memory": "320Mi"},
+            None,
+            {"requests": {"cpu": "2000m", "memory": "1024Mi"}, "limits": {}},
+            # Without a limit, main counts toward the ceiling with its request.
+            {
+                "requests": {"cpu": "2350m", "memory": "1344Mi"},
+                "limits": {"cpu": "2350m", "memory": "3264Mi"},
+            },
+            id="shape-b-request-mode",
+        ),
+        pytest.param(
+            _SHAPE_A_COMPOSE,
+            _GUARANTEE_2CPU_1GI,
+            None,
+            None,
+            {
+                "requests": {"cpu": "2000m", "memory": "1024Mi"},
+                "limits": {"cpu": "2000m", "memory": "1024Mi"},
+            },
+            # `cache` declares a 128Mi ceiling and no reservation, so it adds to
+            # the Pod ceiling but not to the request.
+            {
+                "requests": {"cpu": "2000m", "memory": "1024Mi"},
+                "limits": {"cpu": "2000m", "memory": "1152Mi"},
+            },
+            id="shape-a-guarantee",
+        ),
+    ],
+)
+def test_compose_resource_model(
+    tmp_path: Path,
+    compose_yaml: str,
+    budget: dict[str, str],
+    expected_engine_requests: dict[str, str] | None,
+    expected_inner_main: dict | None,
+    expected_native_main: dict | None,
+    expected_pod: dict | None,
+) -> None:
+    """Every shape: `main` carries the task budget, other services what they
+    declare, and the Pod -- the Docker host -- is bounded by the sum."""
+    pod = _translate_dind(tmp_path, compose_yaml, **budget)
+
+    if expected_pod is None:
+        assert pod.spec.resources is None
+    else:
+        assert pod.spec.resources.requests == expected_pod["requests"]
+        assert pod.spec.resources.limits == expected_pod["limits"]
+
+    inner_main = None
+    if expected_engine_requests is None:
+        names = [
+            c.name for c in [*(pod.spec.init_containers or []), *pod.spec.containers]
+        ]
+        assert "dind-engine" not in names
+    else:
+        engine = _pod_container(pod, "dind-engine")
+        assert {
+            k: v for k, v in engine.resources.requests.items() if k in ("cpu", "memory")
+        } == expected_engine_requests
+        # The Pod ceiling bounds the host; a container limit would cap the
+        # daemon and every nested container below it.
+        engine_limits = engine.resources.limits or {}
+        assert "cpu" not in engine_limits
+        assert "memory" not in engine_limits
+        inner_main = _inner_compose(pod)["services"].get("main")
+
+    if expected_inner_main is not None:
+        assert inner_main["deploy"]["resources"] == expected_inner_main
+        for legacy_key in ("cpus", "mem_limit", "mem_reservation"):
+            assert legacy_key not in inner_main
+
+    if expected_native_main is not None:
+        assert inner_main is None
+        main = _pod_container(pod, MAIN_SERVICE_NAME)
+        assert {
+            k: v
+            for k, v in (main.resources.requests or {}).items()
+            if k in ("cpu", "memory")
+        } == expected_native_main["requests"]
+        assert {
+            k: v
+            for k, v in (main.resources.limits or {}).items()
+            if k in ("cpu", "memory")
+        } == expected_native_main["limits"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("runtime_class_name", "expect_nesting"),
+    [
+        pytest.param(None, True, id="runc-nests-under-own-cgroup"),
+        pytest.param("gvisor", False, id="gvisor-sandbox-already-contains"),
+    ],
+)
+def test_dind_engine_keeps_nested_containers_inside_its_own_cgroup(
+    tmp_path: Path, runtime_class_name: str | None, expect_nesting: bool
+) -> None:
+    """A privileged container shares the node's cgroup namespace on GKE, so a
+    default dockerd puts every nested container in `/docker/<id>` at the node
+    root: outside the Pod, invisible to kubelet, and leaked after the Pod is
+    gone (measured on GKE 1.35.6, 2026-10-03). dind-engine must move its own
+    processes into a leaf and point dockerd's `--cgroup-parent` below itself.
+
+    The move has to happen before any background job starts: cgroup v2 refuses
+    to enable controllers on a cgroup that still holds processes, so a watcher
+    forked first would make `cgroup.subtree_control` fail with EBUSY.
+    """
+    pod = _translate_dind(
+        tmp_path,
+        _DIND_SHAPE_B_COMPOSE,
+        runtime_class_name=runtime_class_name,
+        **_GUARANTEE_2CPU_1GI,
+    )
+    script = _pod_container(pod, "dind-engine").command[2]
+
+    if not expect_nesting:
+        assert "--cgroup-parent" not in script
+        assert "cgroup.subtree_control" not in script
+        return
+
+    dockerd_at = script.index("exec dockerd ")
+    assert '--cgroup-parent="${HARBOR_CG_SELF}/docker"' in script[dockerd_at:]
+    nesting_done_at = script.index("cgroup.subtree_control")
+    first_background_job_at = script.index(" & ")
+    assert nesting_done_at < first_background_job_at
+    # Fail closed: a dind-engine that cannot nest would silently put the task's
+    # workload outside the Pod again.
+    assert "HARBOR_ERROR: dind-engine cannot nest" in script
 
 
 @pytest.mark.unit
@@ -2115,3 +2433,257 @@ services:
     assert "ip route replace unreachable" not in dind_allowed
     assert ".metadata-blocked" not in gate_allowed
     assert "rm -rf /harbor/dind-images/.docker" in gate_allowed
+
+
+@pytest.mark.unit
+def test_fetch_oci_config_never_mints_gcloud_token_for_crafted_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F-01 regression: a crafted host ending in #.gcr.io must be rejected before minting a gcloud token."""
+    import subprocess
+    from harbor_gke_ext import compose_translator as ct
+
+    run_mock = MagicMock()
+    monkeypatch.setattr(subprocess, "run", run_mock)
+
+    with pytest.raises(ValueError):
+        ct._fetch_oci_config_from_registry(
+            "attacker.example:8443#.gcr.io/proj/img:latest"
+        )
+    assert run_mock.call_count == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "unsafe_realm",
+    [
+        "file:///etc/passwd",
+        "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+        "https://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+        "https://127.0.0.1:8443/token",
+        "https://localhost:8443/token",
+        "https://10.0.0.1/token",
+        "https://user:pass@auth.docker.io/token",
+        "https://auth.docker.io/token#fragment",
+    ],
+)
+def test_fetch_oci_config_rejects_unsafe_www_authenticate_realm(
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_realm: str,
+) -> None:
+    """F-04 regression: _fetch_oci_config_from_registry must reject non-HTTPS, IP/loopback/private, or credentialed WWW-Authenticate realms."""
+    from email.message import Message
+    import io
+    import urllib.error
+    import urllib.request
+    from harbor_gke_ext import compose_translator as ct
+
+    requested_urls: list[str] = []
+
+    class _FakeOpener:
+        def open(self, fullurl, data=None, timeout=None):
+            url_str = (
+                fullurl.full_url
+                if isinstance(fullurl, urllib.request.Request)
+                else str(fullurl)
+            )
+            requested_urls.append(url_str)
+            hdrs = Message()
+            hdrs["WWW-Authenticate"] = (
+                f'Bearer realm="{unsafe_realm}",service="registry.example.io",scope="repository:org/app:pull"'
+            )
+            raise urllib.error.HTTPError(
+                url_str, 401, "Unauthorized", hdrs, io.BytesIO(b"")
+            )
+
+    monkeypatch.setattr(ct, "_build_safe_https_opener", lambda: _FakeOpener(), raising=False)
+
+    with pytest.raises((ValueError, urllib.error.HTTPError)):
+        ct._fetch_oci_config_from_registry("ghcr.io/org/app:latest")
+
+    # Only the initial manifest URL may have been attempted; the unsafe realm must never be opened.
+    assert requested_urls == ["https://ghcr.io/v2/org/app/manifests/latest"]
+
+
+@pytest.mark.unit
+def test_build_safe_https_opener_rejects_file_scheme_and_strips_cross_host_auth(
+    tmp_path: Path,
+) -> None:
+    """Verify _build_safe_https_opener has no FileHandler and strips Authorization on cross-host redirects."""
+    from email.message import Message
+    import urllib.error
+    import urllib.request
+    from harbor_gke_ext import compose_translator as ct
+
+    secret_file = tmp_path / "secret.json"
+    secret_file.write_text('{"token": "leaked"}')
+
+    opener = ct._build_safe_https_opener()
+    with pytest.raises(urllib.error.URLError):
+        opener.open(f"file://{secret_file}")
+
+    redirect_handler = next(
+        h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+    )
+    orig_req = urllib.request.Request(
+        "https://us-central1-docker.pkg.dev/v2/proj/repo/blobs/sha256:1234",
+        headers={"Authorization": "Bearer ya29.secret"},
+    )
+    redirected = redirect_handler.redirect_request(
+        orig_req,
+        None,
+        302,
+        "Found",
+        Message(),
+        "https://storage.googleapis.com/gcs-blob-bucket/layer",
+    )
+    assert redirected is not None
+    assert "Authorization" not in redirected.headers
+    assert "Authorization" not in redirected.unredirected_hdrs
+
+    with pytest.raises(ValueError, match="https://"):
+        redirect_handler.redirect_request(
+            orig_req,
+            None,
+            302,
+            "Found",
+            Message(),
+            "http://storage.googleapis.com/gcs-blob-bucket/layer",
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("/etc/passwd", "/logs"),
+        ("/etc/passwd", "/logs/verifier"),
+        ("/logs/../../etc/passwd", "/app/leak"),
+        ("symlink_escape", "/workspace/leak"),
+    ],
+)
+def test_translate_compose_rejects_logs_bind_mount_bypass_and_symlink_escape(
+    tmp_path: Path, source: str, target: str
+) -> None:
+    """Verify translate_compose_to_pod rejects out-of-tree bind mounts and /logs bypasses."""
+    from harbor_gke_ext.placement import UnsupportedComposeFeatureError
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "secret.txt"
+    outside_file.write_text("secret", encoding="utf-8")
+
+    task_dir = tmp_path / "task"
+    env_dir = task_dir / "environment"
+    env_dir.mkdir(parents=True)
+
+    if source == "symlink_escape":
+        link = env_dir / "escaped_link"
+        link.symlink_to(outside_file)
+        actual_source = "./escaped_link"
+    elif source == "/etc/passwd":
+        actual_source = str(outside_file)
+    else:
+        actual_source = source
+
+    compose_file = env_dir / "docker-compose.yaml"
+    compose_file.write_text(
+        f"""
+services:
+  main:
+    image: alpine:3
+    volumes:
+      - {actual_source}:{target}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UnsupportedComposeFeatureError):
+        translate_compose(
+            compose_paths=[compose_file],
+            pod_name="test-pod",
+            namespace="default",
+            main_image_url="alpine:3",
+            task_dir=task_dir,
+            base_dir=env_dir,
+        )
+
+
+@pytest.mark.unit
+def test_dind_init_container_ordering_and_trusted_images(tmp_path: Path) -> None:
+    """WP-3 (F-05): Verify harbor-seed and dind-pull run on trusted dind image, and dind-pull scrubs auth and blocks metadata before any task init/sidecar/cache container runs."""
+    (tmp_path / "seed_dir").mkdir()
+    (tmp_path / "seed_dir" / "file.txt").write_text("seed-content", encoding="utf-8")
+
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text(
+        """
+services:
+  main:
+    image: us-central1-docker.pkg.dev/proj/repo/untrusted-main:latest
+    depends_on:
+      setup_db:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    volumes:
+      - ./seed_dir:/workspace/seed_dir
+  setup_db:
+    image: us-central1-docker.pkg.dev/proj/repo/untrusted-init:latest
+    restart: "no"
+    command: ["sh", "-c", "echo init"]
+  redis:
+    image: redis:7-alpine
+  docker_helper:
+    image: us-central1-docker.pkg.dev/proj/repo/untrusted-dind:latest
+    privileged: true
+""",
+        encoding="utf-8",
+    )
+
+    pod = translate_compose(
+        compose_paths=[compose_file],
+        compose_env={
+            "MAIN_IMAGE_NAME": "us-central1-docker.pkg.dev/proj/repo/untrusted-main:latest"
+        },
+        pod_name="wp3-dind-pod",
+        namespace="default",
+        labels={},
+        main_image="us-central1-docker.pkg.dev/proj/repo/untrusted-main:latest",
+        is_autopilot=False,
+        image_resolver=ImageResolver(),
+        task_dir=tmp_path,
+        allow_metadata_server=False,
+        wait_for_netpol=True,
+    )
+
+    inits = list(pod.spec.init_containers or [])
+    init_names = [c.name for c in inits]
+    init_by_name = {c.name: c for c in inits}
+
+    # 1. harbor-seed and dind-pull must use the trusted infra image, never untrusted task images
+    assert "harbor-seed" in init_by_name
+    assert init_by_name["harbor-seed"].image.startswith("docker:")
+    assert "dind-pull" in init_by_name
+    assert init_by_name["dind-pull"].image.startswith("docker:")
+
+    # 2. dind-engine and dind-pull must precede all untrusted task init/sidecar containers (no dind-cache-*)
+    assert not any(n.startswith("dind-cache-") for n in init_names)
+    idx_engine = init_names.index("dind-engine")
+    idx_pull = init_names.index("dind-pull")
+    idx_setup = init_names.index("setup-db")
+    idx_redis = init_names.index("redis")
+    idx_gate = init_names.index("compose-up-gate")
+
+    assert idx_engine < idx_pull < min(idx_setup, idx_redis)
+    assert max(idx_setup, idx_redis) < idx_gate
+
+    # 3. dind-pull script must pull images, scrub .docker, wait for .metadata-blocked, and handshake .netpol-applied
+    pull_script = init_by_name["dind-pull"].command[2]
+    assert 'DOCKER_CONFIG="/harbor/dind-images/.docker"' in pull_script
+    assert "touch /harbor/dind-images/.auth-scrubbed" in pull_script
+    assert "rm -rf /harbor/dind-images/.docker" in pull_script
+    assert "/harbor/dind-images/.metadata-blocked" in pull_script
+    assert "/harbor/dind-images/.ready-for-netpol" in pull_script
+    assert "/harbor/dind-images/.netpol-applied" in pull_script
+

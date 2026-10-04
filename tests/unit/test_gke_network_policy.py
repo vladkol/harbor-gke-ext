@@ -448,7 +448,7 @@ async def test_apply_network_policy_uses_policy_key_for_names_and_pod_name_for_o
 async def test_dns_egress_rule_default_and_extra_cidrs():
     from harbor_gke_ext.network_policy import apply_network_policy
 
-    async def _run_policy(extra_cidrs=None):
+    async def _run_policy(extra_cidrs=None, kube_dns_cluster_ip=None):
         networking_api = MagicMock()
         custom_api = MagicMock()
         created = []
@@ -465,34 +465,56 @@ async def test_dns_egress_rule_default_and_extra_cidrs():
             pod_labels={"session": "job-abc"},
             network_policy=NetworkPolicy(
                 network_mode=NetworkMode.ALLOWLIST,
-                allowed_hosts=["10.0.0.1/32"],
+                allowed_hosts=["1.1.1.1/32"],
             ),
             policy_key="job-abc",
             dns_egress_extra_cidrs=extra_cidrs,
+            kube_dns_cluster_ip=kube_dns_cluster_ip,
         )
         return created[0].spec.egress[-1]
 
-    # Default: cluster/VPC DNS ranges only, never 8.8.8.8/8.8.4.4
-    rule = await _run_policy()
+    # WP-5 (F-09): Default opens only kube-system DNS pods + link-local DNS + discovered kube-dns ClusterIP,
+    # NEVER broad RFC1918/CGNAT ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, 34.118.224.0/20).
+    rule = await _run_policy(kube_dns_cluster_ip="10.96.0.10")
     assert rule.to[0].namespace_selector.match_labels == {
         "kubernetes.io/metadata.name": "kube-system"
     }
+    assert rule.to[0].pod_selector is not None
+    expr = rule.to[0].pod_selector.match_expressions[0]
+    assert expr.key == "k8s-app"
+    assert expr.operator == "In"
+    assert set(expr.values) == {"kube-dns", "node-local-dns"}
+
     cidrs = {peer.ip_block.cidr for peer in rule.to if peer.ip_block}
-    assert {
+    assert cidrs == {
+        "169.254.20.10/32",
+        "169.254.169.254/32",
+        "10.96.0.10/32",
+    }
+    for forbidden in (
         "10.0.0.0/8",
         "172.16.0.0/12",
         "192.168.0.0/16",
         "169.254.0.0/16",
         "100.64.0.0/10",
         "34.118.224.0/20",
-    } == cidrs
-    assert "8.8.8.8/32" not in cidrs
-    assert "8.8.4.4/32" not in cidrs
+        "8.8.8.8/32",
+        "8.8.4.4/32",
+    ):
+        assert forbidden not in cidrs
     assert all(p.port == 53 for p in rule.ports)
 
-    r_extra = await _run_policy(extra_cidrs=["198.18.0.10/32"])
+    r_extra = await _run_policy(
+        extra_cidrs=["198.18.0.10/32"],
+        kube_dns_cluster_ip="34.118.224.10",
+    )
     extra_cidrs = {peer.ip_block.cidr for peer in r_extra.to if peer.ip_block}
-    assert "198.18.0.10/32" in extra_cidrs
+    assert extra_cidrs == {
+        "169.254.20.10/32",
+        "169.254.169.254/32",
+        "34.118.224.10/32",
+        "198.18.0.10/32",
+    }
 
 
 @pytest.mark.unit

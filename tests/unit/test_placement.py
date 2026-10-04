@@ -356,3 +356,51 @@ def test_default_gpu_count_fallback_when_compose_declares_count_all() -> None:
     assert resolved.gpus == 1
     assert resolved.accelerator_label == "nvidia-l4"
     assert resolved.gpu_services == ("main",)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("/etc/passwd", "/logs"),
+        ("/etc/passwd", "/logs/verifier"),
+        ("/var/run/docker.sock", "/logs/agent"),
+        ("/logs/../../etc/shadow", "/logs/verifier"),
+        ("symlink_escape", "/workspace"),
+    ],
+)
+def test_bind_mount_logs_bypass_rejected(
+    tmp_path: Path, source: str, target: str
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "secret.txt"
+    outside_file.write_text("secret", encoding="utf-8")
+
+    task_dir = tmp_path / "task"
+    env_dir = task_dir / "environment"
+    env_dir.mkdir(parents=True)
+    if source == "symlink_escape":
+        link = env_dir / "escaped_link"
+        link.symlink_to(outside_file)
+        actual_source = str(link)
+    else:
+        actual_source = source
+
+    project = {
+        "services": {
+            "main": {
+                "image": "alpine:3",
+                "volumes": [
+                    {"type": "bind", "source": actual_source, "target": target}
+                ],
+            }
+        }
+    }
+    with pytest.raises(UnsupportedComposeFeatureError) as exc_info:
+        classify_compose_placement(project, task_dir=task_dir, base_dir=env_dir)
+    assert any(
+        "ABSOLUTE_BIND" in c or "BIND_MOUNT_OUT_OF_TREE" in c
+        for c in exc_info.value.causes
+    )
+

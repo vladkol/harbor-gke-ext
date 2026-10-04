@@ -73,16 +73,16 @@ How CPU and memory budgets from `task.toml` (`cpus`, `memory_mb`) translate into
 | Mode | What `GKEEnvironment` emits | Behavior on GKE Standard | Behavior on GKE Autopilot |
 |---|---|---|---|
 | `--cpus auto --memory auto` (default) | `_GKE_DEFAULT_RESOURCE_AUTO_MODE = ResourceMode.GUARANTEE`: sets `requests = limits = declared budget` (unless `cpu_limit_multiplier` or `memory_limit_multiplier` raises the limit above the request). | Capped at the declared budget (`Guaranteed` QoS on direct Pods when no multipliers are set; eligible for `cpuManagerPolicy: static`). | Capped at the declared budget (or rounded up by Autopilot Warden if below the class minimum). |
-| `--cpus guarantee --memory guarantee` | Explicitly sets `requests = limits = declared budget` on the `main` container (for direct Pods) or `spec.resources` (for Compose Pods). `cpu_limit_multiplier` and `memory_limit_multiplier` are ignored. | Capped at the declared budget (`Guaranteed` QoS). | Capped at the declared budget. |
+| `--cpus guarantee --memory guarantee` | Explicitly sets `requests = limits = declared budget` on the `main` container (for direct Pods; for Compose Pods the budget goes on `main` and `spec.resources` covers it plus every other container). `cpu_limit_multiplier` and `memory_limit_multiplier` are ignored. | Capped at the declared budget (`Guaranteed` QoS). | Capped at the declared budget. |
 | `--cpus request --memory request` (direct Pods) | Sets `requests = declared budget` on `spec.resources` and **omits `limits`**. `cpu_limit_multiplier` and `memory_limit_multiplier` are ignored. | Uncapped (`Burstable` QoS): the Pod reserves its declared budget for scheduling but can burst into idle node CPU and memory. | Autopilot raises `requests` to its minimums. On clusters that support [Pod bursting](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/pod-bursting-gke#availability-in-gke) (GKE `1.30.2-gke.1394000` or later with cgroup v2), Autopilot doesn't set `limits`, so the Pod can burst into the node's burstable capacity (unused requests of Pods on the node). On clusters that don't support bursting, Autopilot sets `limits = requests`. GKE documents this for container resources; it hasn't been measured for Pod-level `spec.resources`. |
-| `--cpus request --memory request` (Compose Pods) | Sets `requests = declared budget` on `spec.resources`, and sets `limits` to the larger of the request, the aggregate of per-container limits, and (for memory with `dind-engine`) the `8192 MiB` DinD floor. With no container limits declared, `limits = requests`. | Capped at the Pod-level limit. | Capped at the Pod-level limit. |
+| `--cpus request --memory request` (Compose Pods, Shapes A, B and C) | `main` reserves the declared budget without a limit. `spec.resources.requests` is the larger of the budget and the aggregate container requests; `limits` is the larger of that request and the aggregate of per-container ceilings (limit, else request; for `dind-engine`, the daemon baseline plus the ceilings of the DinD services). With no container limits declared, `limits = requests`. See [Docker-in-Docker](docker-in-docker.md#resource-model-and-volume-topology). | Capped at the Pod-level limit. | Capped at the Pod-level limit (DinD not validated, see below). |
 
 > [!IMPORTANT]
 > Whether `--cpus auto --memory auto` remains mapped to `ResourceMode.GUARANTEE` (`requests = limits = declared budget`, matching Harbor's Docker environment) or switches back to `ResourceMode.REQUEST` is an open question pending final benchmark validation.
 
 ### Multi-container Compose budgets on Autopilot (`spec.resources`)
 
-For multi-container Compose Pods, `build_pod_level_resources()` places the task-wide CPU and memory budget on the Pod (`spec.resources`, KEP-2837, beta in Kubernetes 1.34+) rather than dividing synthetic slices across individual containers.
+For every multi-container Compose Pod (Shapes A, B and C), the task budget goes on `main`, as in Harbor's Docker environment, and `build_pod_level_resources()` puts a host-wide request and ceiling on the Pod (`spec.resources`, KEP-2837, beta in Kubernetes 1.34+) that cover `main` plus every other container, rather than dividing synthetic slices across individual containers.
 
 On GKE Autopilot, the `autopilot-default-resources-mutator` webhook injects `500m` CPU and `2Gi` memory into every container that declares neither a request nor a limit. With Pod-level resources, the API server then rejects the Pod whenever that injected aggregate exceeds `spec.resources.requests` (`spec.resources.requests[memory]: Invalid value: "4Gi": must be greater than or equal to aggregate container requests of 14Gi`). Measured on GKE Autopilot `1.35.8` with a 7-container Pod and a `2` CPU / `4Gi` budget:
 
@@ -93,6 +93,8 @@ On GKE Autopilot, the `autopilot-default-resources-mutator` webhook injects `500
 | `Performance`, accelerator (GPU) | No | Admitted |
 
 To keep the task budget as the effective cap, `build_pod_level_resources(..., is_autopilot=True)` gives every container that declares neither a request nor a limit for a resource a token `1m` CPU / `1Mi` memory request, but only for resources that reach `spec.resources`. Declared Compose values are never changed, and GKE Standard is never floored. Autopilot may still raise individual containers to its own per-container minimums (measured up to `246m` / `1020Mi` on `Scale-Out`), so a task budget below those minimums can still be rejected.
+
+DinD Pods (Shapes B and C) carry `spec.resources` too, so their undeclared Harbor infrastructure containers receive the same token requests. DinD on Autopilot also requires a `WorkloadAllowlist`, and this combination has not been measured.
 
 ## ComputeClass resolution and ephemeral storage
 

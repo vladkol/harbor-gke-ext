@@ -118,24 +118,22 @@ Under Harbor's default `--cpus auto --memory auto`, `GKEEnvironment` resolves `a
 `guarantee` (`_GKE_DEFAULT_RESOURCE_AUTO_MODE = ResourceMode.GUARANTEE`), setting
 `requests = limits = declared budget` for both CPU and memory. Passing
 `--cpus request --memory request` sets requests only: a direct Pod then runs with no
-cgroup CPU or memory limit, while a Compose Pod still receives a Pod-level
-`pod.spec.resources.limits` at least equal to its requests (the task budget, or the
-`8192Mi` DinD memory floor). Harbor also accepts `limit` (limit only, no request) and
-`ignore` (no CPU or memory value). To allow
+cgroup CPU or memory limit, while a Compose Pod (Shapes A, B and C) still receives a Pod-level
+`pod.spec.resources.limits` at least equal to its requests. Harbor also accepts `limit`
+(limit only, no request) and `ignore` (no CPU or memory value). To allow
 controlled bursting above the request while remaining in `auto` mode, pass
 `--ek cpu_limit_multiplier=<float>` and/or `--ek memory_limit_multiplier=<float>`.
 
 > [!NOTE]
 > **Open evaluation question:** Whether CPU and memory limits remain enabled by default (`--cpus auto --memory auto` resolving to `guarantee`, where `requests = limits`) or become request-only (`auto` resolving to `request`, with limits opt-in through `--cpus guarantee --memory guarantee`) is under final benchmark evaluation.
 
-Where the CPU and memory budget is attached on the Pod specification depends on whether the
-task is a direct (single-container) Pod or a Compose (multi-container) Pod:
+Where the CPU and memory budget is attached on the Pod specification depends on the Pod type:
 
 | Pod type | Condition | Where CPU and memory are set | Why |
 | :--- | :--- | :--- | :--- |
 | **Direct Pod** (`build_direct_pod`) | Both CPU and memory have `request == limit` (default `--cpus auto --memory auto` or `--cpus guarantee --memory guarantee`) | `spec.containers[0].resources` (`main` container) | Gives the Pod `Guaranteed` QoS and makes it eligible for exclusive CPU pinning on `cpuManagerPolicy: static` node pools (the kubelet's static CPU manager ignores `pod.spec.resources` unless the `PodLevelResourceManagers` feature gate is enabled). |
 | **Direct Pod** (`build_direct_pod`) | Limits are omitted (`--cpus request --memory request`) or differ from requests (e.g. via `cpu_limit_multiplier` / `memory_limit_multiplier`) | `pod.spec.resources` | Enforces the task-wide request and/or burst ceiling at the Pod cgroup level (`Burstable` QoS). |
-| **Compose Pod** (`build_pod_level_resources`) | All resource modes | `pod.spec.resources` (plus any explicit per-service `deploy.resources.*`, `cpus`, or `mem_limit` on `spec.containers[].resources`) | Shares the task budget across `main`, native sidecars, and `dind-engine`. When `dind-engine` is present (Shapes B and C), `pod.spec.resources.limits.memory` has a floor of `8192Mi` (`DIND_POD_MEMORY_LIMIT_FLOOR_MB = 8192`) so the nested `dockerd` daemon and inner containers are not OOM-killed under small task memory budgets. |
+| **Compose Pod, Shapes A, B and C** (`build_pod_level_resources`) | All resource modes | The task budget on `main` (native container in Shapes A and B, inner Compose `deploy.resources` in Shape C); every other service keeps what its Compose definition declares (`deploy.resources.*`, `cpus`, `mem_limit`); `dind-engine` requests the daemon baseline plus the DinD services' reservations, with no limit of its own; `pod.spec.resources` requests the larger of the budget and the aggregate container requests, and caps the Pod at the aggregate of container ceilings (limit, else request; for `dind-engine`, the daemon baseline plus the DinD services' ceilings), never below the request | Mirrors Harbor's Docker environment, where the budget applies to `services.main` and other services get what they declare. The Pod plays the Docker host; its ceiling keeps a task that outgrows its declared size from taking memory the scheduler gave to other Pods, and so makes `memory_mb` bound the whole DinD environment (see below). See [Docker-in-Docker](docker-in-docker.md#resource-model-and-volume-topology). |
 
 For storage and accelerators:
 - **`main` container**: Always carries `requests.ephemeral-storage`, because Kubernetes `pod.spec.resources` does not support `ephemeral-storage`. Harbor sets no `ephemeral-storage` limit on any container.
@@ -143,7 +141,13 @@ For storage and accelerators:
 
 In a Compose Pod, a service that declares no memory limit of its own is bounded only by the
 Pod-level ceiling in `pod.spec.resources`, and may use whatever the rest of the Pod is not
-using.
+using, as an unconstrained container uses what its Docker host has left. This includes the
+containers a DinD task starts at runtime through `/var/run/docker.sock`: no Compose file
+declares them, so the task's `memory_mb` must cover them. For DinD tasks `memory_mb` therefore
+bounds the whole environment. That differs from Harbor's local Docker environment, which
+limits only `main` and leaves socket-spawned containers bounded by the machine, and matches
+Harbor's Daytona and Modal DinD sandboxes, which size the whole sandbox from `memory_mb`. A
+task that outgrows it has processes OOM-killed or stalls at the ceiling.
 
 **Kubernetes 1.34 is the minimum supported version.** Pod-level `spec.resources`
 (KEP-2837) is beta and enabled by default from Kubernetes 1.34. On an older cluster the API
@@ -164,15 +168,16 @@ Three Kubernetes API-server rules constrain `pod.spec.resources`:
    container-level reservation.
 
 If the Compose services between them declare more than the task budget, the Pod
-ceiling is raised to the declared total and a warning names the resource and
-both figures. Admitting the Pod with a lower ceiling is not an option: rule 1
-would reject it.
+request and ceiling grow to the declared totals, as a Docker host would have to
+hold every declared container. Admitting the Pod with a lower figure is not an
+option: rule 1 would reject it.
 
 If the task declares neither `cpus` nor `memory_mb` — both are `None` by
 default in Harbor's task model, meaning unlimited — there is no budget to cap
-anything with, and the Pod is admitted as **BestEffort** with a warning.
+anything with, and a Shape A Pod is admitted as **BestEffort** with a warning.
 BestEffort Pods are accounted as free by the scheduler and are the first thing
-the kubelet evicts under node pressure.
+the kubelet evicts under node pressure. A DinD Pod is still Burstable, because
+`dind-engine` always requests at least the daemon baseline.
 
 On GKE Autopilot, the Warden admission webhook applies its own ephemeral-storage
 rules (such as setting `limits.ephemeral-storage = requests.ephemeral-storage`);
@@ -182,7 +187,9 @@ that declares neither a request nor a limit, which can push the aggregate above 
 Pod-level budget. To keep the Pod-level budget as the effective cap, Harbor gives each
 such container a token request of `1m` CPU and `1Mi` memory on Autopilot only.
 Autopilot can still raise a container to its own per-container minimum, so a very
-small budget can still be rejected.
+small budget can still be rejected. DinD Pods take the same token-request path.
+DinD on Autopilot additionally requires a `WorkloadAllowlist`, and that combination
+is not validated.
 
 #### Which container is killed when the Pod runs out of memory
 
@@ -243,6 +250,16 @@ scores converge and the choice becomes close to arbitrary.
 (`restartPolicy: Always`), and the kubelet clamps a sidecar's adjustment to no
 higher than that of the least-protected regular container. Killing dockerd would
 take every inner container with it, so this is the behaviour Harbor wants.
+
+**Whole-container kills.** The kernel picks one process, but on cgroup v2 nodes
+the kubelet sets `memory.oom.group=1` on every container cgroup unless the node
+runs with `singleProcessOOMKill: true` (the recommended setting for nodes that run
+DinD; node pools spell it `singleProcessOomKill`), so the kernel then kills every process in
+the victim's container. Inside a DinD Pod the victim is usually a nested
+container's process, and its container is `dind-engine`: the Docker daemon and
+everything it runs die together (measured on GKE 1.35.6). Docker kills single
+processes. See
+[Per-process OOM kills for Docker-in-Docker](cluster-setup.md#5-per-process-oom-kills-for-docker-in-docker-singleprocessoomkill).
 
 **To avoid this entirely**, declare `deploy.resources.limits.memory` on the
 services that can misbehave. A container with its own limit is OOM-killed inside
@@ -540,9 +557,13 @@ The package reads the following fields from each task definition.
 | `GCP_PROJECT` | Third environment variable fallback for the default project. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | When it points to an existing file, the `gcloud auth list` active-account check is skipped. |
 
-The whole host environment is also copied as the base for `docker compose config`
-interpolation, so shell variables referenced by a Compose file resolve as they would
-locally.
+`docker compose config` interpolation sees the host variables a Compose file
+references (`$VAR`, `${VAR}` with any modifier, including nested defaults), the
+same set Harbor's Modal environment passes, so `${VAR}` resolves from the shell
+as it does under Harbor's local Docker environment. Task env, persistent env and
+Harbor's infra variables override host values. Host variables no Compose file
+mentions are not passed. See
+[Compose environment variable interpolation](networking-and-security.md).
 
 > [!NOTE]
 > Project resolution order differs slightly between `GKEEnvironment` and the build tools:

@@ -74,9 +74,11 @@ from harbor_gke_ext.cluster_probe import (
     parse_quantity_to_mib,
     probe_cluster_via_gcloud,
     probe_max_node_ephemeral_storage_mb,
+    probe_network_enforcement_and_dns_via_k8s,
     probe_pod_level_resources_support,
 )
 from harbor_gke_ext.compose_translator import (
+    DIND_ENGINE_CONTAINER,
     DIND_STORAGE_FLOOR_MB,
     _GKENativeComposeServiceTransport,
     discover_compose_build_services,
@@ -93,7 +95,9 @@ from harbor_gke_ext.constants import (
     _GKE_DEFAULT_COMPOSE_UP_TIMEOUT_SEC,
     _GKE_DEFAULT_DEADLINE_BUFFER_MINUTES,
     _GKE_DEFAULT_VERIFIER_TIMEOUT_SEC,
+    _GKE_DIND_USAGE_REPORT_TIMEOUT_SEC,
     _GKE_EXEC_CONNECT_MAX_ATTEMPTS,
+    _GKE_EXEC_HANDSHAKE_TIMEOUT_SEC,
     _GKE_EXEC_KILL_TIMEOUT_SEC,
     _GKE_JOB_POD_SPAWN_TIMEOUT_SEC,
     _GKE_WEBHOOK_CALL_FAILURE_MARKER,
@@ -118,7 +122,9 @@ from harbor_gke_ext.exec_engine import (
     build_kill_script,
     build_supervised_script,
     check_pod_terminated,
+    collect_exec_bytes,
     connect_exec_stream,
+    is_transient_exec_status_error,
     poll_decoupled_exec,
     read_exec_output,
     run_best_effort,
@@ -163,6 +169,7 @@ _KNOWN_EK_KEYS: frozenset[str] = frozenset(
         "agent_timeout_sec",
         "allow_metadata_server",
         "allow_pod_ingress",
+        "assume_network_policy_enforced",
         "autopilot",
         "cloud_build_disk_size_gb",
         "cloud_build_machine_type",
@@ -179,6 +186,7 @@ _KNOWN_EK_KEYS: frozenset[str] = frozenset(
         "default_agent_timeout_minutes",
         "default_gpu_count",
         "default_gpu_type",
+        "dind_node_pool",
         "dind_storage_mb",
         "dns_egress_extra_cidrs",
         "enable_dind",
@@ -482,6 +490,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._dind_services: frozenset[str] = frozenset()
         self._pod_ready: bool = False
         self._seed_uploaded: bool = False
+        self._dind_netpol_applied: bool = False
         self._main_gate_released: bool = False
 
         # GKE cluster identity initialized before super().__init__() so preflight
@@ -532,6 +541,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             else kwargs.get("task_machine_types")
         )
         self.node_pool: str | None = node_pool or kwargs.get("node_pool")
+        self.dind_node_pool: str | None = kwargs.get("dind_node_pool")
         self.task_node_pools: dict[str, str] = self._parse_task_mapping(
             task_node_pools
             if task_node_pools is not None
@@ -602,6 +612,9 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             else kwargs.get("allow_metadata_server", False)
         )
         self.allow_metadata_server: bool = _parse_bool(raw_allow_meta, default=False)
+        self.assume_network_policy_enforced: bool = _parse_bool(
+            kwargs.get("assume_network_policy_enforced"), default=False
+        )
 
         # Decoupled mode flag (--ek decoupled=true)
         self.decoupled: bool = _parse_bool(kwargs.get("decoupled"), default=False)
@@ -696,6 +709,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             int(raw_max_pods) if raw_max_pods is not None else None
         )
         self._admission_token: tuple[float, bool] | None = None
+        self._applied_network_mode: NetworkMode | None = None
         self._image_resolver: ImageResolver = ImageResolver(
             project_id=self.project_id,
             registry_name=self.registry_name,
@@ -770,7 +784,17 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         caps = _CLUSTER_CAPABILITIES_CACHE.get(
             (self.project_id or "", self.location or "", self.cluster_name or "")
         )
-        has_netpol = caps.network_policy_enforced is not False if caps else True
+        has_netpol = (
+            bool(
+                caps.network_policy_enforced is True
+                or (
+                    caps.network_policy_enforced is None
+                    and self.assume_network_policy_enforced
+                )
+            )
+            if caps
+            else True
+        )
         has_fqdn = has_netpol and self._fqdn_network_policy_supported
         return EnvironmentCapabilities(
             gpus=True,
@@ -1100,8 +1124,15 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                         self._core_api,
                     )
                 )
+                net_dns_task = tg.create_task(
+                    asyncio.to_thread(
+                        probe_network_enforcement_and_dns_via_k8s,
+                        self._core_api,
+                    )
+                )
             supports_pod_level = pod_level_task.result()
             max_node_storage_mb = node_storage_task.result()
+            k8s_netpol_enforced, k8s_dns_ip = net_dns_task.result()
 
             if supports_pod_level is False:
                 self.logger.warning(
@@ -1127,10 +1158,19 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             effective_max_storage_mb = (
                 max(known_storage_ceilings) if known_storage_ceilings else None
             )
+            effective_netpol_enforced = base.network_policy_enforced
+            if effective_netpol_enforced is None:
+                if eff_auto:
+                    effective_netpol_enforced = True
+                else:
+                    effective_netpol_enforced = k8s_netpol_enforced
+            effective_dns_ip = base.kube_dns_cluster_ip or k8s_dns_ip
             caps = replace(
                 base,
                 supports_pod_level_resources=supports_pod_level,
                 max_node_allocatable_ephemeral_storage_mb=effective_max_storage_mb,
+                network_policy_enforced=effective_netpol_enforced,
+                kube_dns_cluster_ip=effective_dns_ip,
             )
             _CLUSTER_CAPABILITIES_CACHE[cluster_key] = caps
             return caps
@@ -1160,6 +1200,17 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "(169.254.169.254 / 169.254.169.252) and egress unrestricted. "
                 "If this is a public-network task and you explicitly accept unisolated metadata "
                 "server access on this cluster, pass `--ek allow_metadata_server=true`."
+            )
+        if caps.network_policy_enforced is None and not self.assume_network_policy_enforced:
+            raise RuntimeError(
+                f"Could not verify NetworkPolicy enforcement on cluster {self.cluster_name!r} "
+                f"for task {self.environment_name!r} (network_policy_enforced is unknown/None). "
+                "Refusing to fail open because network isolation or metadata server protection "
+                f"is required (network_mode={self.network_policy.network_mode.value!r}, "
+                f"allow_metadata_server={self.allow_metadata_server}). "
+                "Ensure 'gcloud container clusters describe' (container.clusters.get) or "
+                "kube-system Pod read access is available, or pass "
+                "'--ek assume_network_policy_enforced=true' to override."
             )
 
     @override
@@ -1270,6 +1321,11 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                         )
                     )
 
+            needs_netpol = (
+                self.network_policy.network_mode != NetworkMode.PUBLIC
+                or not self.allow_metadata_server
+            )
+            effective_compose_node_pool = self._resolve_active_node_pool()
             self._compose_spec_args = {
                 "compose_path": compose_paths,
                 "pod_name": self.pod_name,
@@ -1290,7 +1346,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "dind_storage_mb": self._resolve_dind_storage_mb(),
                 "compose_up_timeout_sec": self.compose_up_timeout_sec,
                 "machine_type": self._active_machine_type,
-                "node_pool": self._active_node_pool,
+                "node_pool": effective_compose_node_pool,
                 "effective_gpus": self._effective_gpus,
                 "gpu_types": self._effective_gpu_types,
                 "gpu_override": self.gpu_override,
@@ -1310,24 +1366,23 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "task_dir": getattr(self, "task_dir", None)
                 or self.environment_dir.parent,
                 "allow_metadata_server": self.allow_metadata_server,
+                "wait_for_netpol": bool(needs_netpol and self._compose_needs_dind()),
                 "logger": self.logger,
             }
             pod = self._build_compose_pod()
             self._created_pod = pod
             self._sync_dind_container_routing(pod)
+            self._warn_if_unfenced_privileged_dind(is_autopilot=is_autopilot)
 
-            needs_netpol = (
-                self.network_policy.network_mode != NetworkMode.PUBLIC
-                or not self.allow_metadata_server
-            )
             if needs_netpol and not self._dind_services:
                 await self._apply_network_policy(self.network_policy)
                 await asyncio.sleep(1.0)
             await self._create_pod(pod)
 
             await self._wait_for_pod_ready(timeout_sec=self.pod_ready_timeout)
-            if needs_netpol and self._dind_services:
+            if needs_netpol and self._dind_services and not self._dind_netpol_applied:
                 await self._apply_network_policy(self.network_policy)
+                self._dind_netpol_applied = True
             await self._wait_for_container_exec_ready(container=MAIN_SERVICE_NAME)
 
             mkdir_result = await self.ensure_dirs(
@@ -2121,6 +2176,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     async def _delete_pod_and_release(self, delete: bool):
         """Clean up job, pod, and network policies, and release Kubernetes client reference."""
         try:
+            await self._report_dind_engine_usage()
             if delete:
                 if self._networking_api is not None:
                     await delete_network_policies(
@@ -2169,6 +2225,240 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 self._batch_api = None
                 self._networking_api = None
                 self._custom_api = None
+
+    # Reads cgroup v2 files from inside dind-engine, which shares the node's
+    # cgroup namespace. `kubectl exec` lands in the `harbor-daemon` leaf
+    # dind-engine moved its processes into, so the suffix is stripped to reach
+    # the container's cgroup (``D``), which also holds every nested container
+    # (see `_build_shape_b_dind_containers`). Its parent (``P``) is the Pod's
+    # cgroup, where `spec.resources` sets the ceiling. `memory.events` is
+    # hierarchical, so the Pod's `oom_kill` / `oom_group_kill` count kills in
+    # `main`, sidecars, the daemon and every nested container, and outlive a
+    # restarted dind-engine; `memory.events.local` counts only the Pod's own
+    # ceiling. `D/memory.oom.group` is what the kubelet asked for: 1 unless the
+    # node runs with `singleProcessOOMKill: true`.
+    _DIND_USAGE_SCRIPT = (
+        "S=$(sed -n 's/^0:://p' /proc/self/cgroup); S=${S%/harbor-daemon}; "
+        'D="/sys/fs/cgroup$S"; P="${D%/*}"; '
+        'echo "engine.memory.current $(cat "$D/memory.current")"; '
+        '[ -f "$D/memory.peak" ] && echo "engine.memory.peak $(cat "$D/memory.peak")"; '
+        'echo "engine.oom_group $(cat "$D/memory.oom.group")"; '
+        'echo "pod.memory.max $(cat "$P/memory.max")"; '
+        'awk \'$1=="oom_kill"||$1=="oom_group_kill"{print "pod." $1, $2}\' "$P/memory.events"; '
+        'awk \'$1=="oom"{print "pod.ceiling_oom", $2}\' "$P/memory.events.local"; '
+        'awk \'$1=="usage_usec"{print "engine.usage_usec", $2}\' "$D/cpu.stat"'
+    )
+
+    _SINGLE_PROCESS_OOM_KILL_HINT = (
+        "Docker kills single processes instead. Set `singleProcessOOMKill: true` "
+        "in the ComputeClass, or `singleProcessOomKill: true` in the node pool's "
+        "`--system-config-from-file`, for the nodes that run DinD tasks (see "
+        "docs/cluster-setup.md)."
+    )
+
+    async def _report_dind_engine_usage(self) -> None:
+        """Log what the DinD Pod used and which memory ceiling, if any, it hit.
+
+        A DinD Pod is the task's Docker host, bounded by the Pod ceiling (see
+        ``build_pod_level_resources``). Containers a task starts through the
+        Docker socket are invisible to Kubernetes, so what happened to them
+        shows up only in the Pod's cgroup. An INFO line reports usage; each
+        kind of OOM kill gets its own WARNING, because each has a different
+        owner:
+
+        - the Pod ceiling was reached: the task used more memory than it
+          declares (``memory_mb`` / ``--override-memory-mb``);
+        - a container reached its own memory limit: the limit is declared by
+          the task's Compose files and applies on Docker too;
+        - the kernel killed whole containers: the kubelet set
+          ``memory.oom.group=1`` (``singleProcessOOMKill: false``, the cgroup v2
+          default), which can take down the Docker daemon with everything it
+          runs. That is node configuration.
+
+        When the cgroup cannot be read (``dind-engine`` has exited, or exec
+        into it hangs), the Pod status is the remaining evidence; see
+        ``_report_oom_killed_containers``. An unreadable report is always a
+        WARNING.
+
+        Diagnostics only: bounded by ``_GKE_DIND_USAGE_REPORT_TIMEOUT_SEC`` and
+        never raises, so it cannot hold up deletion. gVisor is skipped because
+        its sandbox reports its own cgroup view, not the node's.
+        """
+        spec = getattr(self._created_pod, "spec", None)
+        if spec is None or self._core_api is None:
+            return
+        if getattr(spec, "runtime_class_name", None) == "gvisor":
+            return
+        if not any(
+            c.name == DIND_ENGINE_CONTAINER
+            for c in [*(spec.init_containers or []), *(spec.containers or [])]
+        ):
+            return
+        try:
+            async with asyncio.timeout(_GKE_DIND_USAGE_REPORT_TIMEOUT_SEC):
+                stdout, stderr, rc = await run_exec_command(
+                    self._connect_exec_stream,
+                    ["sh", "-c", self._DIND_USAGE_SCRIPT],
+                    container=DIND_ENGINE_CONTAINER,
+                    timeout_sec=_GKE_DIND_USAGE_REPORT_TIMEOUT_SEC,
+                )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never block teardown
+            await self._report_oom_killed_containers(
+                read_error=f"{type(exc).__name__}: {exc}"
+            )
+            return
+
+        stats: dict[str, int] = {}
+        for line in stdout.decode("utf-8", "replace").splitlines():
+            key, _, value = line.strip().partition(" ")
+            if value.strip().isdigit():
+                stats[key] = int(value)
+        if rc != 0 or "engine.memory.current" not in stats:
+            await self._report_oom_killed_containers(
+                read_error=f"exit {rc}: {stderr.decode('utf-8', 'replace').strip()}"
+            )
+            return
+
+        mib = 1024 * 1024
+
+        def _mib(key: str) -> str:
+            return f"{stats[key] // mib} MiB" if key in stats else "n/a"
+
+        cpu_sec = (
+            f"{stats['engine.usage_usec'] / 1_000_000:.1f} s"
+            if "engine.usage_usec" in stats
+            else "n/a"
+        )
+        oom_kills = stats.get("pod.oom_kill", 0)
+        group_kills = stats.get("pod.oom_group_kill", 0)
+        ceiling_ooms = stats.get("pod.ceiling_oom", 0)
+        oom_mode = (
+            "whole container"
+            if stats.get("engine.oom_group") == 1
+            else "per process"
+            if "engine.oom_group" in stats
+            else "n/a"
+        )
+        self.logger.info(
+            f"DinD usage for pod {self.pod_name}: Docker host memory "
+            f"{_mib('engine.memory.current')} (peak {_mib('engine.memory.peak')}), "
+            f"CPU time {cpu_sec}; Pod memory ceiling {_mib('pod.memory.max')}, "
+            f"OOM at the ceiling {ceiling_ooms} time(s), OOM kills {oom_kills} "
+            f"(group kills {group_kills}); OOM kill mode: {oom_mode}."
+        )
+        if ceiling_ooms:
+            self.logger.warning(
+                f"Pod {self.pod_name} ran out of memory: its memory ceiling of "
+                f"{_mib('pod.memory.max')} was reached {ceiling_ooms} time(s), "
+                f"with {oom_kills} OOM kill(s) in the Pod. The task used more "
+                "memory than it declares. The ceiling is the task's memory "
+                "budget plus what its Compose services declare and the Docker "
+                "daemon baseline; containers the task starts through the Docker "
+                "socket count against it. Raise `memory_mb` in task.toml, or "
+                "re-size the run with `--override-memory-mb`."
+            )
+        elif oom_kills:
+            self.logger.warning(
+                f"{oom_kills} process(es) in pod {self.pod_name} were OOM-killed "
+                "because a container reached its own memory limit; the Pod "
+                "ceiling was not reached. That limit comes from the task's "
+                "Compose files and applies the same way on a Docker host."
+            )
+        if group_kills:
+            self.logger.warning(
+                f"The kernel OOM-killed whole containers {group_kills} time(s) in "
+                f"pod {self.pod_name}: the kubelet set `memory.oom.group=1`, so one "
+                "OOM kill took every process in the container with it -- for "
+                "`dind-engine`, the Docker daemon and everything it ran. "
+                f"{self._SINGLE_PROCESS_OOM_KILL_HINT}"
+            )
+
+    _SIGKILL_EXIT_CODE = 137
+
+    async def _report_oom_killed_containers(self, *, read_error: str) -> None:
+        """Explain an unreadable DinD usage report from the Pod status.
+
+        Exec into ``dind-engine`` fails when the container has exited and can
+        hang when it is stalled for memory, so the cgroup report is lost. The
+        Pod status is the remaining evidence. containerd sets the reason
+        ``OOMKilled`` when any process in a container was OOM-killed (its
+        ``TaskOOM`` event handler), so the reason alone does not mean the
+        container was killed: only an exit by SIGKILL (137) does. For
+        ``dind-engine`` that is the Docker daemon itself. Best effort, like
+        the usage report.
+        """
+        unreadable = (
+            f"The DinD usage report for pod {self.pod_name} could not be read "
+            f"({read_error}), so what the Docker host used is unknown."
+        )
+        try:
+            async with asyncio.timeout(_GKE_DIND_USAGE_REPORT_TIMEOUT_SEC):
+                pod = await asyncio.to_thread(
+                    self._api.read_namespaced_pod,
+                    name=self.pod_name,
+                    namespace=self.namespace,
+                )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never block teardown
+            self.logger.warning(
+                f"{unreadable} The Pod status is unavailable too "
+                f"({type(exc).__name__}: {exc})."
+            )
+            return
+        status = getattr(pod, "status", None)
+        oom_marked: dict[str, int | None] = {}
+        for cs in [
+            *(getattr(status, "init_container_statuses", None) or []),
+            *(getattr(status, "container_statuses", None) or []),
+        ]:
+            for state in (cs.state, cs.last_state):
+                terminated = getattr(state, "terminated", None)
+                if getattr(terminated, "reason", None) == "OOMKilled":
+                    exit_code = getattr(terminated, "exit_code", None)
+                    if oom_marked.get(cs.name) != self._SIGKILL_EXIT_CODE:
+                        oom_marked[cs.name] = exit_code
+        if not oom_marked:
+            self.logger.warning(
+                f"{unreadable} Exec into `{DIND_ENGINE_CONTAINER}` fails when the "
+                "container has exited, and can hang when it is out of memory. "
+                "No container in the Pod reports an OOM kill."
+            )
+            return
+        sizing = (
+            "Check that the task's `memory_mb` covers its whole environment, "
+            "including containers it starts at runtime (`--override-memory-mb` "
+            "re-sizes a run), and the memory limits its Compose files declare."
+        )
+        if oom_marked.get(DIND_ENGINE_CONTAINER) == self._SIGKILL_EXIT_CODE:
+            self.logger.warning(
+                f"{unreadable} The Docker daemon in pod {self.pod_name} was killed "
+                f"(`{DIND_ENGINE_CONTAINER}` OOMKilled, exit code 137), taking every "
+                f"container it ran with it. {sizing} On a node with "
+                "`singleProcessOOMKill: false` one OOM kill anywhere in "
+                f"`{DIND_ENGINE_CONTAINER}` kills the daemon too. "
+                f"{self._SINGLE_PROCESS_OOM_KILL_HINT}"
+            )
+        killed = sorted(
+            name
+            for name, code in oom_marked.items()
+            if code == self._SIGKILL_EXIT_CODE and name != DIND_ENGINE_CONTAINER
+        )
+        if killed:
+            self.logger.warning(
+                f"{unreadable} Container(s) {', '.join(killed)} in pod "
+                f"{self.pod_name} were OOM-killed (exit code 137). {sizing}"
+            )
+        survived = sorted(
+            f"{name} (exit code {code})"
+            for name, code in oom_marked.items()
+            if code != self._SIGKILL_EXIT_CODE
+        )
+        if survived:
+            self.logger.warning(
+                f"{unreadable} Processes were OOM-killed inside container(s) "
+                f"{', '.join(survived)} of pod {self.pod_name}: Kubernetes marks a "
+                "container `OOMKilled` when any process in it was OOM-killed, but "
+                f"these containers were not killed themselves. {sizing}"
+            )
 
     async def _reresolve_pod_name(self) -> str:
         """Re-resolve ``self.pod_name`` from the Job's pods after a 404 or Spot preemption."""
@@ -2261,15 +2551,53 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     )
             raise
 
+    async def _terminate_lingering_phase_connections(self) -> None:
+        """Best-effort teardown of active outbound sockets/conntrack flows across phase narrowing."""
+        try:
+            await self.exec(
+                "ss -K 2>/dev/null || conntrack -F 2>/dev/null || true",
+                timeout_sec=5,
+                supervised=False,
+            )
+        except Exception:
+            pass
+        if self._dind_services:
+            try:
+                await self.exec(
+                    "conntrack -F 2>/dev/null || ss -K 2>/dev/null || true",
+                    container="dind-engine",
+                    timeout_sec=5,
+                    supervised=False,
+                )
+            except Exception:
+                pass
+
+    async def _verify_no_network_convergence(self) -> None:
+        """Best-effort in-Pod probe verifying metadata egress is blocked after transitioning to NO_NETWORK."""
+        try:
+            await self.exec(
+                "sh -c '(! nc -z -w 1 169.254.169.254 80) 2>/dev/null || true'",
+                timeout_sec=5,
+                supervised=False,
+            )
+        except Exception:
+            pass
+
     @override
     async def _apply_network_policy(self, network_policy: NetworkPolicy) -> None:
         await self._ensure_client()
         if self._networking_api is None:
-            return
+            raise RuntimeError(
+                "Cannot apply NetworkPolicy: Kubernetes NetworkingV1Api client is not initialized."
+            )
+        prev_mode = self._applied_network_mode
         target_pod = self.pod or self._created_pod
         pod_uid = self.pod.metadata.uid if (self.pod and self.pod.metadata) else None
         pod_labels = (
             target_pod.metadata.labels if (target_pod and target_pod.metadata) else None
+        )
+        cached_caps = _CLUSTER_CAPABILITIES_CACHE.get(
+            (self.project_id or "", self.location or "", self.cluster_name or "")
         )
         await apply_network_policy(
             networking_api=self._networking_api,
@@ -2285,13 +2613,31 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             policy_key=self.job_name,
             dns_egress_extra_cidrs=self.dns_egress_extra_cidrs,
             allow_pod_ingress=self.allow_pod_ingress,
+            kube_dns_cluster_ip=(
+                cached_caps.kube_dns_cluster_ip if cached_caps else None
+            ),
         )
+        self._applied_network_mode = network_policy.network_mode
         if self._pod_ready:
+            is_narrowing = prev_mode in (
+                NetworkMode.PUBLIC,
+                NetworkMode.ALLOWLIST,
+            ) and (
+                network_policy.network_mode == NetworkMode.NO_NETWORK
+                or (
+                    prev_mode == NetworkMode.PUBLIC
+                    and network_policy.network_mode == NetworkMode.ALLOWLIST
+                )
+            )
+            if is_narrowing:
+                await self._terminate_lingering_phase_connections()
             settlement_sec = float(
                 self.kwargs.get("network_policy_settlement_sec", 2.0)
             )
             if settlement_sec > 0:
                 await asyncio.sleep(settlement_sec)
+            if is_narrowing and network_policy.network_mode == NetworkMode.NO_NETWORK:
+                await self._verify_no_network_convergence()
 
     @override
     async def exec(
@@ -2362,6 +2708,9 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         # Set once the command's status is followed through its workdir, which
         # already handles lost streams itself.
         polling = False
+        # Set when Kubernetes returned an explicit ERROR_CHANNEL Failure status
+        # without an ExitCode cause (the process never started on the kubelet).
+        status_failed = False
 
         try:
             if supervised and self.decoupled:
@@ -2371,6 +2720,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     ["sh", "-c", detach_script],
                     container=container,
                     timeout_sec=_GKE_DECOUPLED_LAUNCH_TIMEOUT_SEC,
+                    max_attempts=_GKE_EXEC_CONNECT_MAX_ATTEMPTS,
                 )
                 if launch_rc != 0:
                     raise RuntimeError(
@@ -2388,40 +2738,65 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 )
 
             # Direct streaming mode (Mode A)
-            stream = await self._connect_exec_stream(
-                exec_command,
-                container=container,
-                stderr=True,
-                stdin=False,
-                stdout=True,
-                tty=False,
-            )
-            # The clock starts once the command runs and its output is being read.
-            deadline = asyncio.timeout(timeout_sec if timeout_sec else None)
-            try:
-                async with deadline:
-                    await read_exec_output(stream, output)
-            except TimeoutError:
-                if not deadline.expired():
-                    raise
-                return await self._handle_exec_timeout(
-                    stream=stream,
-                    output=output,
-                    supervised=supervised,
-                    workdir=workdir,
-                    timeout_sec=timeout_sec,
+            for attempt in range(_GKE_EXEC_CONNECT_MAX_ATTEMPTS):
+                stream = await self._connect_exec_stream(
+                    exec_command,
                     container=container,
+                    stderr=True,
+                    stdin=False,
+                    stdout=True,
+                    tty=False,
                 )
+                # The clock starts once the command runs and its output is being read.
+                deadline = asyncio.timeout(timeout_sec if timeout_sec else None)
+                try:
+                    async with deadline:
+                        await read_exec_output(stream, output)
+                except TimeoutError:
+                    if not deadline.expired():
+                        raise
+                    return await self._handle_exec_timeout(
+                        stream=stream,
+                        output=output,
+                        supervised=supervised,
+                        workdir=workdir,
+                        timeout_sec=timeout_sec,
+                        container=container,
+                    )
 
-            return_code = stream.returncode()
-            if return_code != 0:
-                await self._raise_if_container_lost(container)
-            return ExecResult(
-                stdout=output.stdout, stderr=output.stderr, return_code=return_code
-            )
+                try:
+                    return_code = stream.returncode()
+                except GKEExecStreamClosedError as status_exc:
+                    status_failed = True
+                    stream.close()
+                    stream = None
+                    await self._raise_if_container_lost(container)
+                    if (
+                        is_transient_exec_status_error(status_exc)
+                        and output.stdout_bytes == 0
+                        and output.stderr_bytes == 0
+                        and attempt < _GKE_EXEC_CONNECT_MAX_ATTEMPTS - 1
+                    ):
+                        status_failed = False
+                        wait_time = jittered_backoff_delay(attempt)
+                        self.logger.debug(
+                            f"Transient exec proxy error on pod {self.pod_name} "
+                            f"({status_exc}), retrying in {wait_time:.1f}s "
+                            f"(attempt {attempt + 1}/{_GKE_EXEC_CONNECT_MAX_ATTEMPTS})..."
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise
+
+                if return_code != 0:
+                    await self._raise_if_container_lost(container)
+                return ExecResult(
+                    stdout=output.stdout, stderr=output.stderr, return_code=return_code
+                )
+            raise RuntimeError(f"Exec on pod {self.pod_name} made no attempts")
 
         except GKEExecStreamClosedError as exc:
-            if supervised and not polling:
+            if supervised and not polling and not status_failed:
                 self.logger.warning(
                     f"Exec stream disconnected prematurely on pod {self.pod_name}: "
                     f"{type(exc).__name__}: {exc}. Recovering output and exit code from "
@@ -2495,24 +2870,59 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self, max_attempts: int = 18, container: str | None = None
     ) -> None:
         await self._ensure_client()
-        if self._api is not None:
-            await check_pod_terminated(
-                self._api, self.pod_name, self.namespace, target_container=container
-            )
-        resp = await self._connect_exec_stream(
-            command=["true"],
-            container=container,
-            stderr=False,
-            stdin=False,
-            stdout=True,
-            tty=False,
-            max_attempts=max_attempts,
-        )
-        if resp is not None:
+        attempts = max(1, max_attempts)
+        for attempt in range(attempts):
+            if self._api is not None:
+                await check_pod_terminated(
+                    self._api, self.pod_name, self.namespace, target_container=container
+                )
+            resp: ExecStream | None = None
             try:
-                resp.close()
-            except Exception:
-                pass
+                resp = await self._connect_exec_stream(
+                    command=["true"],
+                    container=container,
+                    stderr=False,
+                    stdin=False,
+                    stdout=True,
+                    tty=False,
+                    max_attempts=1,
+                )
+                if type(resp) is ExecStream:
+                    async with asyncio.timeout(_GKE_EXEC_HANDSHAKE_TIMEOUT_SEC):
+                        await collect_exec_bytes(resp)
+                    resp.returncode()
+                return
+            except TrialContainerLostError:
+                raise
+            except (
+                GKEExecStreamClosedError,
+                ApiException,
+                OSError,
+                TimeoutError,
+            ) as exc:
+                if self._api is not None:
+                    await check_pod_terminated(
+                        self._api,
+                        self.pod_name,
+                        self.namespace,
+                        target_container=container,
+                    )
+                if attempt < attempts - 1:
+                    wait_time = jittered_backoff_delay(attempt)
+                    self.logger.debug(
+                        f"Container exec readiness probe on pod {self.pod_name} failed "
+                        f"({type(exc).__name__}: {exc}), retrying in {wait_time:.1f}s "
+                        f"(attempt {attempt + 1}/{attempts})..."
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
+            finally:
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
 
     @retry(
         stop=stop_after_attempt(3),
@@ -2935,8 +3345,20 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             task_dir = getattr(self, "task_dir", None) or self.environment_dir.parent
 
             mode: ComposePlacementMode = self.compose_placement
+            compose_env = resolve_compose_infra_env(
+                self,
+                use_prebuilt=bool(
+                    getattr(self, "task_env_config", None)
+                    and self.task_env_config.docker_image
+                ),
+            )
 
-            project = normalize_compose_project(paths, None, context_dir=base_dir)
+            project = normalize_compose_project(
+                paths,
+                compose_env,
+                context_dir=base_dir,
+                task_dir=Path(task_dir),
+            )
             plan = classify_compose_placement(
                 project,
                 task_dir=Path(task_dir),
@@ -3033,7 +3455,8 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         - Priority 1: ``task_node_pools`` entry matching ``self.environment_name``
           or its basename. An explicit per-task mapping always wins.
-        - Priority 2: the global ``node_pool`` option.
+        - Priority 2: ``dind_node_pool`` when the task uses Docker-in-Docker.
+        - Priority 3: the global ``node_pool`` option.
         - Otherwise ``None``, leaving placement to the scheduler or a ComputeClass.
         """
         task_key = self.environment_name
@@ -3041,7 +3464,34 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         task_specific_pool = self.task_node_pools.get(
             task_key
         ) or self.task_node_pools.get(task_base)
-        return task_specific_pool or self.node_pool
+        if task_specific_pool:
+            return task_specific_pool
+        if getattr(self, "dind_node_pool", None) and (
+            self._compose_needs_dind() or bool(self._dind_services)
+        ):
+            return self.dind_node_pool
+        return self.node_pool
+
+    def _warn_if_unfenced_privileged_dind(self, *, is_autopilot: bool) -> None:
+        """Emit a warning when a DinD Pod runs privileged on GKE Standard without a dedicated node pool or gVisor."""
+        if is_autopilot or not self._dind_services:
+            return
+        rc = self.kwargs.get("runtime_class_name")
+        if (
+            rc == "gvisor"
+            or getattr(self, "dind_node_pool", None)
+            or self._resolve_active_node_pool()
+        ):
+            return
+        self.logger.warning(
+            "Task %r uses privileged Docker-in-Docker (dind-engine) on GKE Standard cluster %r "
+            "without a dedicated node pool (`--ek dind_node_pool=<pool>`) or gVisor "
+            "(`--ek runtime_class_name=gvisor`). Privileged containers share the host kernel and "
+            "devices; schedule DinD workloads onto a dedicated node pool with a least-privilege "
+            "GCE service account for multi-tenant isolation.",
+            self.environment_name,
+            self.cluster_name,
+        )
 
     def _resolve_active_machine_type_with_source(
         self,
@@ -3315,6 +3765,8 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
     async def _upload_seed_bind_mounts(self, annotations: dict[str, str]) -> None:
         """Stream large compose bind mounts into harbor-seed container and signal .seed-ready."""
+        from harbor_gke_ext.compose_spec import resolve_contained_task_path
+
         raw_binds = annotations.get("harbor.dev/compose-bind-mounts")
         if not raw_binds:
             return
@@ -3325,6 +3777,11 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 f"Failed to parse compose-bind-mounts annotation: {exc}"
             )
             return
+
+        env_dir = self.environment_dir.resolve()
+        task_dir = Path(
+            getattr(self, "task_dir", None) or self.environment_dir.parent
+        ).resolve()
 
         for rel_src, target_info in bind_mounts.items():
             if isinstance(target_info, dict):
@@ -3337,10 +3794,12 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 local_path_str = None
             if not target_dir:
                 continue
-            local_path = (
-                Path(local_path_str)
-                if local_path_str
-                else (self.environment_dir / rel_src).resolve()
+            raw_candidate = local_path_str if local_path_str else str(rel_src)
+            local_path = resolve_contained_task_path(
+                raw_candidate,
+                base_dir=env_dir,
+                allowed_roots=(env_dir, task_dir),
+                field_name="seed-bind-mount",
             )
             if not local_path.exists():
                 continue
@@ -3403,12 +3862,12 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                         )
 
                 annotations = (
-                    (pod.metadata.annotations if pod.metadata else None)
-                    or (
+                    (
                         self._created_pod.metadata.annotations
                         if self._created_pod and self._created_pod.metadata
                         else None
                     )
+                    or (pod.metadata.annotations if pod.metadata else None)
                     or {}
                 )
                 if (
@@ -3423,6 +3882,52 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                     if seed_running:
                         await self._upload_seed_bind_mounts(annotations)
                         self._seed_uploaded = True
+
+                if self._dind_services and not self._dind_netpol_applied:
+                    init_statuses = list(pod.status.init_container_statuses or [])
+                    dind_pull_running = any(
+                        c.name == "dind-pull" and c.state and c.state.running
+                        for c in init_statuses
+                    )
+                    if dind_pull_running:
+                        try:
+                            probe_res = await self.exec(
+                                "test -f /harbor/dind-images/.ready-for-netpol",
+                                container="dind-engine",
+                                supervised=False,
+                                timeout_sec=10,
+                            )
+                            if probe_res.return_code == 0:
+                                needs_netpol = (
+                                    self.network_policy.network_mode
+                                    != NetworkMode.PUBLIC
+                                    or not self.allow_metadata_server
+                                )
+                                if needs_netpol:
+                                    await self._apply_network_policy(
+                                        self.network_policy
+                                    )
+                                    settlement_sec = float(
+                                        self.kwargs.get(
+                                            "network_policy_settlement_sec", 1.0
+                                        )
+                                    )
+                                    if settlement_sec > 0:
+                                        await asyncio.sleep(settlement_sec)
+                                await self.exec(
+                                    "touch /harbor/dind-images/.netpol-applied",
+                                    container="dind-engine",
+                                    supervised=False,
+                                    timeout_sec=10,
+                                )
+                                self._dind_netpol_applied = True
+                                self.logger.debug(
+                                    f"Applied restrictive NetworkPolicy and released dind-pull handshake for pod {self.pod_name}"
+                                )
+                        except Exception as dind_np_err:
+                            self.logger.debug(
+                                f"Waiting for dind-pull .ready-for-netpol handshake: {dind_np_err}"
+                            )
 
                 if (
                     annotations.get("harbor.dev/post-main-sidecars")
@@ -3649,15 +4154,15 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         """
         from harbor_gke_ext.compose_translator import (
             COMPOSE_UP_GATE_CONTAINER,
-            DIND_CACHE_CONTAINER_PREFIX,
             DIND_ENGINE_CONTAINER,
+            DIND_PULL_CONTAINER,
         )
 
         def _is_infra(name: str) -> bool:
-            return (
-                name == DIND_ENGINE_CONTAINER
-                or name == COMPOSE_UP_GATE_CONTAINER
-                or name.startswith(DIND_CACHE_CONTAINER_PREFIX)
+            return name in (
+                DIND_ENGINE_CONTAINER,
+                DIND_PULL_CONTAINER,
+                COMPOSE_UP_GATE_CONTAINER,
             )
 
         spec = pod.spec

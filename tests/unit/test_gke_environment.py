@@ -87,6 +87,16 @@ def mock_k8s_manager(monkeypatch):
         "harbor_gke_ext.client.get_active_gke_context",
         lambda: None,
     )
+    monkeypatch.setattr(
+        env_mod,
+        "probe_cluster_via_gcloud",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        env_mod,
+        "probe_network_enforcement_and_dns_via_k8s",
+        lambda *args, **kwargs: (True, "10.96.0.10"),
+    )
     yield {
         "manager": mock_mgr,
         "core_api": mock_core_api,
@@ -1458,30 +1468,31 @@ async def test_start_direct_pod_build_and_push(tmp_path):
 @pytest.mark.asyncio
 async def test_start_direct_pod_mkdir_failure(tmp_path):
     env = make_gke_env(tmp_path)
-    with patch.object(env, "_ensure_client", AsyncMock()):
-        with patch.object(env, "_image_exists", AsyncMock(return_value=True)):
-            with patch.object(env, "_build_direct_pod", return_value=MagicMock()):
-                with patch.object(env, "_create_pod", AsyncMock()):
-                    with patch.object(env, "_wait_for_pod_ready", AsyncMock()):
-                        with patch.object(
-                            env, "_wait_for_container_exec_ready", AsyncMock()
-                        ):
-                            with patch.object(
-                                env,
-                                "ensure_dirs",
-                                AsyncMock(
-                                    return_value=ExecResult(
-                                        stdout="",
-                                        stderr="Permission denied",
-                                        return_code=1,
-                                    )
-                                ),
-                            ):
-                                with pytest.raises(
-                                    RuntimeError,
-                                    match="Failed to create mounted directories",
-                                ):
-                                    await env.start(force_build=False)
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch.object(env, "_image_exists", AsyncMock(return_value=True)),
+        patch.object(env, "_build_direct_pod", return_value=MagicMock()),
+        patch.object(env, "_apply_network_policy", AsyncMock()),
+        patch.object(env, "_create_pod", AsyncMock()),
+        patch.object(env, "_wait_for_pod_ready", AsyncMock()),
+        patch.object(env, "_wait_for_container_exec_ready", AsyncMock()),
+        patch.object(
+            env,
+            "ensure_dirs",
+            AsyncMock(
+                return_value=ExecResult(
+                    stdout="",
+                    stderr="Permission denied",
+                    return_code=1,
+                )
+            ),
+        ),
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="Failed to create mounted directories",
+        ):
+            await env.start(force_build=False)
 
 
 @pytest.mark.unit
@@ -1492,33 +1503,24 @@ async def test_start_compose_dind_mode_enables_sidecar(tmp_path):
         compose_yaml="services:\n  app:\n    image: nginx\n",
         compose_mode="dind",
     )
-    with patch.object(env, "_ensure_client", AsyncMock()):
-        with patch.object(env, "is_autopilot", AsyncMock(return_value=True)):
-            with patch(
-                "harbor_gke_ext.environment.discover_compose_build_services",
-                return_value={},
-            ):
-                with patch.object(env, "_image_exists", AsyncMock(return_value=True)):
-                    with patch.object(
-                        env, "_build_compose_pod", return_value=MagicMock()
-                    ):
-                        with patch.object(env, "_create_pod", AsyncMock()):
-                            with patch.object(env, "_wait_for_pod_ready", AsyncMock()):
-                                with patch.object(
-                                    env, "_wait_for_container_exec_ready", AsyncMock()
-                                ):
-                                    with patch.object(
-                                        env, "ensure_dirs", AsyncMock(return_value=None)
-                                    ):
-                                        await env.start(force_build=False)
-                                        assert (
-                                            env._compose_spec_args["compose_placement"]
-                                            == "dind"
-                                        )
-                                        assert (
-                                            env._compose_spec_args["is_autopilot"]
-                                            is True
-                                        )
+    with (
+        patch.object(env, "_ensure_client", AsyncMock()),
+        patch.object(env, "is_autopilot", AsyncMock(return_value=True)),
+        patch(
+            "harbor_gke_ext.environment.discover_compose_build_services",
+            return_value={},
+        ),
+        patch.object(env, "_image_exists", AsyncMock(return_value=True)),
+        patch.object(env, "_build_compose_pod", return_value=MagicMock()),
+        patch.object(env, "_apply_network_policy", AsyncMock()),
+        patch.object(env, "_create_pod", AsyncMock()),
+        patch.object(env, "_wait_for_pod_ready", AsyncMock()),
+        patch.object(env, "_wait_for_container_exec_ready", AsyncMock()),
+        patch.object(env, "ensure_dirs", AsyncMock(return_value=None)),
+    ):
+        await env.start(force_build=False)
+        assert env._compose_spec_args["compose_placement"] == "dind"
+        assert env._compose_spec_args["is_autopilot"] is True
 
 
 @pytest.mark.unit
@@ -1682,6 +1684,210 @@ async def test_stop_delete_handles_api_exception(tmp_path, mock_k8s_manager):
     # Should log warnings and not raise, but still release client
     await env.stop(delete=True)
     mock_k8s_manager["manager"].release_client.assert_awaited_once()
+
+
+_MIB = 1024 * 1024
+
+
+def _dind_pod_spec(*, has_engine: bool) -> SimpleNamespace:
+    init_containers = (
+        [SimpleNamespace(name="dind-engine", resources=None)] if has_engine else []
+    )
+    return SimpleNamespace(
+        spec=SimpleNamespace(
+            resources=None,
+            init_containers=init_containers,
+            containers=[SimpleNamespace(name="main", resources=None)],
+        )
+    )
+
+
+def _cgroup_report(
+    *, oom_kill: int = 0, ceiling_oom: int = 0, group_kill: int = 0, oom_group: int = 0
+) -> bytes:
+    return (
+        f"engine.memory.current {600 * _MIB}\n"
+        f"engine.memory.peak {900 * _MIB}\n"
+        f"engine.oom_group {oom_group}\n"
+        f"pod.memory.max {6208 * _MIB}\n"
+        f"pod.oom_kill {oom_kill}\n"
+        f"pod.oom_group_kill {group_kill}\n"
+        f"pod.ceiling_oom {ceiling_oom}\n"
+        "engine.usage_usec 123456789\n"
+    ).encode()
+
+
+def _pod_status(*, engine_terminated: tuple[str, int] | None) -> SimpleNamespace:
+    terminated = (
+        SimpleNamespace(reason=engine_terminated[0], exit_code=engine_terminated[1])
+        if engine_terminated
+        else None
+    )
+    return SimpleNamespace(
+        status=SimpleNamespace(
+            init_container_statuses=[
+                SimpleNamespace(
+                    name="dind-engine",
+                    state=SimpleNamespace(terminated=terminated),
+                    last_state=SimpleNamespace(terminated=None),
+                )
+            ],
+            container_statuses=[],
+        )
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "has_engine",
+        "exec_result",
+        "engine_terminated",
+        "info_parts",
+        "required",
+        "forbidden",
+    ),
+    [
+        pytest.param(
+            True,
+            (_cgroup_report(), b"", 0),
+            None,
+            ("600 MiB", "per process"),
+            None,
+            (),
+            id="fit-within-declared-size",
+        ),
+        pytest.param(
+            True,
+            (_cgroup_report(oom_kill=3, ceiling_oom=2), b"", 0),
+            None,
+            ("600 MiB",),
+            ("6208 MiB was reached 2 time(s)", "--override-memory-mb"),
+            ("singleProcessOOMKill",),
+            id="oom-at-the-pod-ceiling-is-a-sizing-problem",
+        ),
+        pytest.param(
+            True,
+            (_cgroup_report(oom_kill=1), b"", 0),
+            None,
+            ("600 MiB",),
+            ("its own memory limit",),
+            ("--override-memory-mb", "singleProcessOOMKill"),
+            id="oom-at-a-declared-container-limit-is-not-a-sizing-problem",
+        ),
+        pytest.param(
+            True,
+            (
+                _cgroup_report(oom_kill=4, ceiling_oom=1, group_kill=1, oom_group=1),
+                b"",
+                0,
+            ),
+            None,
+            ("whole container",),
+            ("singleProcessOOMKill", "--override-memory-mb"),
+            (),
+            id="group-kill-names-the-kubelet-setting",
+        ),
+        pytest.param(
+            True,
+            (_cgroup_report(oom_group=1), b"", 0),
+            None,
+            ("whole container",),
+            None,
+            (),
+            id="group-mode-is-visible-before-anything-is-killed",
+        ),
+        pytest.param(
+            True,
+            TimeoutError("exec stalled"),
+            None,
+            None,
+            ("could not be read", "TimeoutError"),
+            ("OOM-killed", "singleProcessOOMKill"),
+            id="unreadable-report-is-a-warning-and-never-blocks-deletion",
+        ),
+        pytest.param(
+            True,
+            RuntimeError('container not found ("dind-engine")'),
+            ("OOMKilled", 137),
+            None,
+            ("Docker daemon", "killed", "singleProcessOOMKill", "--override-memory-mb"),
+            (),
+            id="killed-docker-host-is-reported-from-pod-status",
+        ),
+        pytest.param(
+            True,
+            RuntimeError('container not found ("dind-engine")'),
+            ("OOMKilled", 0),
+            None,
+            ("OOM-killed inside", "exit code 0", "--override-memory-mb"),
+            ("singleProcessOOMKill", "Docker daemon was killed"),
+            id="oom-inside-a-surviving-docker-host-is-not-a-daemon-kill",
+        ),
+        pytest.param(
+            False, None, None, None, None, (), id="non-dind-pod-is-not-probed"
+        ),
+    ],
+)
+async def test_stop_reports_dind_usage_before_deleting_the_pod(
+    tmp_path,
+    mock_k8s_manager,
+    caplog,
+    has_engine,
+    exec_result,
+    engine_terminated,
+    info_parts,
+    required,
+    forbidden,
+):
+    """Containers a task starts through the Docker socket are invisible to
+    Kubernetes, so what happened to them shows up only in the Pod's cgroup,
+    which disappears with the Pod. Teardown reads it first and tells the
+    operator which ceiling was hit -- the Pod's (re-size the task), a
+    container's own (the task's Compose file), or a whole-container group kill
+    (node configuration). When the Docker host cannot be read, the Pod status
+    is the remaining evidence. containerd marks a container ``OOMKilled`` when
+    any process in it was OOM-killed, so only an exit by SIGKILL (137) means
+    the Docker daemon itself died. It is diagnostics: it must never stand in
+    the way of deletion."""
+    env = make_gke_env(tmp_path)
+    await env._ensure_client()
+    env._created_pod = _dind_pod_spec(has_engine=has_engine)
+    mock_k8s_manager["core_api"].read_namespaced_pod.return_value = _pod_status(
+        engine_terminated=engine_terminated
+    )
+    exec_mock = AsyncMock(
+        side_effect=exec_result if isinstance(exec_result, Exception) else None,
+        return_value=None if isinstance(exec_result, Exception) else exec_result,
+    )
+
+    with (
+        patch("harbor_gke_ext.environment.run_exec_command", new=exec_mock),
+        caplog.at_level("INFO"),
+    ):
+        await env.stop(delete=True)
+
+    mock_k8s_manager["core_api"].delete_namespaced_pod.assert_called_once()
+    assert exec_mock.await_count == (1 if has_engine else 0)
+    if has_engine:
+        assert exec_mock.await_args.kwargs["container"] == "dind-engine"
+
+    def messages(level: str) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelname == level]
+
+    warnings = " | ".join(messages("WARNING"))
+    if required is None:
+        assert warnings == ""
+    for part in required or ():
+        assert part in warnings
+    for part in forbidden:
+        assert part not in warnings
+    if info_parts is not None:
+        usage = [m for m in messages("INFO") if "DinD usage" in m]
+        assert len(usage) == 1
+        for part in info_parts:
+            assert part in usage[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1877,6 +2083,84 @@ async def test_exec_failure_status_without_exit_code_raises(
     ).encode()
     with pytest.raises(GKEExecStreamClosedError, match="container not found"):
         await local_exec_env.exec("true", cwd=str(tmp_path), supervised=False)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_wait_for_container_exec_ready_retries_until_true_executes(
+    local_exec_env, fake_kubelet
+):
+    """Regression: on newly scaled Autopilot nodes, the WebSocket handshake (HTTP 101)
+    succeeds before konnectivity-agent connects, and the API server then sends a
+    Failure Status ('No agent available') on ERROR_CHANNEL. _wait_for_container_exec_ready
+    must wait for `true` to complete with status Success rather than returning as soon
+    as the HTTP 101 handshake opens."""
+    attempts = 0
+
+    def status_for_attempt(argv):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return json.dumps(
+                {
+                    "status": "Failure",
+                    "message": (
+                        "Internal error occurred: error sending request: Post "
+                        '"https://10.128.0.35:10250/exec/default/pod/main?command=true": '
+                        "No agent available"
+                    ),
+                }
+            ).encode()
+        return None
+
+    fake_kubelet.status_override = status_for_attempt
+    with patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()):
+        await local_exec_env._wait_for_container_exec_ready(max_attempts=5)
+
+    assert len(fake_kubelet.connections) == 3
+    assert attempts == 3
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_exec_supervised_retries_pre_exec_konnectivity_no_agent_error(
+    local_exec_env, fake_kubelet, tmp_path
+):
+    """Regression: when a supervised exec receives a pre-execution Konnectivity
+    Failure Status ('No agent available') on ERROR_CHANNEL with 0 output bytes,
+    the command never reached the kubelet and its workdir was never created.
+    exec() must retry launching the command rather than polling the nonexistent
+    workdir and failing with LOST."""
+    attempts = 0
+
+    def status_for_attempt(argv):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return json.dumps(
+                {
+                    "status": "Failure",
+                    "message": (
+                        "Internal error occurred: error sending request: Post "
+                        '"https://10.128.0.35:10250/exec/default/pod/main": '
+                        "No agent available"
+                    ),
+                }
+            ).encode()
+        return None
+
+    fake_kubelet.status_override = status_for_attempt
+    with patch("harbor_gke_ext.environment.asyncio.sleep", AsyncMock()):
+        res = await local_exec_env.exec(
+            "printf ready-now; exit 0", cwd=str(tmp_path), supervised=True
+        )
+
+    assert (res.stdout, res.return_code) == ("ready-now", 0)
+    assert attempts == 3
+    probes = [c for c in fake_kubelet.connections if "DONE_NO_OUTPUT" in c.command[-1]]
+    assert not probes, (
+        "must retry pre-exec proxy errors instead of polling nonexistent workdir"
+    )
 
 
 @pytest.mark.unit
@@ -2923,3 +3207,163 @@ def test_network_policy_enforcement_capabilities_and_fail_closed(tmp_path):
     # Opting into allow_metadata_server=True in PUBLIC mode succeeds without enforcement
     env_opt_out = make_gke_env(tmp_path, allow_metadata_server=True)
     env_opt_out._verify_network_enforcement(unforced_caps)
+
+
+@pytest.mark.unit
+def test_dind_node_pool_and_standard_privileged_warning(tmp_path: Path) -> None:
+    """WP-3 (F-06): Verify dind_node_pool is stored and warning is logged on Standard without dedicated pool or gVisor."""
+    env = make_gke_env(tmp_path, dind_node_pool="dind-isolated-pool")
+    assert env.dind_node_pool == "dind-isolated-pool"
+
+    env_warn = make_gke_env(tmp_path)
+    env_warn._dind_services = {"docker_helper"}
+    with patch.object(env_warn.logger, "warning") as mock_warn:
+        env_warn._warn_if_unfenced_privileged_dind(is_autopilot=False)
+        assert mock_warn.called
+        assert "dedicated" in str(mock_warn.call_args[0][0]).lower()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_wait_for_pod_ready_completes_dind_pull_netpol_handshake(
+    tmp_path: Path, mock_k8s_manager
+) -> None:
+    """WP-3 (F-05): Verify _wait_for_pod_ready applies NetworkPolicy and touches .netpol-applied while dind-pull is waiting."""
+    env = make_gke_env(tmp_path, network_policy_settlement_sec=0)
+    await env._ensure_client()
+    env._dind_services = frozenset({"docker_helper"})
+
+    dind_pull_init = SimpleNamespace(
+        name="dind-pull",
+        state=SimpleNamespace(running=True, waiting=None, terminated=None),
+    )
+    pod_pending = MagicMock()
+    pod_pending.status.phase = "Pending"
+    pod_pending.status.init_container_statuses = [dind_pull_init]
+    pod_pending.status.container_statuses = []
+
+    pod_ready = MagicMock()
+    pod_ready.status.phase = "Running"
+    pod_ready.status.init_container_statuses = []
+    pod_ready.status.container_statuses = [SimpleNamespace(name="main", ready=True)]
+
+    mock_k8s_manager["core_api"].read_namespaced_pod.side_effect = [
+        pod_pending,
+        pod_ready,
+    ]
+    mock_k8s_manager["core_api"].list_namespaced_event.return_value = SimpleNamespace(
+        items=[]
+    )
+
+    exec_calls: list[tuple[str, str | None]] = []
+
+    async def fake_exec(cmd: str, container: str | None = None, **kwargs):
+        exec_calls.append((cmd, container))
+        return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+    with (
+        patch.object(env, "exec", side_effect=fake_exec),
+        patch.object(env, "_apply_network_policy", AsyncMock()) as mock_apply_np,
+    ):
+        await env._wait_for_pod_ready(timeout_sec=10)
+
+    assert mock_apply_np.await_count == 1
+    assert env._dind_netpol_applied is True
+    assert (
+        "test -f /harbor/dind-images/.ready-for-netpol",
+        "dind-engine",
+    ) in exec_calls
+    assert ("touch /harbor/dind-images/.netpol-applied", "dind-engine") in exec_calls
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "enforced,assume,expected_error",
+    [
+        (True, False, None),
+        (False, False, "active Kubernetes NetworkPolicy enforcement is required"),
+        (False, True, "active Kubernetes NetworkPolicy enforcement is required"),
+        (None, False, "Could not verify NetworkPolicy enforcement"),
+        (None, True, None),
+    ],
+)
+def test_verify_network_enforcement_matrix(
+    tmp_path: Path,
+    enforced: bool | None,
+    assume: bool,
+    expected_error: str | None,
+) -> None:
+    """WP-4 (F-07): Verify _verify_network_enforcement and capabilities fail closed on None unless assumed."""
+    env = make_gke_env(
+        tmp_path,
+        allow_metadata_server=False,
+        assume_network_policy_enforced=assume,
+    )
+    caps = _standard_caps(network_policy_enforced=enforced)
+    env_mod._CLUSTER_CAPABILITIES_CACHE[
+        (env.project_id, env.location, env.cluster_name)
+    ] = caps
+
+    expected_cap = enforced is True or (enforced is None and assume)
+    assert env.capabilities.disable_internet is expected_cap
+    assert env.capabilities.network_allowlist is expected_cap
+
+    if expected_error is None:
+        env._verify_network_enforcement(caps)
+    else:
+        with pytest.raises(RuntimeError, match=expected_error):
+            env._verify_network_enforcement(caps)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_apply_network_policy_raises_when_networking_api_is_none(
+    tmp_path: Path,
+) -> None:
+    """WP-5 (F-10 / N-2): Verify _apply_network_policy raises RuntimeError instead of silently returning when _networking_api is None."""
+    from harbor.models.task.config import NetworkMode, NetworkPolicy
+
+    env = make_gke_env(tmp_path)
+    env._ensure_client = AsyncMock()
+    env._networking_api = None
+    with pytest.raises(RuntimeError, match="NetworkingV1Api client is not initialized"):
+        await env._apply_network_policy(
+            NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_dynamic_policy_narrowing_flushes_connections_and_verifies_convergence(
+    tmp_path: Path,
+) -> None:
+    """WP-5 (F-08 / N-1): Verify narrowing NetworkPolicy on a ready Pod flushes connections and checks convergence."""
+    from harbor.models.task.config import NetworkMode, NetworkPolicy
+
+    env = make_gke_env(tmp_path, network_policy_settlement_sec=0.01)
+    env._ensure_client = AsyncMock()
+    env._networking_api = MagicMock()
+    env._custom_api = MagicMock()
+    env._pod_ready = True
+    env._dind_services = frozenset({"docker_helper"})
+
+    exec_calls: list[tuple[str, str | None]] = []
+
+    async def fake_exec(cmd: str, container: str | None = None, **kwargs):
+        exec_calls.append((cmd, container))
+        return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+    with (
+        patch("harbor_gke_ext.environment.apply_network_policy", AsyncMock()),
+        patch.object(env, "exec", side_effect=fake_exec),
+    ):
+        await env._apply_network_policy(NetworkPolicy(network_mode=NetworkMode.PUBLIC))
+        assert exec_calls == []
+
+        await env._apply_network_policy(
+            NetworkPolicy(network_mode=NetworkMode.NO_NETWORK)
+        )
+
+    assert any("ss -K" in cmd or "conntrack -F" in cmd for cmd, _ in exec_calls)
+    assert any(container == "dind-engine" for _, container in exec_calls)
+    assert any("169.254.169.254" in cmd for cmd, _ in exec_calls)

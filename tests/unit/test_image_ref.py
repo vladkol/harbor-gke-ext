@@ -125,3 +125,59 @@ def test_image_resolver_streaming_report() -> None:
     assert report["streaming_ineligible"] == 1
     assert report["digest_pinned"] == 1
     assert report["ineligible_images"][0]["registry"] == "public.ecr.aws"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "malicious_ref",
+    [
+        "attacker.example:8443#.gcr.io/proj/img:latest",
+        "attacker.example?.gcr.io/proj/img:latest",
+        "gcr.io@attacker.example/proj/img:latest",
+        "us-docker.pkg.dev/proj/img:latest\nAuthorization: foo",
+        "us-docker.pkg.dev/proj/img:latest\r\nX-Injected: 1",
+        "docker.io/library/../../etc/passwd:latest",
+        "docker.io/library/../ubuntu:latest",
+        "docker.io/library/ubuntu:latest#fragment",
+        "docker.io/library/ubuntu:latest?query=1",
+        "docker.io/library/ubuntu@sha256:not-a-valid-hex-digest",
+        "localhost:99999/test/img:dev",
+        "localhost:0/test/img:dev",
+        "-invalid-host.io/repo/img:latest",
+    ],
+)
+def test_parse_image_ref_rejects_malformed_and_url_injection_refs(
+    malicious_ref: str,
+) -> None:
+    with pytest.raises(ValueError):
+        parse_image_ref(malicious_ref)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("gcr.io", True),
+        ("us.gcr.io", True),
+        ("eu.gcr.io", True),
+        ("asia.gcr.io", True),
+        ("us-central1-docker.pkg.dev", True),
+        ("us-docker.pkg.dev", True),
+        ("europe-west4-docker.pkg.dev", True),
+        ("attacker.example#.gcr.io", False),
+        ("attacker.example:8443#.gcr.io", False),
+        ("evil.gcr.io", False),
+        ("sub.us.gcr.io", False),
+        ("foo.bar-docker.pkg.dev", False),
+        ("evil.pkg.dev", False),
+        ("gcr.io.attacker.example", False),
+        ("docker.io", False),
+        ("ghcr.io", False),
+        ("", False),
+    ],
+)
+def test_is_google_registry_host(host: str, expected: bool) -> None:
+    from harbor_gke_ext.image_ref import is_google_registry_host
+
+    assert is_google_registry_host(host) is expected
+

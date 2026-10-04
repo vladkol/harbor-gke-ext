@@ -35,7 +35,13 @@ from harbor_gke_ext.cluster_probe import (
     ClusterCapabilities,
     DindAvailability,
 )
-from harbor_gke_ext.compose_spec import MAIN_SERVICE_NAME
+from harbor_gke_ext.compose_spec import (
+    HARBOR_SYNTHETIC_LOG_PATHS,
+    MAIN_SERVICE_NAME,
+    UnsupportedComposeFeatureError,
+    is_harbor_synthetic_log_mount,
+    resolve_contained_task_path,
+)
 from harbor_gke_ext.constants import (
     GKE_GPU_TYPE_MAP,
     resolve_gpu_accelerator_label,
@@ -153,31 +159,9 @@ SAFE_SYSCTL_PREFIXES: tuple[str, ...] = (
     "net.ipv4.ping_group_range",
 )
 
-HARBOR_LOG_PATHS: frozenset[str] = frozenset(
-    {
-        "/logs",
-        "/logs/",
-        "/logs/verifier",
-        "/logs/agent",
-        "/logs/artifacts",
-    }
-)
+HARBOR_LOG_PATHS: frozenset[str] = HARBOR_SYNTHETIC_LOG_PATHS
 
 DOCKER_SOCK_PATH = "/var/run/docker.sock"
-
-
-class UnsupportedComposeFeatureError(ValueError):
-    """Raised when a compose specification uses features unsupported on GKE."""
-
-    def __init__(self, causes: list[str], message: str | None = None) -> None:
-        self.causes = list(causes)
-        if message is None:
-            joined = "\n  - ".join(self.causes)
-            message = (
-                f"Task compose configuration cannot be executed on GKE "
-                f"({len(self.causes)} unsupported feature(s)):\n  - {joined}"
-            )
-        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -655,7 +639,10 @@ def classify_compose_placement(
                         else "volume"
                     )
 
-            if vsrc == DOCKER_SOCK_PATH or vtgt == DOCKER_SOCK_PATH:
+            if vsrc in (DOCKER_SOCK_PATH, "/run/docker.sock") and vtgt in (
+                DOCKER_SOCK_PATH,
+                "/run/docker.sock",
+            ):
                 dind_reasons[sname].append(f"DOCKER_SOCK:{DOCKER_SOCK_PATH}")
                 continue
 
@@ -664,37 +651,18 @@ def classify_compose_placement(
                 dind_reasons[sname].append(f"EXTERNAL_VOLUME:{vsrc}")
 
             if vtype == "bind" and vsrc:
-                if (
-                    vsrc.rstrip("/") in HARBOR_LOG_PATHS
-                    or vsrc.startswith("/logs/")
-                    or vtgt.rstrip("/") in HARBOR_LOG_PATHS
-                ):
+                if is_harbor_synthetic_log_mount(vsrc, vtgt):
                     continue
 
-                normalized_vsrc = vsrc
-                if (
-                    normalized_vsrc == "/harbor/environment"
-                    or normalized_vsrc.startswith("/harbor/environment/")
-                ):
-                    suffix = normalized_vsrc[len("/harbor/environment") :]
-                    normalized_vsrc = str(resolved_base_dir) + suffix
-
-                src_path = (
-                    Path(normalized_vsrc)
-                    if Path(normalized_vsrc).is_absolute()
-                    else (resolved_base_dir / normalized_vsrc)
-                )
                 try:
-                    resolved_src = src_path.resolve()
-                except Exception:
-                    resolved_src = src_path
-
-                if resolved_src.is_relative_to(
-                    resolved_task_dir
-                ) or resolved_src.is_relative_to(resolved_base_dir):
-                    continue
-
-                fail_causes.append(f"ABSOLUTE_BIND:{sname}:{vsrc}")
+                    resolve_contained_task_path(
+                        vsrc,
+                        base_dir=resolved_base_dir,
+                        allowed_roots=(resolved_base_dir, resolved_task_dir),
+                        field_name=f"services.{sname}.volumes",
+                    )
+                except UnsupportedComposeFeatureError:
+                    fail_causes.append(f"ABSOLUTE_BIND:{sname}:{vsrc}")
 
         # Expose / port collision tracking
         for exp in sspec.get("expose") or []:

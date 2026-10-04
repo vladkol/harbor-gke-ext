@@ -245,7 +245,17 @@ gcloud container clusters create "${CLUSTER_NAME}" \
   --cluster-dns-scope=cluster \
   --addons=NodeLocalDNS
 
-# 2. Create the scale-to-zero primary worker pool (16 vCPU, 500 GB boot disk -> 339.2 GiB allocatable)
+# 2. Create the scale-to-zero primary worker pool (16 vCPU, 500 GB boot disk -> 339.2 GiB allocatable).
+#    Recommended for every pool that runs Docker-in-Docker tasks: singleProcessOomKill
+#    makes OOM kills per process, as on a Docker host, instead of killing the whole
+#    Docker daemon (see docs/cluster-setup.md, "Per-process OOM kills for Docker-in-Docker").
+#    The node-pool system config spells the key singleProcessOomKill; gcloud rejects
+#    other spellings. Needs gcloud 2025-08-08 or later and GKE 1.32.4-gke.1132000,
+#    1.33.0-gke.1748000 or later.
+cat > harbor-kubelet-config.yaml <<'EOF'
+kubeletConfig:
+  singleProcessOomKill: true
+EOF
 gcloud container node-pools create harbor-workers \
   --cluster="${CLUSTER_NAME}" \
   --region="${REGION}" \
@@ -254,6 +264,7 @@ gcloud container node-pools create harbor-workers \
   --disk-size=500 \
   --disk-type=pd-balanced \
   --service-account="${NODE_SA}" \
+  --system-config-from-file=harbor-kubelet-config.yaml \
   --enable-image-streaming \
   --num-nodes=0 \
   --enable-autoscaling --total-min-nodes=0 --total-max-nodes=16
@@ -275,14 +286,16 @@ gcloud container node-pools create l4-gpu-pool \
   --num-nodes=0 \
   --enable-autoscaling --total-min-nodes=0 --total-max-nodes=8
 
-# 4. Grant the cluster's Workload Identity pool read access to the harbor-tasks repository
-#    Required so Docker-in-Docker (dind-engine / dind-cache-*) can docker pull built images
+# 4. Grant the Harbor Kubernetes ServiceAccount read access to the harbor-tasks repository
+#    Required so Docker-in-Docker (dind-engine / dind-pull) can docker pull built images
 #    from Artifact Registry when Workload Identity (GKE_METADATA) is active on the nodes.
+HARBOR_NAMESPACE="${HARBOR_NAMESPACE:-default}"
+HARBOR_KSA="${HARBOR_KSA:-default}"
 PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
 gcloud artifacts repositories add-iam-policy-binding harbor-tasks \
   --location="${REGION}" \
   --project="${PROJECT_ID}" \
-  --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/*" \
+  --member="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/${HARBOR_NAMESPACE}/sa/${HARBOR_KSA}" \
   --role="roles/artifactregistry.reader"
 
 gcloud container clusters get-credentials "${CLUSTER_NAME}" \
@@ -293,7 +306,7 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" \
 > [!NOTE]
 > - Because `default-pool` is tainted with `CriticalAddonsOnly=true:NoSchedule`, `kube-system` runs on a single `100 GB` `e2-standard-4` node, while `harbor-workers` and the GPU pool scale to **`0` nodes when no evaluations are running**.
 > - Ensure your project's regional **`SSD_TOTAL_GB`** (`Persistent Disk SSD (GB)`) quota in `${REGION}` can cover your peak active worker nodes (`500 GB` per active node).
-> - **Why step 4 binds `principalSet://.../workloadIdentityPools/${PROJECT_ID}.svc.id.goog/*` after cluster creation:** Creating the cluster with `--workload-pool="${PROJECT_ID}.svc.id.goog"` (or creating an Autopilot cluster) provisions the project's Workload Identity pool and enables `GKE_METADATA` on worker nodes. Under `GKE_METADATA`, `kubelet` on the host still uses `${NODE_SA}`, but `dind-engine` inside a Pod receives a Workload Identity token when querying `169.254.169.254`. Binding `roles/artifactregistry.reader` on the `harbor-tasks` repository to the Workload Identity pool lets `dind-cache-<service>` pull built task and sidecar images directly via `docker pull` instead of falling back to slow rootfs streaming (`tar -cf - / | docker import`). See [Docker-in-Docker](docs/docker-in-docker.md).
+> - **Why step 4 binds `principal://.../subject/ns/${HARBOR_NAMESPACE}/sa/${HARBOR_KSA}` after cluster creation:** Creating the cluster with `--workload-pool="${PROJECT_ID}.svc.id.goog"` (or creating an Autopilot cluster) provisions the project's Workload Identity pool and enables `GKE_METADATA` on worker nodes. Under `GKE_METADATA`, `kubelet` on the host still uses `${NODE_SA}`, but `dind-engine` inside a Pod receives a Workload Identity token when querying `169.254.169.254`. Binding `roles/artifactregistry.reader` on the `harbor-tasks` repository to the Harbor Kubernetes ServiceAccount lets the trusted `dind-pull` init container pull built task and sidecar images directly via `docker pull` before scrubbing the token and locking down the metadata server. See [Docker-in-Docker](docs/docker-in-docker.md).
 
 ### 5. Run a task
 
@@ -363,8 +376,17 @@ cores, or to scale limits above requests in `auto` mode:
 ```
 
 `--cpus request --memory request` removes limits for single-container tasks
-only. Compose Pods always carry a Pod-level limit of at least the declared
-budget, with an `8192 MiB` memory floor when `dind-engine` is present.
+only. Every Compose Pod (Shapes A, B and C) is treated as the Docker host of its
+services: the budget applies to `main`, and the Pod carries a `spec.resources`
+ceiling equal to the sum of its containers' ceilings, never below the declared
+budget. For Docker-in-Docker tasks `memory_mb` therefore bounds the whole
+environment, including containers the task starts at runtime through
+`/var/run/docker.sock`, as on Harbor's Daytona and Modal DinD sandboxes (Harbor's
+local Docker environment limits only `main`). A DinD task that outgrows its
+`memory_mb` has processes OOM-killed, or stalls at its ceiling, inside its own Pod
+instead of taking memory from its neighbours; re-size it with `memory_mb` or
+`--override-memory-mb` (see
+[Docker-in-Docker](docs/docker-in-docker.md#resource-model-and-volume-topology)).
 
 **Request a GPU or override GPU.** When running a dataset whose tasks declare
 `gpu_types` that yiou don't have capacity for, such as
@@ -445,8 +467,8 @@ code.
 
 Different benchmarks stress different cluster dimensions:
 
-- **High-concurrency coding and CLI suites** (`SWE-bench`, `terminal-bench`): Dominated by Pod scheduling throughput, Image Streaming warmup, and compile/test CPU sensitivity. Under the default `--cpus auto --memory auto` (`guarantee`), direct Pods place `requests = limits` on the `main` container (`Guaranteed` QoS), making them eligible for exclusive CPU cores on `cpuManagerPolicy: static` node pools or `ComputeClass`es (see [Task sizing and placement](docs/task-sizing-and-placement.md)). For development runs where bursty `pytest` / `tsc` builds share idle node cores, pass `--cpus request --memory request`. This removes limits for single-container tasks only; Compose Pods always carry a Pod-level limit.
-- **Storage- and DinD-heavy suites** (`orca-bench`, `long-horizon-terminal-bench`): Dominated by unpacked layer size inside `dind-engine` (`overlay2`), hardlink expansion under GCFS Image Streaming, and inner daemon memory overhead. Provision a dedicated worker pool with `1,500 GB+` boot disks for these datasets. `--ek scratch_volume_size=100Gi` moves `/var/lib/docker` onto a Persistent Disk, but `dind-engine` still reserves its full `ephemeral-storage` estimate on the node, so it does not replace node disk capacity. Shape B and Shape C automatically enforce an `8192 MiB` Pod memory-limit floor so `dockerd` + `containerd` do not OOM-kill during layer unpack on small-budget tasks.
+- **High-concurrency coding and CLI suites** (`SWE-bench`, `terminal-bench`): Dominated by Pod scheduling throughput, Image Streaming warmup, and compile/test CPU sensitivity. Under the default `--cpus auto --memory auto` (`guarantee`), direct Pods place `requests = limits` on the `main` container (`Guaranteed` QoS), making them eligible for exclusive CPU cores on `cpuManagerPolicy: static` node pools or `ComputeClass`es (see [Task sizing and placement](docs/task-sizing-and-placement.md)). For development runs where bursty `pytest` / `tsc` builds share idle node cores, pass `--cpus request --memory request`. This removes limits for single-container tasks only; Shape A Compose Pods always carry a Pod-level limit.
+- **Storage- and DinD-heavy suites** (`orca-bench`, `long-horizon-terminal-bench`): Dominated by unpacked layer size inside `dind-engine` (`overlay2`), hardlink expansion under GCFS Image Streaming, and inner daemon memory overhead. Provision a dedicated worker pool with `1,500 GB+` boot disks for these datasets. `--ek scratch_volume_size=100Gi` moves `/var/lib/docker` onto a Persistent Disk, but `dind-engine` still reserves its full `ephemeral-storage` estimate on the node, so it does not replace node disk capacity. The Pod's memory ceiling is the task's `memory_mb` plus what the DinD services declare; containers a task starts through the Docker socket must fit in `memory_mb` (the teardown usage report logs a WARNING for each kind of OOM kill). Run these suites on nodes with the kubelet's `singleProcessOOMKill: true`, so an OOM kill takes one process rather than the whole Docker host (see [Cluster setup](docs/cluster-setup.md#5-per-process-oom-kills-for-docker-in-docker-singleprocessoomkill)).
 - **ISA-sensitive scientific and EDA suites** (`apex-openroad-ibex-signoff`, `bespokelabs/terminal-bench-science`): Many prebuilt images are `linux/amd64`-only or execute AVX2/FMA instructions that crash with `SIGILL` on older or non-x86 CPUs. `harbor-gke-ext` does not detect image architecture or pin `kubernetes.io/arch`. Pair `--ek task_machine_types`, `--ek task_node_pools`, or `--ek task_compute_classes` with AVX2-capable x86 node pools (`n2-standard-*`, `c3-standard-*`), as shown in [Cluster setup](docs/cluster-setup.md).
 
 See [Cluster setup](docs/cluster-setup.md), [Task sizing and placement](docs/task-sizing-and-placement.md), and [Dataset notes](docs/dataset-notes.md) for concrete node pool, `ComputeClass`, and per-dataset recipes.

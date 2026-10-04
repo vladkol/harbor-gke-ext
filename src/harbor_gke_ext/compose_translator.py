@@ -59,6 +59,7 @@ import shlex
 import subprocess
 import tarfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, override
 
@@ -78,8 +79,10 @@ from harbor.utils.logger import logger
 from harbor_gke_ext.cluster_probe import ClusterCapabilities
 from harbor_gke_ext.compose_spec import (
     discover_compose_build_services,
+    is_harbor_synthetic_log_mount,
     normalize_compose_project,
     parse_duration_seconds,
+    resolve_contained_task_path,
 )
 from harbor_gke_ext.constants import (
     _GKE_AUTOPILOT_MAX_GENERAL_PURPOSE_STORAGE_MB,
@@ -91,8 +94,11 @@ from harbor_gke_ext.constants import (
     resolve_tpu_accelerator_label,
 )
 from harbor_gke_ext.image_ref import (
+    _REGISTRY_HOST_RE,
     ImageOrigin,
     ImageResolver,
+    is_google_registry_host,
+    parse_image_ref,
 )
 from harbor_gke_ext.placement import (
     ComposePlacementMode,
@@ -117,8 +123,9 @@ _DIND_ENGINE_IMAGE = "docker:28.3.3-dind"
 # Harbor's own machinery, not task services; `GKEEnvironment` uses them to
 # identify whose logs are infrastructure diagnostics worth preserving.
 DIND_ENGINE_CONTAINER = "dind-engine"
+DIND_MAIN_ROOTFS_CONTAINER = "dind-main-rootfs"
+DIND_PULL_CONTAINER = "dind-pull"
 COMPOSE_UP_GATE_CONTAINER = "compose-up-gate"
-DIND_CACHE_CONTAINER_PREFIX = "dind-cache-"
 
 # Linux caps a SINGLE execve() argv string at MAX_ARG_STRLEN = 32 * PAGE_SIZE
 # (fs/exec.c). With the usual 4 KiB page that is 128 KiB. The `harbor-seed`
@@ -172,108 +179,84 @@ DIND_IMAGE_EXPANSION_RATIO = 3.0
 DIND_STORAGE_FLOOR_MB = 10240
 
 
-def _format_oci_config_changes(oci_cfg: dict[str, Any]) -> list[str]:
-    """Format an OCI image ``config`` dict into ``docker import --change`` directives.
-
-    Reconstructs the six image-config fields that ``tar | docker import``
-    discards and that cannot be read from inside a command-overridden container:
-    ``Entrypoint``, ``Cmd``, ``ExposedPorts``, ``Labels``, ``StopSignal``, and
-    ``Healthcheck``.
-    """
-    if not oci_cfg:
-        return []
-
-    changes: list[str] = []
-
-    entrypoint = oci_cfg.get("Entrypoint")
-    if isinstance(entrypoint, list) and entrypoint:
-        changes.append(f"ENTRYPOINT {json.dumps([str(x) for x in entrypoint])}")
-
-    cmd = oci_cfg.get("Cmd")
-    if isinstance(cmd, list) and cmd:
-        changes.append(f"CMD {json.dumps([str(x) for x in cmd])}")
-
-    exposed = oci_cfg.get("ExposedPorts")
-    if isinstance(exposed, dict):
-        for port_spec in sorted(exposed.keys()):
-            if port_spec:
-                changes.append(f"EXPOSE {port_spec}")
-
-    labels = oci_cfg.get("Labels")
-    if isinstance(labels, dict):
-        for k, v in sorted(labels.items()):
-            if k:
-                changes.append(f"LABEL {json.dumps(str(k))}={json.dumps(str(v))}")
-
-    stop_signal = oci_cfg.get("StopSignal")
-    if isinstance(stop_signal, str) and stop_signal.strip():
-        changes.append(f"STOPSIGNAL {stop_signal.strip()}")
-
-    hc = oci_cfg.get("Healthcheck")
-    if isinstance(hc, dict):
-        test = hc.get("Test")
-        if isinstance(test, list) and test:
-            kind = str(test[0])
-            if kind == "NONE":
-                changes.append("HEALTHCHECK NONE")
-            else:
-                opts: list[str] = []
-                if hc.get("Interval"):
-                    opts.append(f"--interval={int(hc['Interval'])}ns")
-                if hc.get("Timeout"):
-                    opts.append(f"--timeout={int(hc['Timeout'])}ns")
-                if hc.get("StartPeriod"):
-                    opts.append(f"--start-period={int(hc['StartPeriod'])}ns")
-                if hc.get("Retries"):
-                    opts.append(f"--retries={int(hc['Retries'])}")
-                opt_str = (" ".join(opts) + " ") if opts else ""
-                if kind == "CMD-SHELL" and len(test) >= 2:
-                    changes.append(f"HEALTHCHECK {opt_str}CMD {test[1]}")
-                elif kind == "CMD" and len(test) >= 2:
-                    changes.append(
-                        f"HEALTHCHECK {opt_str}CMD {json.dumps([str(x) for x in test[1:]])}"
-                    )
-
-    return changes
-
-
 def _parse_registry_image_ref(image_ref: str) -> tuple[str, str, str]:
     """Split ``image_ref`` into ``(registry_host, repository, tag_or_digest)``."""
-    clean = image_ref.strip()
-    if "@" in clean:
-        repo_part, digest = clean.split("@", 1)
-        last_seg = repo_part.rpartition("/")[2]
-        if ":" in last_seg:
-            repo_part = (
-                repo_part[: len(repo_part) - len(last_seg)] + last_seg.split(":", 1)[0]
-            )
-        ref = digest
-    else:
-        last_seg = clean.rpartition("/")[2]
-        if ":" in last_seg:
-            prefix = clean[: len(clean) - len(last_seg)]
-            name_only, tag = last_seg.split(":", 1)
-            repo_part = prefix + name_only
-            ref = tag
-        else:
-            repo_part = clean
-            ref = "latest"
+    parsed = parse_image_ref(image_ref)
+    host = (
+        "registry-1.docker.io"
+        if parsed.registry in ("docker.io", "index.docker.io")
+        else parsed.registry
+    )
+    ref = parsed.digest or parsed.tag or "latest"
+    return host, parsed.repository, ref
 
-    parts = repo_part.split("/")
-    if len(parts) >= 2 and (
-        "." in parts[0] or ":" in parts[0] or parts[0] == "localhost"
-    ):
-        host = parts[0]
-        repo = "/".join(parts[1:])
-    else:
-        host = "registry-1.docker.io"
-        repo = repo_part
 
-    if host in ("docker.io", "index.docker.io"):
-        host = "registry-1.docker.io"
-    if host == "registry-1.docker.io" and "/" not in repo:
-        repo = f"library/{repo}"
-    return host, repo, ref
+def _validate_public_https_url(raw_url: str) -> str:
+    """Validate that ``raw_url`` is a public HTTPS URL without userinfo, fragments, or private/IP hosts."""
+    import ipaddress
+    import urllib.parse
+
+    if not raw_url or any(ch.isspace() for ch in raw_url):
+        raise ValueError(f"Invalid registry or auth realm URL: {raw_url!r}")
+    parts = urllib.parse.urlsplit(raw_url)
+    if parts.scheme != "https":
+        raise ValueError(
+            f"Registry/realm URL must use https:// scheme, got: {raw_url!r}"
+        )
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(
+            f"Registry/realm URL must not contain userinfo credentials: {raw_url!r}"
+        )
+    if parts.fragment:
+        raise ValueError(
+            f"Registry/realm URL must not contain a fragment: {raw_url!r}"
+        )
+    hostname = (parts.hostname or "").strip().lower()
+    if not hostname or hostname == "localhost" or hostname.endswith((".localhost", ".internal")):
+        raise ValueError(
+            f"Registry/realm URL must not target localhost or internal hosts: {raw_url!r}"
+        )
+    try:
+        ipaddress.ip_address(hostname)
+        is_ip = True
+    except ValueError:
+        is_ip = False
+    if is_ip:
+        raise ValueError(
+            f"Registry/realm URL must use a public DNS hostname, not an IP literal: {raw_url!r}"
+        )
+    netloc = parts.netloc.lower()
+    if not _REGISTRY_HOST_RE.fullmatch(netloc):
+        raise ValueError(f"Invalid registry/realm host {netloc!r} in URL: {raw_url!r}")
+    if parts.port is not None and not (1 <= parts.port <= 65535):
+        raise ValueError(f"Invalid port in registry/realm URL: {raw_url!r}")
+    return raw_url
+
+
+def _build_safe_https_opener() -> Any:
+    """Construct an HTTPS-only urllib OpenerDirector that validates redirects and strips cross-host Authorization."""
+    import urllib.parse
+    import urllib.request
+
+    class _HTTPSRedirectStripAuthHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            _validate_public_https_url(newurl)
+            new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+            if new_req is not None:
+                orig_host = urllib.parse.urlsplit(req.full_url).netloc.lower()
+                dest_host = urllib.parse.urlsplit(new_req.full_url).netloc.lower()
+                if orig_host != dest_host:
+                    new_req.headers.pop("Authorization", None)
+                    new_req.unredirected_hdrs.pop("Authorization", None)
+            return new_req
+
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.UnknownHandler())
+    opener.add_handler(urllib.request.HTTPSHandler())
+    opener.add_handler(_HTTPSRedirectStripAuthHandler())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    return opener
 
 
 def _fetch_oci_config_from_registry(
@@ -288,6 +271,7 @@ def _fetch_oci_config_from_registry(
     trip. ``None`` means the manifest carried no usable layer sizes.
     """
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     host, repo, ref = _parse_registry_image_ref(image_ref)
@@ -299,8 +283,9 @@ def _fetch_oci_config_from_registry(
             "application/vnd.docker.distribution.manifest.v2+json",
         ]
     )
+    is_google = is_google_registry_host(host)
     token: str | None = None
-    if host.endswith("-docker.pkg.dev") or host == "gcr.io" or host.endswith(".gcr.io"):
+    if is_google:
         try:
             proc = subprocess.run(
                 ["gcloud", "auth", "print-access-token"],
@@ -314,40 +299,49 @@ def _fetch_oci_config_from_registry(
         except Exception:
             token = None
 
+    opener = _build_safe_https_opener()
+
     def _http_get_json(
         url: str, extra_headers: dict[str, str] | None = None
     ) -> dict[str, Any]:
         nonlocal token
+        _validate_public_https_url(url)
         headers = dict(extra_headers or {})
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            with opener.open(req, timeout=timeout_sec) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as err:
-            if err.code == 401 and not token:
+            if err.code == 401 and not token and not is_google:
                 auth_hdr = err.headers.get("WWW-Authenticate", "")
                 realm_m = re.search(r'realm="([^"]+)"', auth_hdr)
                 if realm_m:
-                    realm = realm_m.group(1)
-                    params: list[str] = []
+                    realm = _validate_public_https_url(realm_m.group(1))
+                    query_params: list[tuple[str, str]] = []
                     svc_m = re.search(r'service="([^"]+)"', auth_hdr)
                     if svc_m:
-                        params.append(f"service={svc_m.group(1)}")
+                        query_params.append(("service", svc_m.group(1)))
                     scope_m = re.search(r'scope="([^"]+)"', auth_hdr)
                     if scope_m:
-                        params.append(f"scope={scope_m.group(1)}")
-                    tok_url = realm + (("?" + "&".join(params)) if params else "")
-                    with urllib.request.urlopen(
-                        tok_url, timeout=timeout_sec
+                        query_params.append(("scope", scope_m.group(1)))
+                    sep = "&" if "?" in realm else "?"
+                    tok_url = (
+                        f"{realm}{sep}{urllib.parse.urlencode(query_params)}"
+                        if query_params
+                        else realm
+                    )
+                    _validate_public_https_url(tok_url)
+                    with opener.open(
+                        urllib.request.Request(tok_url), timeout=timeout_sec
                     ) as tok_resp:
                         tok_data = json.loads(tok_resp.read().decode("utf-8"))
                         token = tok_data.get("token") or tok_data.get("access_token")
                     if token:
                         headers["Authorization"] = f"Bearer {token}"
                         req2 = urllib.request.Request(url, headers=headers)
-                        with urllib.request.urlopen(req2, timeout=timeout_sec) as resp2:
+                        with opener.open(req2, timeout=timeout_sec) as resp2:
                             return json.loads(resp2.read().decode("utf-8"))
             raise
 
@@ -437,13 +431,69 @@ def _resolve_oci_manifest_facts(image_ref: str) -> tuple[dict[str, Any], int | N
 def _resolve_oci_image_config(image_ref: str) -> dict[str, Any]:
     """Resolve and cache the OCI image ``config`` dict for ``image_ref``.
 
-    Used at Compose translation time so ``dind-cache-<svc>`` can pass
-    ``--change`` directives for ``Entrypoint``, ``Cmd``, ``ExposedPorts``,
-    ``Labels``, ``StopSignal``, and ``Healthcheck`` without network access
-    inside the Pod.
+    Used at Compose translation time so ``dind-pull`` / ``dind-cache-<svc>`` can
+    pass ``--change`` directives for ``Entrypoint``, ``Cmd``, ``Env``,
+    ``WorkingDir``, ``User``, ``ExposedPorts``, ``Labels``, and ``StopSignal``
+    without network access inside the Pod.
     """
     cfg, _ = _resolve_oci_manifest_facts(image_ref)
     return cfg
+
+
+def _format_oci_import_changes(oci_cfg: Mapping[str, Any]) -> str:
+    """Format an OCI ``config`` dict into shell-escaped ``--change`` flags for ``docker import``."""
+    if not oci_cfg:
+        return ""
+    directives: list[str] = []
+
+    raw_env = oci_cfg.get("Env")
+    if isinstance(raw_env, list):
+        for entry in raw_env:
+            entry_str = str(entry)
+            if "=" in entry_str:
+                k, v = entry_str.split("=", 1)
+                if k.strip():
+                    directives.append(f"ENV {k.strip()}={json.dumps(v)}")
+
+    ep = oci_cfg.get("Entrypoint")
+    if isinstance(ep, list) and ep:
+        directives.append(f"ENTRYPOINT {json.dumps([str(x) for x in ep])}")
+    elif isinstance(ep, str) and ep.strip():
+        directives.append(f"ENTRYPOINT {ep.strip()}")
+
+    cmd = oci_cfg.get("Cmd")
+    if isinstance(cmd, list) and cmd:
+        directives.append(f"CMD {json.dumps([str(x) for x in cmd])}")
+    elif isinstance(cmd, str) and cmd.strip():
+        directives.append(f"CMD {cmd.strip()}")
+
+    workdir = oci_cfg.get("WorkingDir")
+    if isinstance(workdir, str) and workdir.strip():
+        directives.append(f"WORKDIR {workdir.strip()}")
+
+    user = oci_cfg.get("User")
+    if isinstance(user, str) and user.strip():
+        directives.append(f"USER {user.strip()}")
+
+    exposed = oci_cfg.get("ExposedPorts")
+    if isinstance(exposed, dict):
+        for port in sorted(exposed):
+            if str(port).strip():
+                directives.append(f"EXPOSE {str(port).strip()}")
+
+    labels = oci_cfg.get("Labels")
+    if isinstance(labels, dict):
+        for lk, lv in sorted(labels.items()):
+            if str(lk).strip():
+                directives.append(
+                    f"LABEL {json.dumps(str(lk))}={json.dumps(str(lv))}"
+                )
+
+    stopsig = oci_cfg.get("StopSignal")
+    if isinstance(stopsig, str) and stopsig.strip():
+        directives.append(f"STOPSIGNAL {stopsig.strip()}")
+
+    return " ".join(f"--change {shlex.quote(d)}" for d in directives)
 
 
 def _resolve_oci_compressed_size_bytes(image_ref: str) -> int | None:
@@ -542,14 +592,9 @@ def _is_google_registry_host(host: str) -> bool:
 
     Used to scope the node service account's OAuth2 access token in
     ``/harbor/dind-images/.docker/config.json`` strictly to Google-hosted
-    registries (`gcr.io`, `*.gcr.io`, `*.pkg.dev`), never third-party hosts.
+    registries (`gcr.io`, `{us,eu,asia}.gcr.io`, `*-docker.pkg.dev`), never third-party hosts.
     """
-    normalized = host.strip().lower().split(":", 1)[0]
-    return (
-        normalized == "gcr.io"
-        or normalized.endswith(".gcr.io")
-        or normalized.endswith(".pkg.dev")
-    )
+    return is_google_registry_host(host)
 
 
 def _sanitize_docker_image_name(name: str) -> str:
@@ -659,10 +704,10 @@ def _normalize_dind_tmpfs_entries(
     1. A target already mounted by a volume is dropped. Docker refuses a project
        that mounts the same target twice ("target X already mounted as ...").
     2. Every surviving entry carries an explicit ``size=``. An unbounded tmpfs
-       defaults to half of the cgroup's memory, and because tmpfs pages are
-       shmem they are charged to ``dind-engine``'s memory cgroup -- an
-       unbounded entry can OOM-kill the engine and take down every sidecar in
-       the Pod.
+       defaults to half of the node's RAM, and because tmpfs pages are shmem
+       charged to the writing container's cgroup (nested under
+       ``dind-engine``, which has no memory limit), an unbounded entry can
+       drive the node into memory-pressure eviction of the whole Pod.
     """
     normalized: list[str] = []
     seen: set[str] = set()
@@ -819,6 +864,7 @@ def aggregate_pod_resource(
     key: str,
     *,
     prefer_limit: bool = False,
+    overrides: Mapping[str, int] | None = None,
 ) -> int:
     """Compute the Kubernetes effective Pod request for one resource.
 
@@ -833,24 +879,43 @@ def aggregate_pod_resource(
     the aggregate is derived from the assembled container lists rather than
     recomputed from the inputs -- the assembled Pod is the only place the real
     order exists.
+
+    ``overrides`` replaces the figure of the named containers, for a container
+    whose cgroup holds more than its own spec shows (see
+    ``build_pod_level_resources``).
     """
+    by_name = overrides or {}
+
+    def amount_of(container: k8s_client.V1Container) -> int:
+        if container.name in by_name:
+            return by_name[container.name]
+        return _container_resource_amount(container, key, prefer_limit=prefer_limit)
+
     running_sidecars = 0
     peak = 0
     for container in init_containers:
-        amount = _container_resource_amount(container, key, prefer_limit=prefer_limit)
+        amount = amount_of(container)
         if _is_native_sidecar(container):
             running_sidecars += amount
             peak = max(peak, running_sidecars)
         else:
             peak = max(peak, running_sidecars + amount)
-    app_total = running_sidecars + sum(
-        _container_resource_amount(c, key, prefer_limit=prefer_limit)
-        for c in app_containers
-    )
+    app_total = running_sidecars + sum(amount_of(c) for c in app_containers)
     return max(peak, app_total)
 
 
-DIND_POD_MEMORY_LIMIT_FLOOR_MB = 8192
+# What a DinD Pod adds on top of the task's own figures for the Docker daemon
+# itself. Memory is measured: `dockerd` plus `containerd` held 38.6 MiB of
+# anonymous memory once idle in `docker:28.3.3-dind` on GKE 1.35.6
+# (2026-10-03). Image-pull page cache is not added: `dind-pull` finishes before
+# `main` starts, so the whole budget is free while it runs, and the kernel
+# reclaims page cache under the Pod ceiling before it OOM-kills anything. CPU is
+# nominal: an idle daemon uses effectively none. Both go into dind-engine's
+# request and into its ceiling (see `build_pod_level_resources`), so the task
+# keeps its full declared budget for its own containers.
+DIND_ENGINE_BASELINE_MEMORY_MB = 64
+DIND_ENGINE_BASELINE_CPU_M = 100
+
 
 # Token requests given to containers that declare nothing on Autopilot. See
 # `_apply_autopilot_request_floor`.
@@ -894,15 +959,36 @@ def build_pod_level_resources(
     task_mem_mb: int | None,
     task_cpu_limit_m: int | None = None,
     task_mem_limit_mb: int | None = None,
+    host_ceilings: Mapping[str, Mapping[str, int]] | None = None,
     is_autopilot: bool = False,
     log: Any | None = None,
 ) -> k8s_client.V1ResourceRequirements | None:
-    """Build ``spec.resources`` carrying the task-wide CPU/memory budget.
+    """Build ``spec.resources``: the Pod is the Docker host for the task.
 
-    Harbor budgets a *task*, not a container, so the budget belongs on the Pod.
-    Containers then carry only what their Compose service declares, and anything
-    undeclared is bounded by the Pod alone -- which is how Compose behaves on a
-    workstation.
+    Harbor's Docker environment caps `main` at the task budget and leaves every
+    other container with what its Compose service declares. Docker documents
+    the rest: a container with a limit is capped at it, and one without "can
+    use as much of a given resource as the host's kernel scheduler allows". The
+    Pod plays the host, so its figures are sums of what runs inside it:
+
+    - request: ``max(task budget, aggregate container requests)``;
+    - ceiling: ``max(request, aggregate container ceilings, task limit)``, where
+      a container's ceiling is its limit, else its request.
+
+    Containers without a ceiling of their own share whatever the Pod has left.
+    The Pod is not a real host, though: its ceiling keeps one task from taking
+    memory or CPU that the scheduler gave to its neighbours.
+
+    ``host_ceilings`` maps a container name to ``{"cpu": millicores, "memory":
+    MiB}`` and replaces that container's ceiling. It exists for ``dind-engine``,
+    whose cgroup holds the Docker daemon and every container the daemon starts
+    (see ``cgroup_nesting_cmd`` in ``_build_shape_b_dind_containers``). Its own
+    spec carries no limit, so its true ceiling -- daemon baseline plus the
+    ceilings of the services it runs -- is only known to the caller.
+
+    A resource the task does not budget gets no Pod-level figure at all: Harbor
+    treats an absent ``cpus`` / ``memory_mb`` as unlimited, and Docker leaves an
+    undeclared container unconstrained.
 
     **Requires Kubernetes 1.34+**, where ``spec.resources`` (KEP-2837) is beta
     and on by default. This function does not check: on an older cluster the API
@@ -954,23 +1040,14 @@ def build_pod_level_resources(
 
     requests: dict[str, str] = {}
     limits: dict[str, str] = {}
-    exceeded: list[str] = []
-    has_dind = any(c.name == "dind-engine" for c in init_containers)
 
     for key, budget, budget_limit, unit in (
         ("cpu", task_cpu_m, task_cpu_limit_m, "m"),
         ("memory", task_mem_mb, task_mem_limit_mb, "Mi"),
     ):
-        request_aggregate = aggregate_pod_resource(
-            init_containers, app_containers, key, prefer_limit=False
-        )
-        limit_aggregate = aggregate_pod_resource(
-            init_containers, app_containers, key, prefer_limit=True
-        )
-        if budget is None and request_aggregate == 0 and limit_aggregate == 0:
+        if budget is None:
             continue
-
-        if is_autopilot and (budget or request_aggregate):
+        if is_autopilot:
             floored = _apply_autopilot_request_floor(
                 [*init_containers, *app_containers], key
             )
@@ -983,51 +1060,243 @@ def build_pod_level_resources(
                     _AUTOPILOT_FLOOR_REQUESTS[key],
                     floored,
                 )
-                request_aggregate = aggregate_pod_resource(
-                    init_containers, app_containers, key, prefer_limit=False
-                )
-                limit_aggregate = aggregate_pod_resource(
-                    init_containers, app_containers, key, prefer_limit=True
-                )
+        request_aggregate = aggregate_pod_resource(init_containers, app_containers, key)
+        ceiling_aggregate = aggregate_pod_resource(
+            init_containers,
+            app_containers,
+            key,
+            prefer_limit=True,
+            overrides={
+                name: ceiling[key]
+                for name, ceiling in (host_ceilings or {}).items()
+                if key in ceiling
+            },
+        )
 
-        pod_request = max(budget or 0, request_aggregate)
+        pod_request = max(budget, request_aggregate)
         # `budget_limit` is an explicitly declared task limit, which
         # `cpu_limit_multiplier` / `memory_limit_multiplier` set deliberately
         # above the request. It must reach the Pod or the multiplier does
-        # nothing. When `dind-engine` is present, nested sibling containers
-        # spawned via `/var/run/docker.sock` run inside the Pod's cgroup (unlike
-        # local Docker where sibling containers run on the host daemon outside
-        # `main`'s memory limit), so enforce `DIND_POD_MEMORY_LIMIT_FLOOR_MB`
-        # on the Pod memory limit while keeping `pod_request` at the task budget.
-        dind_limit_floor = (
-            DIND_POD_MEMORY_LIMIT_FLOOR_MB if (has_dind and key == "memory") else 0
-        )
-        pod_limit = max(
-            pod_request, limit_aggregate, budget_limit or 0, dind_limit_floor
-        )
+        # nothing.
+        pod_limit = max(pod_request, ceiling_aggregate, budget_limit or 0)
         if pod_request <= 0:
             continue
 
         requests[key] = f"{pod_request}{unit}"
         limits[key] = f"{pod_limit}{unit}"
-        if budget and limit_aggregate > max(budget, budget_limit or 0):
-            exceeded.append(
-                f"{key}: services declare {limit_aggregate}{unit} against a task "
-                f"budget of {budget}{unit}"
-            )
 
     if not requests:
         return None
 
-    if exceeded:
-        emit.warning(
-            "Compose-declared limits exceed the task budget, so the Pod ceiling "
-            "was raised to the declared total (%s). The task budget is no longer "
-            "the effective cap for this Pod.",
-            "; ".join(exceeded),
-        )
-
     return k8s_client.V1ResourceRequirements(requests=requests, limits=limits)
+
+
+@dataclass(frozen=True)
+class _MainBudget:
+    """The task's CPU/memory budget, which Harbor applies to `main` only.
+
+    ``*_request`` falls back to the limit when only a limit was given, matching
+    how Kubernetes defaults an unset request. ``None`` means the task left that
+    figure undeclared, so nothing is written for it.
+    """
+
+    cpu_request_m: int | None = None
+    cpu_limit_m: int | None = None
+    memory_request_mb: int | None = None
+    memory_limit_mb: int | None = None
+
+    def container_resources(self) -> tuple[dict[str, str], dict[str, str]]:
+        """The budget as Kubernetes container ``(requests, limits)``."""
+        requests: dict[str, str] = {}
+        limits: dict[str, str] = {}
+        if self.cpu_request_m is not None:
+            requests["cpu"] = f"{self.cpu_request_m}m"
+        if self.memory_request_mb is not None:
+            requests["memory"] = f"{self.memory_request_mb}Mi"
+        if self.cpu_limit_m is not None:
+            limits["cpu"] = f"{self.cpu_limit_m}m"
+        if self.memory_limit_mb is not None:
+            limits["memory"] = f"{self.memory_limit_mb}Mi"
+        return requests, limits
+
+    def apply_to(self, container: k8s_client.V1Container) -> None:
+        """Layer the budget over a natively placed `main`'s own declaration.
+
+        The budget wins wherever it declares a figure, as Harbor's resources
+        override does. A ceiling `main` declares for itself survives where the
+        task sets none, and the request is lowered to it when it would exceed
+        it: the API server rejects a request above the limit.
+        """
+        budget_requests, budget_limits = self.container_resources()
+        res = container.resources or k8s_client.V1ResourceRequirements()
+        requests = {**(res.requests or {}), **budget_requests}
+        limits = {**(res.limits or {}), **budget_limits}
+        for key, parse in (
+            ("cpu", _parse_cpu_millicores_opt),
+            ("memory", _parse_memory_mb_opt),
+        ):
+            requested = parse(requests.get(key))
+            ceiling = parse(limits.get(key))
+            if requested is not None and ceiling is not None and requested > ceiling:
+                logger.warning(
+                    "`main` declares its own %s ceiling of %s, below the task "
+                    "request of %s; requesting %s instead.",
+                    key,
+                    limits[key],
+                    requests[key],
+                    limits[key],
+                )
+                requests[key] = limits[key]
+        res.requests = requests or None
+        res.limits = limits or None
+        container.resources = res
+
+
+def _compose_cpus(raw: Any) -> Any:
+    """Normalize a Compose CPU figure to decimal cores; keep it if unparseable."""
+    millicores = _parse_cpu_millicores_opt(raw)
+    return raw if millicores is None else format(millicores / 1000, "g")
+
+
+def _compose_memory(raw: Any) -> Any:
+    """Normalize a Compose memory figure to ``<MiB>M``; keep it if unparseable."""
+    mib = _parse_memory_mb_opt(raw)
+    return raw if mib is None else f"{mib}M"
+
+
+def _apply_dind_main_budget(
+    sspec: dict[str, Any], budget: _MainBudget
+) -> dict[str, Any]:
+    """Return a copy of inner `main`'s spec carrying the task budget.
+
+    Mirrors Harbor's Docker environment, whose resources override file sets
+    ``services.main`` and wins over whatever the task's own Compose file
+    declares. Only the figures the task declares are written, so a ceiling
+    `main` sets for itself survives in request mode.
+
+    The legacy top-level keys (``cpus``, ``mem_limit``, ``mem_reservation``) are
+    folded into ``deploy.resources`` first: Compose rejects a service that sets
+    both forms to different values, and one source of truth is easier to read
+    in the inner Compose file.
+    """
+    out = dict(sspec)
+    deploy = dict(out["deploy"]) if isinstance(out.get("deploy"), dict) else {}
+    resources = (
+        dict(deploy["resources"]) if isinstance(deploy.get("resources"), dict) else {}
+    )
+    limits = (
+        dict(resources["limits"]) if isinstance(resources.get("limits"), dict) else {}
+    )
+    reservations = (
+        dict(resources["reservations"])
+        if isinstance(resources.get("reservations"), dict)
+        else {}
+    )
+
+    if "cpus" in out:
+        limits.setdefault("cpus", out.pop("cpus"))
+    if "mem_limit" in out:
+        limits.setdefault("memory", out.pop("mem_limit"))
+    if "mem_reservation" in out:
+        reservations.setdefault("memory", out.pop("mem_reservation"))
+
+    # Declared figures first, so whatever survives the budget below reads in the
+    # same canonical form as the budget itself.
+    for block in (limits, reservations):
+        if "cpus" in block:
+            block["cpus"] = _compose_cpus(block["cpus"])
+        if "memory" in block:
+            block["memory"] = _compose_memory(block["memory"])
+
+    for block, cpu_m, memory_mb in (
+        (limits, budget.cpu_limit_m, budget.memory_limit_mb),
+        (reservations, budget.cpu_request_m, budget.memory_request_mb),
+    ):
+        if cpu_m is not None:
+            block["cpus"] = format(cpu_m / 1000, "g")
+        if memory_mb is not None:
+            block["memory"] = f"{memory_mb}M"
+
+    # In request mode the task sets no ceiling, so one `main` declares for
+    # itself stays in force and can sit below the task's request. Docker refuses
+    # a memory reservation above the limit, and reserving what `main` can never
+    # use only withholds it from the node, so the reservation is lowered to the
+    # ceiling.
+    for key, parse in (
+        ("cpus", _parse_cpu_millicores_opt),
+        ("memory", _parse_memory_mb_opt),
+    ):
+        reserved = parse(reservations.get(key))
+        ceiling = parse(limits.get(key))
+        if reserved is not None and ceiling is not None and reserved > ceiling:
+            logger.warning(
+                "DinD `main` declares its own %s ceiling of %s, below the task "
+                "request of %s; reserving %s instead.",
+                key,
+                limits[key],
+                reservations[key],
+                limits[key],
+            )
+            reservations[key] = limits[key]
+
+    if limits:
+        resources["limits"] = limits
+    if reservations:
+        resources["reservations"] = reservations
+    if resources:
+        deploy["resources"] = resources
+        out["deploy"] = deploy
+    return out
+
+
+@dataclass(frozen=True)
+class _DindDeclared:
+    """CPU (millicores) and memory (MiB) the DinD services declare in total.
+
+    These live in the inner Compose file, where the API server cannot see them,
+    yet every container dockerd starts is nested in the Pod's cgroup.
+    ``ceilings`` sums each service's limit, else its reservation -- the rule
+    ``build_pod_level_resources`` applies to Kubernetes containers.
+    """
+
+    reservations: dict[str, int]
+    ceilings: dict[str, int]
+
+
+def _dind_declared_totals(
+    dind_services: Mapping[str, dict[str, Any]],
+) -> _DindDeclared:
+    """Sum what the DinD services declare, in both Compose spellings.
+
+    Reservations come from ``deploy.resources.reservations`` or the legacy
+    ``mem_reservation``; limits from ``deploy.resources.limits`` or the legacy
+    ``cpus`` / ``mem_limit``. A service that declares nothing adds nothing: on
+    Docker it is unconstrained, which here means bounded by the Pod.
+    """
+    reservations = {"cpu": 0, "memory": 0}
+    ceilings = {"cpu": 0, "memory": 0}
+    for sspec in dind_services.values():
+        deploy = sspec.get("deploy")
+        resources = deploy.get("resources") if isinstance(deploy, dict) else None
+        resources = resources if isinstance(resources, dict) else {}
+        declared: dict[str, dict[str, int]] = {}
+        for block, legacy_cpu, legacy_memory in (
+            ("reservations", None, "mem_reservation"),
+            ("limits", "cpus", "mem_limit"),
+        ):
+            raw = resources.get(block)
+            raw = raw if isinstance(raw, dict) else {}
+            cpu = raw.get("cpus", sspec.get(legacy_cpu) if legacy_cpu else None)
+            memory = raw.get("memory", sspec.get(legacy_memory))
+            declared[block] = {
+                "cpu": _quantity_to_millicores(cpu),
+                "memory": _quantity_to_mib(memory),
+            }
+        for key in ("cpu", "memory"):
+            reserved = declared["reservations"][key]
+            reservations[key] += reserved
+            ceilings[key] += declared["limits"][key] or reserved
+    return _DindDeclared(reservations=reservations, ceilings=ceilings)
 
 
 def _extract_service_resources(
@@ -1433,6 +1702,7 @@ def _extract_volumes_and_seed_container(
     base_dir: Path,
     is_autopilot: bool,
     main_image_url: str,
+    seed_image_url: str | None = None,
     scratch_volume_size: str | None = None,
     task_memory_budget_mb: int | None = None,
 ) -> tuple[
@@ -1548,8 +1818,8 @@ def _extract_volumes_and_seed_container(
                 continue
 
             # Harbor log mount
-            if vtgt.rstrip("/") in _HARBOR_SHARED_LOG_PATHS:
-                log_vol_name = _HARBOR_SHARED_LOG_PATHS[vtgt.rstrip("/")]
+            if is_harbor_synthetic_log_mount(vsrc, vtgt):
+                log_vol_name = _HARBOR_SHARED_LOG_PATHS[posixpath.normpath(vtgt)]
                 service_mounts[sname].append(
                     k8s_client.V1VolumeMount(
                         name=log_vol_name,
@@ -1561,7 +1831,10 @@ def _extract_volumes_and_seed_container(
                 continue
 
             # docker.sock mount on DinD sidecars
-            if vsrc == "/var/run/docker.sock" or vtgt == "/var/run/docker.sock":
+            if vsrc in ("/var/run/docker.sock", "/run/docker.sock") and vtgt in (
+                "/var/run/docker.sock",
+                "/run/docker.sock",
+            ):
                 if "harbor-dind-socket" in volumes_dict:
                     service_mounts[sname].append(
                         k8s_client.V1VolumeMount(
@@ -1612,23 +1885,12 @@ def _extract_volumes_and_seed_container(
 
             # Relative / task-tree bind mount
             if vtype == "bind" and vsrc:
-                normalized_vsrc = vsrc
-                if (
-                    normalized_vsrc == "/harbor/environment"
-                    or normalized_vsrc.startswith("/harbor/environment/")
-                ):
-                    suffix = normalized_vsrc[len("/harbor/environment") :]
-                    normalized_vsrc = str(resolved_base_dir) + suffix
-
-                src_path = (
-                    Path(normalized_vsrc)
-                    if Path(normalized_vsrc).is_absolute()
-                    else (resolved_base_dir / normalized_vsrc)
+                local_path = resolve_contained_task_path(
+                    vsrc,
+                    base_dir=resolved_base_dir,
+                    allowed_roots=(resolved_base_dir, resolved_task_dir),
+                    field_name=f"services.{sname}.volumes",
                 )
-                try:
-                    local_path = src_path.resolve()
-                except Exception:
-                    local_path = src_path
 
                 try:
                     rel_key = os.path.relpath(local_path, resolved_task_dir)
@@ -1711,12 +1973,15 @@ def _extract_volumes_and_seed_container(
             # tmpfs is also the better semantic: it stays RAM-backed and honours
             # noexec/nosuid, which the bind rewrite silently discards.
             if sname in placement.dind_sidecars:
-                # tmpfs pages are shmem, charged to `dind-engine`'s memory
-                # cgroup, so an oversized entry can OOM the engine and take
-                # every inner container with it. The ceiling is the task's own
-                # memory budget: no tmpfs can usefully exceed the memory the
-                # whole task is allowed. A service that declares a smaller limit
-                # for itself wins, since it is the more specific statement.
+                # tmpfs pages are shmem, charged to the writing container's
+                # cgroup, which `dockerd --cgroup-parent` nests under
+                # `dind-engine`. `dind-engine` has no memory limit, so an
+                # oversized entry grows the Pod's usage past its request and
+                # pushes the node toward memory-pressure eviction of the whole
+                # Pod. The ceiling is the task's own memory budget: no tmpfs can
+                # usefully exceed the memory the whole task is allowed. A service
+                # that declares a smaller limit for itself wins, since it is the
+                # more specific statement.
                 declared_service_mb = _parse_memory_mb_opt(sspec.get("mem_limit"))
                 candidates = [
                     mb
@@ -1850,7 +2115,7 @@ def _extract_volumes_and_seed_container(
 
     seed_container = k8s_client.V1Container(
         name="harbor-seed",
-        image=main_image_url,
+        image=seed_image_url or main_image_url,
         command=seed_cmd,
         volume_mounts=seed_mounts,
         restart_policy=None,
@@ -2113,13 +2378,23 @@ def _build_shape_b_dind_containers(
     startup_env: dict[str, str] | None = None,
     main_workdir: str | None = None,
     allow_metadata_server: bool = False,
+    wait_for_netpol: bool = False,
+    main_budget: _MainBudget,
 ) -> tuple[
-    list[k8s_client.V1Container],
+    k8s_client.V1Container,
     k8s_client.V1Container,
     k8s_client.V1Container,
     dict[str, str],
+    dict[str, int],
 ]:
-    """Synthesize dind-cache-* initContainers, dind-engine native sidecar, compose-up-gate initContainer, and deterministic DinD IPs (Shape B / Shape C)."""
+    """Synthesize the DinD plane for Shape B / Shape C.
+
+    Returns the dind-engine native sidecar, the dind-pull and compose-up-gate
+    initContainers, deterministic DinD service IPs, and dind-engine's ceiling in
+    CPU (millicores) / memory (MiB): the daemon baseline plus the ceilings the
+    DinD services declare, which the Pod ceiling must count (see
+    ``build_pod_level_resources``).
+    """
     volumes_dict["harbor-dind-images"] = k8s_client.V1Volume(
         name="harbor-dind-images",
         empty_dir=k8s_client.V1EmptyDirVolumeSource(),
@@ -2133,7 +2408,13 @@ def _build_shape_b_dind_containers(
             name="harbor-dind-storage", mount_path="/var/lib/docker"
         ),
         k8s_client.V1VolumeMount(
-            name="harbor-dind-images", mount_path="/harbor/dind-images"
+            name="harbor-dind-images",
+            mount_path="/harbor/dind-images",
+            mount_propagation=(
+                "HostToContainer"
+                if placement.shape == "C" and not is_gvisor
+                else None
+            ),
         ),
     ]
     mounted_vol_names = {
@@ -2242,6 +2523,7 @@ def _build_shape_b_dind_containers(
                 orig["working_dir"] = main_workdir
             if startup_env:
                 merged_env.update(startup_env)
+            orig = _apply_dind_main_budget(orig, main_budget)
         if merged_env or existing_env is not None:
             orig["environment"] = merged_env
 
@@ -2367,16 +2649,13 @@ def _build_shape_b_dind_containers(
     dind_compose_yaml = yaml.safe_dump(dind_compose_doc, sort_keys=False)
     b64_compose = base64.b64encode(dind_compose_yaml.encode("utf-8")).decode("ascii")
 
-    # Synthesize dind-cache-<sname> initContainers.
-    # Because dind-engine starts BEFORE dind-cache-<sname>, dockerd is already up
-    # on /var/run/harbor-dind/docker.sock and its static CLI binary has been staged
-    # at /harbor/dind-images/docker-cli. Each dind-cache-<sname> streams its rootfs
-    # directly into dockerd over a Unix pipe (`tar -cf - ... | docker-cli import`).
-    # Raw `docker import` discards all OCI image config metadata, so we capture
-    # runtime WORKDIR/USER/ENV inside the container AND pass orchestrator-resolved
-    # OCI config fields (ENTRYPOINT, CMD, EXPOSE, LABEL, STOPSIGNAL, HEALTHCHECK)
-    # via `--change` flags with zero temp .tar files on disk.
-    dind_cache_containers: list[k8s_client.V1Container] = []
+    # Materialize DinD service images via `dind-pull` (running trusted `docker:dind`
+    # under the pre-task Bootstrap NetworkPolicy) before scrubbing `.docker`,
+    # blocking metadata access, and applying the task's restrictive NetworkPolicy.
+    # Omitting per-service `dind-cache-<sname>` init containers prevents Kubelet
+    # (`containerd`) from downloading and unpacking a second copy of every DinD
+    # image onto the host node just to run `exit 0`.
+    pull_cmds: list[str] = []
     load_cmds: list[str] = []
     # Every DinD service's image, including the ones skipped below because they
     # have no `image:` and are built in-Pod instead. Storage sizing needs to know
@@ -2387,101 +2666,65 @@ def _build_shape_b_dind_containers(
         dind_service_images[sname] = s_img or None
         if not s_img:
             continue
-        cache_cname = _sanitize_kubernetes_resource_name(f"dind-cache-{sname}")
         q_sname = shlex.quote(sname)
         q_img = shlex.quote(s_img)
-        oci_cfg = _resolve_oci_image_config(s_img)
-        oci_changes = _format_oci_config_changes(oci_cfg)
-        oci_change_snippet = "".join(
-            f'set -- "$@" --change {shlex.quote(chg)}; ' for chg in oci_changes
-        )
-        cache_script = (
+        gcfs_import_branch = ""
+        if placement.shape == "C" and sname == MAIN_SERVICE_NAME and not is_gvisor:
+            oci_cfg = _resolve_oci_image_config(s_img)
+            change_flags = _format_oci_import_changes(oci_cfg)
+            change_part = f" {change_flags}" if change_flags else ""
+            gcfs_import_branch = (
+                'elif [ "$SN" = "main" ] && [ -f /harbor/dind-images/.main-rootfs-captured ] && { '
+                "mkdir -p /tmp/harbor-empty-seed && : > /tmp/harbor-empty-seed/.harbor-seed && "
+                f'tar -C /tmp/harbor-empty-seed -cf - . | DOCKER_HOST="$DH" "$DCLI" import{change_part} - "$IMG" >/dev/null 2>&1; '
+                "}; then "
+                'echo "harbor: ${SN}: image ${IMG} stub imported for Kubelet gcfs rootfs bridge"; '
+            )
+        pull_cmds.append(
             f"SN={q_sname}; IMG={q_img}; "
-            "DH='unix:///var/run/harbor-dind/docker.sock'; "
-            "DCLI='/harbor/dind-images/docker-cli'; "
-            "mkdir -p /harbor/dind-images; "
             'if DOCKER_HOST="$DH" "$DCLI" image inspect "$IMG" >/dev/null 2>&1; then '
             'echo "harbor: ${SN}: image ${IMG} already present in dind-engine (deduplicated)"; '
-            "exit 0; "
-            "fi; "
-            # Prefer `docker pull` into dind-engine over re-tarring the container's
-            # mounted rootfs. On GKE nodes running Image Streaming (`gcfs`), every
-            # file in the mounted rootfs reports `st_nlink = 1`, so `tar -cf - /`
-            # cannot detect hard-linked files and expands hardlink-dense OCI
-            # layers by an order of magnitude. Pulling from the registry extracts
-            # the original OCI tar onto dind-engine's ext4 `/var/lib/docker/overlay2`,
-            # preserving hard links, layer sharing, and the native OCI image config.
-            # The rootfs `tar | docker import` path remains as the offline/private
-            # fallback when `docker pull` cannot reach the registry.
-            'if DOCKER_CONFIG="/harbor/dind-images/.docker" DOCKER_HOST="$DH" '
+            f"{gcfs_import_branch}"
+            'elif DOCKER_CONFIG="/harbor/dind-images/.docker" DOCKER_HOST="$DH" '
             '"$DCLI" pull -q "$IMG" >/dev/null 2>"/harbor/dind-images/${SN}.pull-err"; then '
             'rm -f "/harbor/dind-images/${SN}.pull-err"; '
             'echo "harbor: ${SN}: image ${IMG} materialized via docker pull '
             '(OCI layers and hardlinks preserved)"; '
-            "exit 0; "
-            "fi; "
-            'echo "harbor: ${SN}: docker pull ${IMG} unavailable '
-            '($(head -1 "/harbor/dind-images/${SN}.pull-err" 2>/dev/null)); '
-            'falling back to rootfs direct-pipe" >&2; '
-            'rm -f "/harbor/dind-images/${SN}.pull-err"; '
-            "WORKDIR=$(pwd); "
-            'set -- --change "WORKDIR ${WORKDIR}"; '
-            f"{oci_change_snippet}"
-            "CUR_UID=$(id -u 2>/dev/null || echo 0); "
-            "CUR_GID=$(id -g 2>/dev/null || echo 0); "
-            'if [ "$CUR_UID" != "0" ]; then '
-            'set -- "$@" --change "USER ${CUR_UID}:${CUR_GID}"; '
-            "fi; "
-            'for K in $(env | sed -n "s/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p"); do '
-            'case "$K" in '
-            "KUBERNETES_*|HOSTNAME|HOME|TERM|PWD|OLDPWD|SHLVL|_|container) continue ;; "
-            "esac; "
-            'eval "V=\\${$K}"; '
-            'V_ESC=$(printf "%s" "$V" | sed \'s/\\\\/\\\\\\\\/g; s/"/\\\\"/g\'); '
-            'set -- "$@" --change "ENV ${K}=\\"${V_ESC}\\""; '
-            "done; "
-            "tar -cf - "
-            "--exclude=/proc --exclude=/sys --exclude=/dev "
-            "--exclude=/harbor --exclude=/var/run --exclude=/run "
-            "--exclude=/etc/hosts --exclude=/etc/resolv.conf --exclude=/etc/hostname "
-            '/ 2>"/harbor/dind-images/${SN}.tar-err" '
-            '| DOCKER_HOST="$DH" "$DCLI" import "$@" - "$IMG" >/dev/null; '
-            'if ! DOCKER_HOST="$DH" "$DCLI" image inspect "$IMG" >/dev/null 2>&1; then '
-            'echo "HARBOR_ERROR: could not materialize image ${IMG} for DinD service ${SN}" >&2; '
-            'if [ -s "/harbor/dind-images/${SN}.tar-err" ]; then '
-            'head -5 "/harbor/dind-images/${SN}.tar-err" >&2; '
-            "fi; "
+            "else "
+            'echo "HARBOR_ERROR: could not pull image ${IMG} for DinD service ${SN}:" >&2; '
+            'cat "/harbor/dind-images/${SN}.pull-err" >&2 2>/dev/null || true; '
+            'rm -rf "/harbor/dind-images/${SN}.pull-err" /harbor/dind-images/.docker; '
             "exit 1; "
             "fi; "
-            'rm -f "/harbor/dind-images/${SN}.tar-err"; '
-            'echo "harbor: ${SN}: image ${IMG} materialized via direct-pipe (OCI config + ENV/WORKDIR/USER preserved)"'
-        )
-        dind_cache_containers.append(
-            k8s_client.V1Container(
-                name=cache_cname,
-                image=s_img,
-                command=["sh", "-c", cache_script],
-                volume_mounts=[
-                    k8s_client.V1VolumeMount(
-                        name="harbor-dind-socket",
-                        mount_path="/var/run/harbor-dind",
-                    ),
-                    k8s_client.V1VolumeMount(
-                        name="harbor-dind-images",
-                        mount_path="/harbor/dind-images",
-                    ),
-                ],
-                restart_policy=None,
-            )
         )
         load_cmds.append(f"load_image {shlex.quote(sname)} {shlex.quote(s_img)}")
 
-    # Invariant 5: Unix socket only, NO TCP listener, NO --dns=8.8.8.8 flag
-    # No CPU or memory figures are set here. dockerd's appetite is a property of
-    # the task's workload, not of dockerd, so there is nothing to derive a
-    # per-container number from. It draws on the Pod-wide budget alongside every
-    # other container.
-    dind_engine_requests: dict[str, str] = {}
+    # Invariant 5: Unix socket only, NO TCP listener, NO --dns=8.8.8.8 flag.
+    # `--dns-opt=ndots:1 --dns-opt=timeout:2 --dns-opt=attempts:1` overrides
+    # Kubelet's `ndots:5` inside inner DinD containers so FQDNs with >= 1 dot
+    # (e.g. `example.com`) are queried directly without walking the 5 Kubernetes
+    # `.svc.cluster.local` search domains (which otherwise stalls `getaddrinfo`
+    # for 48s under `no-network`).
+    #
+    # dind-engine is the Docker host of the DinD services: the daemon and every
+    # container it starts are nested in its cgroup (see `cgroup_nesting_cmd`).
+    # It requests the daemon baseline plus what those services reserve, so the
+    # scheduler sees the workload it places. It has no CPU or memory limit of
+    # its own: the Pod ceiling bounds the host (see `build_pod_level_resources`),
+    # and inside it `main` is capped at the task budget and every DinD service
+    # at the limits it declares, as on Docker. Its true ceiling -- baseline plus
+    # the services' ceilings -- is returned for the Pod ceiling to count.
+    dind_declared = _dind_declared_totals(dind_services_spec)
+    dind_engine_requests: dict[str, str] = {
+        "cpu": f"{DIND_ENGINE_BASELINE_CPU_M + dind_declared.reservations['cpu']}m",
+        "memory": (
+            f"{DIND_ENGINE_BASELINE_MEMORY_MB + dind_declared.reservations['memory']}Mi"
+        ),
+    }
+    dind_engine_ceiling: dict[str, int] = {
+        "cpu": DIND_ENGINE_BASELINE_CPU_M + dind_declared.ceilings["cpu"],
+        "memory": DIND_ENGINE_BASELINE_MEMORY_MB + dind_declared.ceilings["memory"],
+    }
     dind_engine_limits: dict[str, str] = {}
 
     # `harbor-dind-storage` is an emptyDir mounted at /var/lib/docker. Without a
@@ -2529,32 +2772,122 @@ def _build_shape_b_dind_containers(
             f"mkdir -p {shlex.quote(parent_dir)} && "
             f"ln -sfn {shlex.quote(src_vol_path)} {shlex.quote(dst_mount_path)}; "
         )
+    stage_gcfs_bridge_cmds = (
+        "cp /bin/busybox /harbor/dind-images/busybox; "
+        "cp /lib/ld-musl-*.so.1 /harbor/dind-images/ld-musl.so.1; "
+        "chmod 0755 /harbor/dind-images/busybox /harbor/dind-images/ld-musl.so.1; "
+        "(while [ ! -f /harbor/dind-images/.main-rootfs-mounted ]; do sleep 0.05; done; "
+        "mkdir -p /tmp/harbor-main-rootfs; "
+        "if mount --bind /harbor/dind-images/main-rootfs /tmp/harbor-main-rootfs 2>>/harbor/dind-images/.main-layers-err; then "
+        "mount --make-private /tmp/harbor-main-rootfs 2>/dev/null || true; "
+        ": > /harbor/dind-images/.main-rootfs-captured; "
+        "fi; "
+        ": > /harbor/dind-images/.main-rootfs-ack) >/dev/null 2>&1 & "
+        if placement.shape == "C" and not is_gvisor
+        else ""
+    )
     main_layers_watcher = (
-        "(while [ ! -s /harbor/dind-images/.main-layers ]; do sleep 0.2; done; "
+        "(while [ ! -s /harbor/dind-images/.main-layers ]; do sleep 0.1; done; "
         "LAYERS=$(cat /harbor/dind-images/.main-layers); "
         "mkdir -p /tmp/harbor-main-rootfs; "
-        'if echo "$LAYERS" | grep -q ":"; then '
-        'mount -t overlay overlay -o "ro,lowerdir=${LAYERS}" /tmp/harbor-main-rootfs 2>/dev/null || true; '
+        "if [ -f /harbor/dind-images/.main-rootfs-captured ]; then "
+        'if [ -n "$LAYERS" ] && [ -d "$LAYERS" ]; then '
+        'mount --bind /tmp/harbor-main-rootfs "$LAYERS" 2>>/harbor/dind-images/.main-layers-err '
+        '|| echo "mount --bind $LAYERS exited $?" >> /harbor/dind-images/.main-layers-err; '
+        "fi; "
         "else "
-        'mount --bind -o ro "$LAYERS" /tmp/harbor-main-rootfs 2>/dev/null || true; '
+        'case "$LAYERS" in '
+        "*:*) "
+        'mount -t overlay overlay -o "ro,lowerdir=${LAYERS}" /tmp/harbor-main-rootfs 2>/dev/null || true ;; '
+        "*) "
+        'mount --bind -o ro "$LAYERS" /tmp/harbor-main-rootfs 2>/dev/null || true ;; '
+        "esac; "
         "fi; "
         "if [ -d /tmp/harbor-main-rootfs/app ] && [ ! -e /app ]; then "
         "ln -sfn /tmp/harbor-main-rootfs/app /app; "
         "fi; "
-        "touch /harbor/dind-images/.main-layers-ready) >/dev/null 2>&1 & "
+        "touch /harbor/dind-images/.main-layers-ready; "
+        "for _j in $(seq 1 150); do "
+        "MM=$(DOCKER_HOST=unix:///var/run/harbor-dind/docker.sock docker inspect -f '{{.GraphDriver.Data.MergedDir}}' main 2>/dev/null || true); "
+        'if [ -n "$MM" ] && [ -d "$MM/app" ]; then ln -sfn "$MM/app" /app; break; fi; '
+        "sleep 0.2; "
+        "done) >/dev/null 2>&1 & "
     )
     metadata_lockdown_watcher = (
         "(while [ ! -f /harbor/dind-images/.auth-scrubbed ]; do sleep 0.1; done; "
+        "if grep -q '169\\.254\\.169\\.254' /etc/resolv.conf 2>/dev/null && command -v iptables >/dev/null 2>&1; then "
+        "iptables -I OUTPUT -d 169.254.169.254/32 -p udp --dport 53 -j ACCEPT 2>/dev/null || true; "
+        "iptables -I OUTPUT -d 169.254.169.254/32 -p tcp --dport 53 -j ACCEPT 2>/dev/null || true; "
+        "iptables -A OUTPUT -d 169.254.169.254/32 -j REJECT 2>/dev/null || true; "
+        "else "
         "ip route replace unreachable 169.254.169.254/32 2>/dev/null || true; "
+        "fi; "
         "ip route replace unreachable 169.254.169.252/32 2>/dev/null || true; "
         "touch /harbor/dind-images/.metadata-blocked) >/dev/null 2>&1 & "
         if not allow_metadata_server
         else ""
     )
+    # A privileged container shares the node's cgroup namespace, so a default
+    # dockerd (cgroupfs driver) creates `/docker/<id>` at the node root for every
+    # container it starts: outside the Pod, invisible to the kubelet's
+    # accounting and eviction, and left behind after the Pod is deleted
+    # (measured on GKE 1.35.6, 2026-10-03). Move this container's processes into
+    # a `harbor-daemon` leaf, delegate every available controller, and point
+    # `--cgroup-parent` below our own cgroup so nested containers count against
+    # dind-engine and are removed with the Pod.
+    #
+    # This must run before any background job: cgroup v2 refuses to enable
+    # controllers on a cgroup that still holds processes. Short-lived processes
+    # (the `$(...)` subshells themselves) can race the move, hence the retry.
+    # Failing closed is deliberate: a dind-engine that cannot nest would
+    # silently put the task's workload outside the Pod again.
+    #
+    # gVisor is exempt: its dockerd runs inside the sandbox, whose own cgroup
+    # already contains everything it starts.
+    cgroup_nesting_cmd = (
+        "harbor_nest_fail() { "
+        "echo \"HARBOR_ERROR: dind-engine cannot nest the Docker daemon's "
+        "containers inside its own cgroup ($1). Refusing to start: they would "
+        "run outside the Pod's resource accounting and outlive it. A cgroup v2 "
+        'node is required." >&2; exit 1; }; '
+        "HARBOR_CG_SELF=$(sed -n 's/^0:://p' /proc/self/cgroup); "
+        'HARBOR_CG="/sys/fs/cgroup${HARBOR_CG_SELF}"; '
+        '{ [ -n "$HARBOR_CG_SELF" ] && [ -f "$HARBOR_CG/cgroup.subtree_control" ]; } '
+        '|| harbor_nest_fail "no cgroup v2 hierarchy at ${HARBOR_CG}"; '
+        'mkdir -p "$HARBOR_CG/harbor-daemon" '
+        '|| harbor_nest_fail "cannot create ${HARBOR_CG}/harbor-daemon"; '
+        "HARBOR_CG_NESTED=0; "
+        "for _try in 1 2 3 4 5 6 7 8 9 10; do "
+        'for _pid in $(cat "$HARBOR_CG/cgroup.procs"); do '
+        '{ echo "$_pid" > "$HARBOR_CG/harbor-daemon/cgroup.procs"; } 2>/dev/null; '
+        "done; "
+        'if { echo "+cpu +memory +pids" > "$HARBOR_CG/cgroup.subtree_control"; } 2>/dev/null; '
+        "then HARBOR_CG_NESTED=1; break; fi; "
+        "sleep 0.1; "
+        "done; "
+        '[ "$HARBOR_CG_NESTED" = 1 ] '
+        '|| harbor_nest_fail "cannot enable +cpu +memory +pids in ${HARBOR_CG}/cgroup.subtree_control"; '
+        # Required controllers are in; anything else the node offers (io,
+        # hugetlb, ...) is delegated when possible but never blocks startup.
+        'for _ctrl in $(cat "$HARBOR_CG/cgroup.controllers"); do '
+        '{ echo "+$_ctrl" > "$HARBOR_CG/cgroup.subtree_control"; } 2>/dev/null; '
+        "done; "
+        # No attempt is made to clear the kubelet's `memory.oom.group=1` on
+        # this cgroup: containerd keeps it in the container's spec and runc
+        # writes it back on every UpdateContainerResources (the static CPU
+        # manager issues one seconds after start; measured on GKE 1.35.6).
+        # Per-process OOM kills, as on a Docker host, come from the node's
+        # kubelet setting `singleProcessOOMKill: true`; the teardown usage
+        # report names it when a group kill happens.
+        if not is_gvisor
+        else ""
+    )
     stage_cli_cmd = (
+        f"{cgroup_nesting_cmd}"
         "mkdir -p /harbor/dind-images /harbor/dind-images/.docker; "
         "cp /usr/local/bin/docker /harbor/dind-images/docker-cli; "
         "chmod 0755 /harbor/dind-images/docker-cli; "
+        f"{stage_gcfs_bridge_cmds}"
         f"{symlink_cmds}"
         f"{main_layers_watcher}"
         f"{metadata_lockdown_watcher}"
@@ -2579,10 +2912,13 @@ def _build_shape_b_dind_containers(
         "harbor_refresh_gcr_auth; "
         "(while sleep 900; do [ -f /harbor/dind-images/.auth-scrubbed ] && break; harbor_refresh_gcr_auth; done) >/dev/null 2>&1 & "
     )
+    dind_dns_opts = "--dns-opt=ndots:1 --dns-opt=timeout:2 --dns-opt=attempts:1"
+    dind_pull_opts = "--max-concurrent-downloads=10"
     dockerd_argv = (
-        "dockerd --host=unix:///var/run/harbor-dind/docker.sock --iptables=false --ip6tables=false"
+        f"dockerd --host=unix:///var/run/harbor-dind/docker.sock {dind_dns_opts} {dind_pull_opts} --iptables=false --ip6tables=false"
         if is_gvisor
-        else "dockerd --host=unix:///var/run/harbor-dind/docker.sock"
+        else f"dockerd --host=unix:///var/run/harbor-dind/docker.sock {dind_dns_opts} {dind_pull_opts} "
+        '--cgroup-parent="${HARBOR_CG_SELF}/docker"'
     )
 
     dind_engine_command: list[str] = [
@@ -2654,7 +2990,7 @@ def _build_shape_b_dind_containers(
     )
 
     dind_engine = k8s_client.V1Container(
-        name="dind-engine",
+        name=DIND_ENGINE_CONTAINER,
         image=dind_image_url,
         command=dind_engine_command,
         security_context=dind_security_context,
@@ -2679,9 +3015,48 @@ def _build_shape_b_dind_containers(
         ),
     )
 
+    metadata_lockdown_wait = (
+        "while [ ! -f /harbor/dind-images/.metadata-blocked ]; do sleep 0.1; done && "
+        if not allow_metadata_server
+        else ""
+    )
+    netpol_handshake_wait = (
+        "touch /harbor/dind-images/.ready-for-netpol && "
+        "while [ ! -f /harbor/dind-images/.netpol-applied ]; do sleep 0.1; done && "
+        if wait_for_netpol
+        else ""
+    )
+    pull_script = (
+        "DH='unix:///var/run/harbor-dind/docker.sock'; "
+        "DCLI='/harbor/dind-images/docker-cli'; "
+        "mkdir -p /harbor/dind-images; "
+        f"{''.join(pull_cmds)}"
+        "touch /harbor/dind-images/.auth-scrubbed && "
+        "rm -rf /harbor/dind-images/.docker && "
+        f"{metadata_lockdown_wait}"
+        f"{netpol_handshake_wait}"
+        "exit 0"
+    )
+    dind_pull = k8s_client.V1Container(
+        name="dind-pull",
+        image=dind_image_url,
+        command=["sh", "-c", pull_script],
+        volume_mounts=[
+            k8s_client.V1VolumeMount(
+                name="harbor-dind-socket",
+                mount_path="/var/run/harbor-dind",
+            ),
+            k8s_client.V1VolumeMount(
+                name="harbor-dind-images",
+                mount_path="/harbor/dind-images",
+            ),
+        ],
+        restart_policy=None,
+    )
+
     # `load_image` verifies that each DinD sidecar image was materialized into
-    # dind-engine by its preceding dind-cache-<sname> initContainer. When `SN`
-    # is `main`, it also records the image's overlay2 layer directories in
+    # dind-engine by `dind-pull` or its preceding `dind-cache-<sname>` initContainer.
+    # When `SN` is `main`, it also records the image's overlay2 layer directories in
     # `/harbor/dind-images/.main-layers` so `dind-engine` can expose `/app` in
     # its mount namespace before nested compose services bind-mount from `/app`.
     load_fn_def = (
@@ -2691,13 +3066,19 @@ def _build_shape_b_dind_containers(
         'if DOCKER_HOST="${DH}" docker image inspect "${IMG}" >/dev/null 2>&1; then '
         'echo "harbor: ${SN}: image ${IMG} verified in dind-engine"; '
         'if [ "$SN" = "main" ]; then '
-        'DOCKER_HOST="${DH}" docker image inspect "${IMG}" --format '
-        "'{{if .GraphDriver.Data.LowerDir}}{{.GraphDriver.Data.UpperDir}}:{{.GraphDriver.Data.LowerDir}}{{else}}{{.GraphDriver.Data.UpperDir}}{{end}}' "
-        "> /harbor/dind-images/.main-layers 2>/dev/null || true; "
-        "for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do "
+        'GD=$(DOCKER_HOST="${DH}" docker image inspect "${IMG}" --format '
+        "'{{if .GraphDriver.Data}}{{if .GraphDriver.Data.LowerDir}}{{.GraphDriver.Data.UpperDir}}:{{.GraphDriver.Data.LowerDir}}{{else}}{{.GraphDriver.Data.UpperDir}}{{end}}{{end}}' "
+        "2>/dev/null || true); "
+        'if [ -n "$GD" ]; then '
+        'printf "%s\\n" "$GD" > /harbor/dind-images/.main-layers; '
+        "for _i in $(seq 1 50); do "
         "[ -f /harbor/dind-images/.main-layers-ready ] && break; "
         "sleep 0.2; "
         "done; "
+        "if [ -s /harbor/dind-images/.main-layers-err ]; then "
+        "cat /harbor/dind-images/.main-layers-err >&2; "
+        "fi; "
+        "fi; "
         "fi; "
         "return 0; "
         "fi; "
@@ -2791,11 +3172,6 @@ def _build_shape_b_dind_containers(
     # Without a bound here the gate blocks until `pod_ready_timeout` (1200s) and
     # the failure reaches the operator as "pod not ready", with no hint that the
     # inner Compose project was the cause.
-    metadata_lockdown_wait = (
-        "while [ ! -f /harbor/dind-images/.metadata-blocked ]; do sleep 0.1; done && "
-        if not allow_metadata_server
-        else ""
-    )
     gate_script = (
         f"touch /harbor/dind-images/.auth-scrubbed && rm -rf /harbor/dind-images/.docker && "
         f"{metadata_lockdown_wait}"
@@ -2846,7 +3222,13 @@ def _build_shape_b_dind_containers(
         restart_policy=None,
     )
 
-    return dind_cache_containers, dind_engine, compose_up_gate, dind_service_ips
+    return (
+        dind_engine,
+        dind_pull,
+        compose_up_gate,
+        dind_service_ips,
+        dind_engine_ceiling,
+    )
 
 
 def translate_compose(
@@ -2892,6 +3274,7 @@ def translate_compose(
     sidecar_images: dict[str, str] | None = None,
     compute_class: str | None = None,
     allow_metadata_server: bool = False,
+    wait_for_netpol: bool = False,
     logger: Any | None = None,
     **_extra_kwargs: Any,
 ) -> k8s_client.V1Pod:
@@ -2929,6 +3312,7 @@ def translate_compose(
         paths,
         compose_env,
         context_dir=base_dir,
+        task_dir=eff_task_dir,
     )
 
     placement = classify_compose_placement(
@@ -2951,12 +3335,19 @@ def translate_compose(
     task_mem_mb = _parse_memory_mb_opt(memory_request or memory_limit)
     task_cpu_limit_m = _parse_cpu_millicores_opt(cpu_limit)
     task_mem_limit_mb = _parse_memory_mb_opt(memory_limit)
+    main_budget = _MainBudget(
+        cpu_request_m=task_cpu_m,
+        cpu_limit_m=task_cpu_limit_m,
+        memory_request_mb=task_mem_mb,
+        memory_limit_mb=task_mem_limit_mb,
+    )
 
-    # Containers carry only what their own Compose service declares; the
-    # task-wide CPU/memory budget is written once onto `spec.resources` (see
-    # `build_pod_level_resources`). Ephemeral storage is the exception, because
-    # the API server accepts only cpu, memory and hugepages-* at Pod level, so
-    # the task's storage budget stays a `main` reservation.
+    # The task budget caps `main`, as in Harbor's Docker environment (see
+    # `_MainBudget`), and bounds the whole Pod -- the "host" -- through
+    # `spec.resources` (see `build_pod_level_resources`). Other containers carry
+    # only what their own Compose service declares. Ephemeral storage stays a
+    # `main` reservation, because the API server accepts only cpu, memory and
+    # hugepages-* at Pod level.
     main_reqs: dict[str, str] = {}
     if ephemeral_storage_request:
         main_reqs["ephemeral-storage"] = ephemeral_storage_request
@@ -2965,6 +3356,7 @@ def translate_compose(
     resolved_main_image = resolver.resolve(
         eff_main_image, origin=ImageOrigin.MAIN_BUILT
     )
+    resolved_dind_image = resolver.resolve(_DIND_ENGINE_IMAGE, origin=ImageOrigin.INFRA)
     sidecar_urls = dict(sidecar_image_urls or sidecar_images or {})
     resolved_sidecar_images: dict[str, str] = {}
     for sname, sspec in services.items():
@@ -2997,6 +3389,7 @@ def translate_compose(
         base_dir=base_dir,
         is_autopilot=caps.is_autopilot,
         main_image_url=resolved_main_image,
+        seed_image_url=resolved_dind_image,
         scratch_volume_size=scratch_volume_size,
         task_memory_budget_mb=task_mem_mb,
     )
@@ -3015,6 +3408,7 @@ def translate_compose(
         if placement.pre_main_ordered_services
         else [*placement.native_init_services, *placement.native_sidecar_services]
     )
+    ordered_pre_main_containers: list[k8s_client.V1Container] = []
     for sname in ordered_pre_main:
         sspec = services[sname]
         is_one_shot = sname in init_service_set
@@ -3033,17 +3427,22 @@ def translate_compose(
             is_one_shot_init=is_one_shot,
         )
         any_needs_gvisor = any_needs_gvisor or gvisor
-        init_containers.append(c_obj)
+        ordered_pre_main_containers.append(c_obj)
 
-    # 3. Shape B / Shape C DinD containers (dind-cache-* + dind-engine + compose-up-gate)
+    # 3. Shape B / Shape C DinD containers (dind-engine + dind-pull + ordered_pre_main + compose-up-gate)
+    # Ordering invariant (WP-3 / F-05):
+    #   harbor-seed (trusted) -> dind-engine (trusted) -> dind-pull (trusted: pulls images, scrubs .docker,
+    #   blocks metadata, and optionally waits for restrictive NetworkPolicy)
+    #   -> ordered_pre_main_containers (untrusted task init/sidecar containers) -> compose-up-gate (trusted).
     dind_service_ips: dict[str, str] = {}
-    resolved_dind_image = resolver.resolve(_DIND_ENGINE_IMAGE, origin=ImageOrigin.INFRA)
+    dind_engine_ceiling: dict[str, int] = {}
     if placement.shape in ("B", "C"):
         (
-            dind_cache_containers,
             dind_engine,
+            dind_pull,
             compose_up_gate,
             dind_service_ips,
+            dind_engine_ceiling,
         ) = _build_shape_b_dind_containers(
             project,
             placement,
@@ -3061,10 +3460,64 @@ def translate_compose(
             startup_env=startup_env,
             main_workdir=main_workdir,
             allow_metadata_server=bool(allow_metadata_server),
+            wait_for_netpol=bool(wait_for_netpol),
+            main_budget=main_budget,
         )
         init_containers.append(dind_engine)
-        init_containers.extend(dind_cache_containers)
+        if placement.shape == "C" and runtime_class_name != "gvisor":
+            dind_main_rootfs = k8s_client.V1Container(
+                name=DIND_MAIN_ROOTFS_CONTAINER,
+                image=resolved_main_image,
+                command=[
+                    "/harbor/dind-images/ld-musl.so.1",
+                    "/harbor/dind-images/busybox",
+                    "sh",
+                    "-c",
+                    'BB="/harbor/dind-images/ld-musl.so.1 /harbor/dind-images/busybox"; '
+                    "if [ ! -f /harbor/dind-images/.main-rootfs-captured ]; then "
+                    "$BB mkdir -p /harbor/dind-images/main-rootfs && "
+                    "$BB mount --bind / /harbor/dind-images/main-rootfs && "
+                    ": > /harbor/dind-images/.main-rootfs-mounted && "
+                    "while [ ! -f /harbor/dind-images/.main-rootfs-ack ]; do "
+                    "$BB sleep 0.05; "
+                    "done; "
+                    "$BB umount -l /harbor/dind-images/main-rootfs 2>/dev/null || true; "
+                    "$BB rmdir /harbor/dind-images/main-rootfs 2>/dev/null || true; "
+                    "fi; "
+                    ": > /harbor/dind-images/.main-rootfs-ready && "
+                    "exec $BB sleep 3650d",
+                ],
+                security_context=k8s_client.V1SecurityContext(privileged=True),
+                volume_mounts=[
+                    k8s_client.V1VolumeMount(
+                        name="harbor-dind-images",
+                        mount_path="/harbor/dind-images",
+                        mount_propagation="Bidirectional",
+                    ),
+                ],
+                restart_policy="Always",
+                startup_probe=k8s_client.V1Probe(
+                    _exec=k8s_client.V1ExecAction(
+                        command=[
+                            "/harbor/dind-images/ld-musl.so.1",
+                            "/harbor/dind-images/busybox",
+                            "test",
+                            "-f",
+                            "/harbor/dind-images/.main-rootfs-ready",
+                        ]
+                    ),
+                    initial_delay_seconds=0,
+                    period_seconds=1,
+                    timeout_seconds=5,
+                    failure_threshold=30,
+                ),
+            )
+            init_containers.append(dind_main_rootfs)
+        init_containers.append(dind_pull)
+        init_containers.extend(ordered_pre_main_containers)
         init_containers.append(compose_up_gate)
+    else:
+        init_containers.extend(ordered_pre_main_containers)
 
     # 4. Main container (native in Shape A/B; lifecycle mirror in Shape C per RFC 0004)
     main_spec = services[MAIN_SERVICE_NAME]
@@ -3115,6 +3568,7 @@ def translate_compose(
             tpu_spec=tpu,
         )
         any_needs_gvisor = any_needs_gvisor or main_gvisor
+        main_budget.apply_to(main_container)
     app_containers.append(main_container)
 
     # 5. Post-main sidecars (Decision Q1: services declaring depends_on: main)
@@ -3269,6 +3723,11 @@ def translate_compose(
     # container requests, and that aggregate depends on the order init
     # containers were appended in. Building it here is the only way to be sure
     # the two agree.
+    #
+    # Every shape: the Pod is the task's Docker host, and its ceiling keeps the
+    # task off memory and CPU the scheduler gave to other Pods. In a DinD Pod
+    # the daemon and its containers are nested in `dind-engine`, whose ceiling
+    # only the DinD builder knows.
     pod_level_resources = build_pod_level_resources(
         init_containers,
         app_containers,
@@ -3276,6 +3735,11 @@ def translate_compose(
         task_mem_mb=task_mem_mb,
         task_cpu_limit_m=task_cpu_limit_m,
         task_mem_limit_mb=task_mem_limit_mb,
+        host_ceilings=(
+            {DIND_ENGINE_CONTAINER: dind_engine_ceiling}
+            if dind_engine_ceiling
+            else None
+        ),
         is_autopilot=caps.is_autopilot,
         log=logger,
     )

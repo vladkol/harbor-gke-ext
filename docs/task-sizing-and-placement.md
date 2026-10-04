@@ -67,15 +67,20 @@ Key implementation details:
     `--ek memory_limit_multiplier=<float>`, which apply only under the default
     `--cpus auto` / `--memory auto` and are ignored with explicit `guarantee` or `request`),
     `build_direct_pod()` places the budget on `pod.spec.resources` (`Burstable` QoS).
-  - On **Compose (multi-container) Pods**, `build_pod_level_resources()` always places the
-    task-wide CPU and memory budget on `pod.spec.resources` so `main`, native sidecars, and
-    `dind-engine` share one Pod cgroup budget. When `dind-engine` is present (Shapes B and
-    C), `pod.spec.resources.limits.memory` enforces a floor of `8192Mi`
-    (`DIND_POD_MEMORY_LIMIT_FLOOR_MB = 8192`) so the nested Docker daemon and inner
-    containers are not OOM-killed under small task budgets. Compose Pods always get a
-    Pod-level limit at least equal to the request, including under
-    `--cpus request --memory request`. See the
-    [configuration reference](configuration.md#the-task-wide-resource-model).
+  - On **Compose (multi-container) Pods** (Shapes A, B and C), the task budget sits on `main`
+    (container-level in Shapes A and B, inner Compose `deploy.resources` in Shape C), and
+    `build_pod_level_resources()` sets `pod.spec.resources` as the Docker host's size: the
+    request covers the budget and every container request, and the limit is the sum of every
+    container's ceiling (its limit, else its request), never below the request, including under
+    `--cpus request --memory request`. In DinD Pods, `dind-engine` counts as a daemon baseline
+    plus the DinD services' ceilings, and nested containers are charged to the Pod, so
+    `memory_mb` bounds the whole environment, including containers started through
+    `/var/run/docker.sock` (Harbor's local Docker environment limits only `main`; Daytona and
+    Modal size the whole DinD sandbox). A task whose Docker workload outgrows `memory_mb` has
+    processes OOM-killed, or stalls at its ceiling, inside its own Pod; re-size it with
+    `memory_mb` or `--override-memory-mb`. See the
+    [configuration reference](configuration.md#the-task-wide-resource-model) and
+    [Docker-in-Docker](docker-in-docker.md#resource-model-and-volume-topology).
 
 Comparing the two capped GKE options against local Docker:
 
@@ -368,6 +373,7 @@ spec:
     nodeSystemConfig:
       kubeletConfig:
         cpuManagerPolicy: static
+        singleProcessOOMKill: true
   - machineFamily: n2
     minCores: 16
     storage:
@@ -376,6 +382,7 @@ spec:
     nodeSystemConfig:
       kubeletConfig:
         cpuManagerPolicy: static
+        singleProcessOOMKill: true
   whenUnsatisfiable: DoNotScaleUp
 ```
 
@@ -383,13 +390,22 @@ Select it for an entire job with `--ek compute_class=harbor-static-cpu`, or for 
 tasks with `--ek task_compute_classes=<task>=harbor-static-cpu`. Direct Pods running with the
 default capped resources (`Guaranteed` QoS) and whole-CPU requests receive exclusive cores on
 the auto-provisioned nodes.
+`singleProcessOOMKill: true` is recommended for every ComputeClass that runs DinD tasks: it
+makes the kernel OOM-kill single processes, as on a Docker host, instead of whole containers;
+for a DinD task the whole container is the Docker daemon and everything it runs. See
+[Per-process OOM kills for Docker-in-Docker](cluster-setup.md#5-per-process-oom-kills-for-docker-in-docker-singleprocessoomkill).
 
 ### Static-CPU node pool (GKE Standard)
+
+The node-pool system config spells the per-process OOM kill key `singleProcessOomKill`
+(gcloud rejects `singleProcessOOMKill` there); it is recommended for every pool that runs
+DinD tasks.
 
 ```bash
 cat > static-cpu-system-config.yaml <<'EOF'
 kubeletConfig:
   cpuManagerPolicy: static
+  singleProcessOomKill: true
 EOF
 
 gcloud container node-pools create static-cpu-pool \
@@ -402,8 +418,8 @@ gcloud container node-pools create static-cpu-pool \
 ```
 
 Use it with `--ek node_pool=static-cpu-pool`, or for specific tasks with
-`--ek task_node_pools=<task>=static-cpu-pool`. Changing `cpuManagerPolicy` on an existing
-pool recreates its nodes. See
+`--ek task_node_pools=<task>=static-cpu-pool`. Changing `cpuManagerPolicy` or
+`singleProcessOomKill` on an existing pool recreates its nodes. See
 [Customizing node system configuration](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/node-system-config).
 
 ### Sizing node boot disks for GCFS Image Streaming and hardlink-heavy images

@@ -74,6 +74,7 @@ async def apply_network_policy(
     policy_key: str | None = None,
     dns_egress_extra_cidrs: Sequence[str] | None = None,
     allow_pod_ingress: bool = False,
+    kube_dns_cluster_ip: str | None = None,
 ) -> None:
     """Apply network policy using native Kubernetes NetworkPolicy and GKE FQDNNetworkPolicy.
 
@@ -207,34 +208,41 @@ async def apply_network_policy(
             k8s_client.V1NetworkPolicyPort(protocol="UDP", port=53),
             k8s_client.V1NetworkPolicyPort(protocol="TCP", port=53),
         ]
-        default_dns_cidrs: tuple[str, ...] = (
-            "10.0.0.0/8",  # RFC 1918 Class A private VPC / cluster network
-            "172.16.0.0/12",  # RFC 1918 Class B private VPC / Docker bridge networks
-            "192.168.0.0/16",  # RFC 1918 Class C private VPC / cluster network
-            "169.254.0.0/16",  # Link-local: GKE NodeLocal DNSCache (169.254.20.10) & Cloud DNS / metadata DNS (169.254.169.254)
-            "100.64.0.0/10",  # RFC 6598 Shared / Carrier-Grade NAT (CGNAT) range used in GKE non-RFC1918 Pod/Service IP allocations
-            "34.118.224.0/20",  # GKE default reserved ClusterIP Service CIDR (where kube-dns ClusterIP e.g. 34.118.224.10 lives)
-        )
-        peers: list[k8s_client.V1NetworkPolicyPeer] = [
-            k8s_client.V1NetworkPolicyPeer(
-                namespace_selector=k8s_client.V1LabelSelector(
-                    match_labels={"kubernetes.io/metadata.name": "kube-system"}
-                )
-            ),
-            *[
-                k8s_client.V1NetworkPolicyPeer(ip_block=k8s_client.V1IPBlock(cidr=cidr))
-                for cidr in default_dns_cidrs
-            ],
+        dns_cidrs: list[str] = [
+            "169.254.20.10/32",  # GKE NodeLocal DNSCache link-local IP
+            "169.254.169.254/32",  # GKE Cloud DNS / metadata DNS resolver (port 53 only)
         ]
+        if kube_dns_cluster_ip and kube_dns_cluster_ip.strip():
+            norm_dns_ip = _normalize_cidr(kube_dns_cluster_ip)
+            if norm_dns_ip not in dns_cidrs:
+                dns_cidrs.append(norm_dns_ip)
         for raw_extra in dns_egress_extra_cidrs or ():
             if not raw_extra or not raw_extra.strip():
                 continue
             norm_cidr = _normalize_cidr(raw_extra)
-            peers.append(
-                k8s_client.V1NetworkPolicyPeer(
-                    ip_block=k8s_client.V1IPBlock(cidr=norm_cidr)
-                )
-            )
+            if norm_cidr not in dns_cidrs:
+                dns_cidrs.append(norm_cidr)
+
+        peers: list[k8s_client.V1NetworkPolicyPeer] = [
+            k8s_client.V1NetworkPolicyPeer(
+                namespace_selector=k8s_client.V1LabelSelector(
+                    match_labels={"kubernetes.io/metadata.name": "kube-system"}
+                ),
+                pod_selector=k8s_client.V1LabelSelector(
+                    match_expressions=[
+                        k8s_client.V1LabelSelectorRequirement(
+                            key="k8s-app",
+                            operator="In",
+                            values=["kube-dns", "node-local-dns"],
+                        )
+                    ]
+                ),
+            ),
+            *[
+                k8s_client.V1NetworkPolicyPeer(ip_block=k8s_client.V1IPBlock(cidr=cidr))
+                for cidr in dns_cidrs
+            ],
+        ]
         return k8s_client.V1NetworkPolicyEgressRule(to=peers, ports=ports)
 
     match network_policy.network_mode:

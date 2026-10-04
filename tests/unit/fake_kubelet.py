@@ -117,6 +117,21 @@ class FakeKubelet:
     def _serve(
         self, conn: FakeConnection, sock: socket.socket, drop_after: int | None
     ) -> None:
+        override = self.status_override(conn.command)
+        if override is not None:
+            try:
+                sock.sendall(channel_frame(3, override))
+                sock.sendall(server_frame(OP_CLOSE, struct.pack("!H", 1000)))
+            except OSError:
+                pass
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                conn.done.set()
+            return
+
         proc = subprocess.Popen(
             conn.command,
             stdin=subprocess.PIPE if conn.stdin else subprocess.DEVNULL,
@@ -184,9 +199,7 @@ class FakeKubelet:
                 # Client went away first; the real kubelet stops the stream too.
                 return
             conn.return_code = proc.wait()
-            status = self.status_override(conn.command)
-            if status is None:
-                status = status_payload(conn.return_code)
+            status = status_payload(conn.return_code)
             try:
                 sock.sendall(channel_frame(3, status))
                 sock.sendall(server_frame(OP_CLOSE, struct.pack("!H", 1000)))

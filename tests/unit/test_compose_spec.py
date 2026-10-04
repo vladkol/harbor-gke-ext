@@ -7,11 +7,13 @@ from pathlib import Path
 import pytest
 
 from harbor_gke_ext.compose_spec import (
+    build_default_compose_env,
     discover_compose_build_services,
     ensure_compose_binary,
     normalize_compose_project,
     parse_duration_seconds,
 )
+from harbor_gke_ext.placement import UnsupportedComposeFeatureError
 
 
 @pytest.mark.unit
@@ -84,6 +86,55 @@ services:
     assert bind_vols[0]["read_only"] is True
     assert len(anon_vols) == 1
     assert anon_vols[0]["target"] == "/workspace/solution"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("reference", "task_env", "expected"),
+    [
+        pytest.param("${HOST_ONLY}", {}, "from-host", id="braced"),
+        pytest.param("$HOST_ONLY", {}, "from-host", id="bare"),
+        pytest.param("${HOST_ONLY:-dflt}", {}, "from-host", id="default-modifier"),
+        pytest.param("${HOST_ONLY-dflt}", {}, "from-host", id="unset-modifier"),
+        pytest.param("${HOST_ONLY:?missing}", {}, "from-host", id="required-modifier"),
+        pytest.param("${UNSET_OUTER:-${HOST_ONLY}}", {}, "from-host", id="nested-default"),
+        pytest.param("${HOST_ONLY}", {"HOST_ONLY": "from-task"}, "from-task", id="task-env-wins"),
+        pytest.param("${CPUS}", {"CPUS": "2"}, "2", id="infra-env-wins"),
+    ],
+)
+def test_normalize_compose_project_interpolates_referenced_host_variables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference: str,
+    task_env: dict[str, str],
+    expected: str,
+) -> None:
+    """Host variables a compose file references interpolate as on Docker and Modal.
+
+    Harbor's Docker provider runs Compose with the whole host environment and
+    Modal passes the host variables the compose files reference; both resolve
+    ``${VAR}`` from the host when the task and infra env do not set it.
+    """
+    monkeypatch.setenv("HOST_ONLY", "from-host")
+    monkeypatch.setenv("CPUS", "99")
+    monkeypatch.delenv("UNSET_OUTER", raising=False)
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text(
+        "services:\n"
+        "  main:\n"
+        "    image: alpine:3\n"
+        "    environment:\n"
+        f"      RESOLVED: \"{reference}\"\n",
+        encoding="utf-8",
+    )
+
+    project = normalize_compose_project(
+        [compose_file],
+        env_vars={"MAIN_IMAGE_NAME": "alpine:3", **task_env},
+        context_dir=tmp_path,
+    )
+
+    assert project["services"]["main"]["environment"]["RESOLVED"] == expected
 
 
 @pytest.mark.unit
@@ -261,3 +312,83 @@ services:
     main = project["services"]["main"]
     assert main["entrypoint"] == ["/entrypoint.sh"]
     assert main["command"] == ["--serve"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "compose_yaml",
+    [
+        "include:\n  - ../outside/extra.yaml\nservices:\n  main:\n    image: alpine:3\n",
+        "services:\n  main:\n    extends:\n      file: ../outside/base.yaml\n      service: base\n",
+        "services:\n  main:\n    image: alpine:3\n    env_file:\n      - ../outside/secret.env\n",
+        "services:\n  main:\n    image: alpine:3\n    env_file:\n      - path: ../outside/secret.env\n",
+        "services:\n  main:\n    image: alpine:3\nsecrets:\n  db_pass:\n    file: ../outside/secret.env\n",
+        "services:\n  main:\n    image: alpine:3\nconfigs:\n  app_cfg:\n    file: ../outside/secret.env\n",
+    ],
+)
+def test_normalize_compose_project_rejects_out_of_tree_file_directives(
+    tmp_path: Path, compose_yaml: str
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.env").write_text("LEAK=1\n", encoding="utf-8")
+    (outside / "extra.yaml").write_text("services: {}\n", encoding="utf-8")
+    (outside / "base.yaml").write_text(
+        "services:\n  base:\n    image: alpine:3\n", encoding="utf-8"
+    )
+    task_dir = tmp_path / "task"
+    env_dir = task_dir / "environment"
+    env_dir.mkdir(parents=True)
+    compose_file = env_dir / "docker-compose.yaml"
+    compose_file.write_text(compose_yaml, encoding="utf-8")
+
+    with pytest.raises(UnsupportedComposeFeatureError):
+        normalize_compose_project(
+            [compose_file],
+            env_vars={"MAIN_IMAGE_NAME": "alpine:3"},
+            context_dir=env_dir,
+            task_dir=task_dir,
+        )
+
+
+@pytest.mark.unit
+def test_normalize_compose_project_rejects_symlink_escaping_task_dir(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret_file = outside / "secret.env"
+    secret_file.write_text("LEAK=1\n", encoding="utf-8")
+
+    task_dir = tmp_path / "task"
+    env_dir = task_dir / "environment"
+    env_dir.mkdir(parents=True)
+    (env_dir / "linked.env").symlink_to(secret_file)
+
+    compose_file = env_dir / "docker-compose.yaml"
+    compose_file.write_text(
+        "services:\n  main:\n    image: alpine:3\n    env_file:\n      - ./linked.env\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UnsupportedComposeFeatureError):
+        normalize_compose_project(
+            [compose_file],
+            env_vars={"MAIN_IMAGE_NAME": "alpine:3"},
+            context_dir=env_dir,
+            task_dir=task_dir,
+        )
+
+
+@pytest.mark.unit
+def test_build_default_compose_env_does_not_leak_unrelated_host_os_environ(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UNRELATED_HOST_SECRET_TOKEN", "top-secret-123")
+    env = build_default_compose_env(
+        context_dir=tmp_path,
+        main_image_name="alpine:3",
+    )
+    assert "UNRELATED_HOST_SECRET_TOKEN" not in env
+    assert "PATH" in env
+

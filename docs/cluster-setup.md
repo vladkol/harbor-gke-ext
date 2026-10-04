@@ -138,7 +138,15 @@ gcloud container clusters create "${CLUSTER_NAME}" \
   --cluster-dns-scope="cluster" \
   --addons="NodeLocalDNS"
 
-# 3. Create the primary scale-to-zero worker pool (16 vCPU, 500 GB disk -> 339.2 GiB allocatable)
+# 3. Create the primary scale-to-zero worker pool (16 vCPU, 500 GB disk -> 339.2 GiB allocatable).
+#    Recommended for every pool that runs Docker-in-Docker tasks: singleProcessOomKill
+#    makes OOM kills per process, as on a Docker host (see "Per-process OOM kills for
+#    Docker-in-Docker" below). The node-pool system config spells the key
+#    singleProcessOomKill; gcloud rejects other spellings.
+cat > harbor-kubelet-config.yaml <<'EOF'
+kubeletConfig:
+  singleProcessOomKill: true
+EOF
 gcloud container node-pools create harbor-workers \
   --cluster="${CLUSTER_NAME}" \
   --region="${REGION}" \
@@ -147,6 +155,7 @@ gcloud container node-pools create harbor-workers \
   --disk-size=500 \
   --disk-type="pd-balanced" \
   --service-account="${NODE_SA}" \
+  --system-config-from-file=harbor-kubelet-config.yaml \
   --enable-image-streaming \
   --num-nodes=0 \
   --enable-autoscaling --total-min-nodes=0 --total-max-nodes=16
@@ -496,8 +505,8 @@ Different benchmark suites stress completely different cluster dimensions. A clu
 
 | Dataset archetype | Examples | Primary bottleneck | Recommended GKE setup & `--ek` flags |
 | :--- | :--- | :--- | :--- |
-| **High-concurrency coding & CLI** | `terminal-bench`, `SWE-bench`, `aider-polyglot` | Pod scheduling rate, image pull latency, compile/test CPU sensitivity (`pytest`, `tsc`, `cargo`, `go test`). | Enable **GKE Image Streaming** (`--enable-image-streaming` on Standard; on by default on Autopilot) and pre-warm built images with `--plugin harbor_gke_ext:CloudBuildPlugin`. By default (`--cpus auto --memory auto`), `GKEEnvironment` resolves `auto` to `guarantee` (`requests = limits = declared budget`, matching Docker's capped default); place trials on static-CPU nodes (`cpuManagerPolicy: static`) for scored runs (see [CPU isolation for scored runs](#4-cpu-isolation-for-scored-runs)). Pass `--cpus request --memory request` during development to remove limits from direct Pods. Compose Pods keep a Pod-level limit equal to the request, or higher when declared container limits or the DinD memory floor raise it. |
-| **Multi-container & Docker-in-Docker (Shapes B & C)** | `orca-bench`, `long-horizon-terminal-bench`, `swelancer` | Inner `dockerd` layer unpack (`overlay2`) disk space, hardlink expansion under GCFS, and daemon/page-cache memory overhead. | Use `1,500 GB+` node boot disks. `--ek scratch_volume_size=100Gi` backs `/var/lib/docker` and Compose named volumes with per-Pod generic ephemeral PVCs, which moves those writes off the boot disk, but `dind-engine` still requests its full `ephemeral-storage` estimate from the node (see [Ephemeral storage schedulability](#3-ephemeral-storage-schedulability-and-generic-ephemeral-volumes)). Shape B/C Pods automatically enforce an `8192 MiB` Pod memory-limit floor (`DIND_POD_MEMORY_LIMIT_FLOOR_MB`). |
+| **High-concurrency coding & CLI** | `terminal-bench`, `SWE-bench`, `aider-polyglot` | Pod scheduling rate, image pull latency, compile/test CPU sensitivity (`pytest`, `tsc`, `cargo`, `go test`). | Enable **GKE Image Streaming** (`--enable-image-streaming` on Standard; on by default on Autopilot) and pre-warm built images with `--plugin harbor_gke_ext:CloudBuildPlugin`. By default (`--cpus auto --memory auto`), `GKEEnvironment` resolves `auto` to `guarantee` (`requests = limits = declared budget`, matching Docker's capped default); place trials on static-CPU nodes (`cpuManagerPolicy: static`) for scored runs (see [CPU isolation for scored runs](#4-cpu-isolation-for-scored-runs)). Pass `--cpus request --memory request` during development to remove limits from direct Pods. Shape A Compose Pods keep a Pod-level limit equal to the request, or higher when declared container limits raise it. |
+| **Multi-container & Docker-in-Docker (Shapes B & C)** | `orca-bench`, `long-horizon-terminal-bench`, `swelancer` | Inner `dockerd` layer unpack (`overlay2`) disk space, hardlink expansion under GCFS, and daemon/page-cache memory overhead. | Use `1,500 GB+` node boot disks. `--ek scratch_volume_size=100Gi` backs `/var/lib/docker` and Compose named volumes with per-Pod generic ephemeral PVCs, which moves those writes off the boot disk, but `dind-engine` still requests its full `ephemeral-storage` estimate from the node (see [Ephemeral storage schedulability](#3-ephemeral-storage-schedulability-and-generic-ephemeral-volumes)). The Pod's memory ceiling is the task's `memory_mb` plus what the DinD services declare; containers a task starts through the Docker socket must fit in `memory_mb`. Set `singleProcessOOMKill: true` on these nodes so an OOM kill takes one process, not the whole Docker host (see [Per-process OOM kills for Docker-in-Docker](#5-per-process-oom-kills-for-docker-in-docker-singleprocessoomkill)). The teardown usage report logs a WARNING for each kind of OOM kill. |
 | **EDA, scientific & AVX2-compiled binaries** | `apex-openroad-ibex-signoff`, `bespokelabs/terminal-bench-science` | `x86_64` ISA (`amd64`), AVX2/FMA instruction support (avoiding `SIGILL`), and 50–150 GiB unpacked toolchains. | Use `n2-standard-16` or `c3-standard-16` node pools (guaranteed modern Intel x86_64 with AVX2/AVX-512) rather than `e2` (which mixes host CPU generations) or `arm64` (`c4a`/`t2a`). Route tasks with `--ek task_machine_types`, `--ek task_node_pools`, or `--ek task_compute_classes`, and use `1,500 GB+` boot disks. |
 | **GPU & ML benchmarks** | `mlgym-bench`, `replicationbench` | Accelerator availability, CUDA driver discovery (`libcuda.so.1`), large model weights. | Pre-create a scale-to-zero autoscaling pool for the accelerator type that your tasks request (for example `g2-standard-8` with `nvidia-l4`, or `a3-highgpu-1g` with `nvidia-h100-80gb`) with `--disk-size=500` (`300–500 GB`) and `--enable-image-streaming`. Pass `--ek gpu_override=<accelerator>` (for example `nvidia-l4`) to run tasks that declare a different GPU type on that pool, and `--ek default_gpu_type=<accelerator> --ek default_gpu_count=1` when Compose tasks request `count: all` without `task.toml` GPU counts. |
 
@@ -537,10 +546,42 @@ Nodes that run the kubelet with the **static CPU manager policy** (`cpuManagerPo
 Two ways to provision static-CPU nodes on GKE Standard:
 
 - **ComputeClass with node auto-provisioning** (`nodeSystemConfig.kubeletConfig.cpuManagerPolicy: static` in a priority rule, GKE 1.32.1-gke.1729000 or later). Select it with `--ek compute_class=<name>`, or per task with `--ek task_compute_classes`. See the [ComputeClass recipe](task-sizing-and-placement.md#static-cpu-nodes-with-node-auto-provisioning-computeclass).
-- **A dedicated node pool** created with `--system-config-from-file` containing `kubeletConfig: {cpuManagerPolicy: static}`. Select it with `--ek node_pool=<name>`, or per task with `--ek task_node_pools`. See the [node pool recipe](task-sizing-and-placement.md#static-cpu-node-pool-gke-standard).
+- **A dedicated node pool** created with `--system-config-from-file` containing `kubeletConfig: {cpuManagerPolicy: static}` (plus the recommended `singleProcessOomKill: true` when it runs DinD tasks; see section 5). Select it with `--ek node_pool=<name>`, or per task with `--ek task_node_pools`. See the [node pool recipe](task-sizing-and-placement.md#static-cpu-node-pool-gke-standard).
 
 > [!NOTE]
 > The cluster-wide NAP defaults file cannot set the CPU manager policy, so nodes auto-provisioned without a ComputeClass use the default (`none`) policy. The kubelet ignores Pod-level `spec.resources` for CPU pinning unless the `PodLevelResourceManagers` feature gate is enabled, so `harbor-gke-ext` puts a Guaranteed direct Pod's budget on the `main` container. Compose Pods keep Pod-level budgets and do not get exclusive cores.
+
+### 5. Per-process OOM kills for Docker-in-Docker (`singleProcessOOMKill`)
+
+On cgroup v2 nodes the kubelet sets `memory.oom.group=1` on every container cgroup (`singleProcessOOMKill: false` is the GKE default there). When the kernel OOM-kills one process in such a container, it kills every process in it. For a DinD Pod that container is `dind-engine`, which holds the Docker daemon and every container the task runs, so one OOM kill takes down the whole Docker host. A Docker host kills single processes, and keeps the daemon alive.
+
+Measured on GKE 1.35.6 (`orca-bench`, `memory_mb = 1024`, Pod ceiling `1088Mi`): the Pod reached its ceiling, the kernel picked `java`, and then killed `dockerd`, the `dind-engine` shell, `grafana` and `python` with it. The other two DinD Pods on the node were unaffected.
+
+`dind-engine` cannot clear the flag itself. containerd keeps `memory.oom.group: "1"` in the container's spec, and runc writes it back on every `UpdateContainerResources` call; the static CPU manager issues one seconds after a container starts.
+
+> [!IMPORTANT]
+> Per-process OOM kills are the recommended setting for every node pool and ComputeClass that runs DinD tasks. Requires GKE 1.32.4-gke.1132000, 1.33.0-gke.1748000 or later, and for node pools a gcloud release from 2025-08-08 or later.
+
+The key is spelled differently in the two APIs:
+
+| Where | Key |
+| :--- | :--- |
+| Node pool `--system-config-from-file` | `singleProcessOomKill` |
+| ComputeClass `nodeSystemConfig.kubeletConfig` | `singleProcessOOMKill` |
+
+gcloud rejects `singleProcessOOMKill` in a node-pool system config file as an unknown field.
+
+```yaml
+# harbor-kubelet-config.yaml, for --system-config-from-file
+kubeletConfig:
+  singleProcessOomKill: true
+```
+
+- **Node pools**: pass `--system-config-from-file=harbor-kubelet-config.yaml` to `gcloud container node-pools create`, or apply it to an existing pool with `gcloud container node-pools update`. Updating re-creates the pool's nodes. When updating, include the pool's existing `kubeletConfig` fields in the file (for example `cpuManagerPolicy: static`, `insecureKubeletReadonlyPortEnabled`, `maxParallelImagePulls`; see `gcloud container node-pools describe ... --format="yaml(config.kubeletConfig)"`): GKE does not document whether omitted fields are kept.
+- **ComputeClasses**: add `singleProcessOOMKill: true` under `nodeSystemConfig.kubeletConfig` in each priority rule, or once in `priorityDefaults.nodeSystemConfig`. See the [ComputeClass recipe](task-sizing-and-placement.md#static-cpu-nodes-with-node-auto-provisioning-computeclass).
+- **Autopilot**: not validated.
+
+The setting applies to every container on those nodes, which matches cgroup v1 nodes, where it is the default. The DinD teardown usage report shows the mode in effect (`OOM kill mode: per process` or `whole container`), and logs a WARNING naming this setting whenever a group kill happened. See [Docker-in-Docker](docker-in-docker.md#resource-model-and-volume-topology).
 
 ### Roadmap: Generating NodePool specs and ComputeClasses for datasets
 

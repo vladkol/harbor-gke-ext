@@ -35,6 +35,7 @@ from typing import Any
 
 DOCKER_HUB_REGISTRY = "docker.io"
 _ARTIFACT_REGISTRY_SUFFIX = "-docker.pkg.dev"
+_GAR_HOST_RE = re.compile(r"^[a-z0-9-]+-docker\.pkg\.dev$")
 _GCR_HOSTS = frozenset({"gcr.io", "us.gcr.io", "eu.gcr.io", "asia.gcr.io"})
 _DOCKER_HUB_HOSTS = frozenset(
     {
@@ -43,7 +44,37 @@ _DOCKER_HUB_HOSTS = frozenset(
         "registry-1.docker.io",
     }
 )
+_REGISTRY_HOST_RE = re.compile(
+    r"^(?:localhost|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)(?::[0-9]{1,5})?$"
+)
+_REPOSITORY_RE = re.compile(
+    r"^[a-zA-Z0-9]+(?:(?:\.|_+|[-]+)[a-zA-Z0-9]+)*(?:/[a-zA-Z0-9]+(?:(?:\.|_+|[-]+)[a-zA-Z0-9]+)*)*$"
+)
+_TAG_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+_FORBIDDEN_CHARS_RE = re.compile(r"[\s?#\\]")
+
+
+def _validate_registry_host(registry: str) -> None:
+    candidate = registry.strip().lower()
+    if not candidate or not _REGISTRY_HOST_RE.fullmatch(candidate):
+        raise ValueError(f"Invalid registry host: {registry!r}")
+    _, sep, port_str = candidate.partition(":")
+    if sep:
+        port = int(port_str)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Invalid registry port in {registry!r}: {port}")
+
+
+def is_google_registry_host(host: str) -> bool:
+    """Return True iff ``host`` is an official Google Container/Artifact Registry domain."""
+    candidate = host.strip().lower()
+    try:
+        _validate_registry_host(candidate)
+    except ValueError:
+        return False
+    hostname, _, _ = candidate.partition(":")
+    return hostname in _GCR_HOSTS or bool(_GAR_HOST_RE.fullmatch(hostname))
 
 
 class ImageOrigin(StrEnum):
@@ -79,6 +110,13 @@ class ImageRef:
             raise ValueError(
                 f"ImageRef requires at least one of tag or digest, got {self!r}"
             )
+        _validate_registry_host(self.registry)
+        if not _REPOSITORY_RE.fullmatch(self.repository):
+            raise ValueError(
+                f"Invalid OCI repository path {self.repository!r} in {self!r}"
+            )
+        if self.tag is not None and not _TAG_RE.fullmatch(self.tag):
+            raise ValueError(f"Invalid OCI image tag {self.tag!r} in {self!r}")
         if self.digest and not _DIGEST_RE.match(self.digest):
             raise ValueError(
                 f"Invalid image digest {self.digest!r}; expected 'sha256:<64 hex chars>'"
@@ -106,8 +144,7 @@ class ImageRef:
         Harbor mirrors *into* Artifact Registry, so an image that is already
         Google-hosted has nothing to gain from being mirrored.
         """
-        reg = self.registry.lower()
-        return reg.endswith(_ARTIFACT_REGISTRY_SUFFIX) or reg in _GCR_HOSTS
+        return is_google_registry_host(self.registry)
 
     @property
     def streaming_eligible(self) -> bool:
@@ -129,10 +166,16 @@ def parse_image_ref(reference: str) -> ImageRef:
     raw = reference.strip()
     if not raw:
         raise ValueError("Image reference cannot be empty")
+    if _FORBIDDEN_CHARS_RE.search(raw):
+        raise ValueError(
+            f"Invalid forbidden characters in image reference {reference!r}"
+        )
 
     digest: str | None = None
     if "@" in raw:
         raw, digest_part = raw.rsplit("@", 1)
+        if "@" in raw:
+            raise ValueError(f"Invalid '@' in image reference {reference!r}")
         digest = digest_part.strip()
         if not _DIGEST_RE.match(digest):
             raise ValueError(

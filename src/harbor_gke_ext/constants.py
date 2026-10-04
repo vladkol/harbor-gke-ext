@@ -180,6 +180,9 @@ _GKE_EXEC_STREAM_PING_INTERVAL_SEC = 10.0
 # killing a timed-out supervised command.
 _GKE_DECOUPLED_LAUNCH_TIMEOUT_SEC = 120.0
 _GKE_EXEC_KILL_TIMEOUT_SEC = 10.0
+# Upper bound for reading dind-engine's cgroup usage at teardown, connection
+# included. Diagnostics only: it must never hold up Pod deletion for long.
+_GKE_DIND_USAGE_REPORT_TIMEOUT_SEC = 10.0
 _GKE_TCP_KEEPALIVE_IDLE_SEC = 10
 _GKE_TCP_KEEPALIVE_INTERVAL_SEC = 5
 _GKE_TCP_KEEPALIVE_COUNT = 3
