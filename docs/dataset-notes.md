@@ -286,11 +286,19 @@ See [Accelerators: Pre-creating an L4 GPU node pool and substituting it for A100
 
 ---
 
-## `orca-bench/orca-bench-verified`
+## `orca-bench/orca-bench` and `orca-bench/orca-bench-verified`
 
-### DinD Shape C execution
+### DinD Shape C execution and memory sizing
 
-Every task in `orca-bench/orca-bench-verified` runs `main` with `privileged: true` and a `/var/run/docker.sock` bind mount, so the environment classifies the entire dataset into **Shape C (Main-in-DinD)**. See [Docker in Docker](docker-in-docker.md).
+Every task in `orca-bench` runs `main` with `privileged: true` and a `/var/run/docker.sock` bind mount, so the environment classifies the entire dataset into **Shape C (Main-in-DinD)**. See [Docker in Docker](docker-in-docker.md).
+
+Upstream `orca-bench` tasks declare `memory_mb = 1024` (1 GiB) in `task.toml` and interpolate `MEMORY=${MEMORY}` (`1024M`) into `services.main.deploy.resources.limits.memory`. However, at startup `main` launches a 23-container OpenTelemetry Demo stack (`opensearch`, `kafka`, `jaeger`, `prometheus`, `postgresql`, `grafana`, etc.) inside `dind-engine` whose working set is ~4–5 GiB. Under the default 1 GiB ceiling (`1088 MiB` Pod memory limit), `opensearch` and `dind-engine` are OOM-killed during `compose-up-gate`. Always pass `--override-memory-mb 8192` so `MEMORY=8192M` and the Pod memory limit is sized to `8256 MiB`:
+
+```bash
+--override-memory-mb 8192
+```
+
+In addition, the `orca-bench` verifier (`tests/check_prediction.py`) uses an `AsyncOpenAI` for LLM judge to grade `/app/report.md` against task rubrics, so pass `--ve OPENAI_API_KEY=...` (and optionally `--ve OPENAI_BASE_URL=...`).
 
 ### Sizing storage and timeouts for task `701e915cf705cdf6` (301 GiB hardlink tree)
 
@@ -299,9 +307,9 @@ Task `701e915cf705cdf6` packages 1,623 Prometheus TSDB snapshots and OpenSearch 
 - **When `dind-cache-main` pulls via `docker pull` (requires registry egress and, for private Artifact Registry images, `--ek allow_metadata_server=true`; see [Image delivery under restricted network modes](cluster-setup.md#image-delivery-under-restricted-network-modes))**: `dockerd` unpacks the compressed OCI layers directly into `/var/lib/docker/overlay2`, preserving hardlinks and keeping the disk footprint at ~`55 GiB`.
 - **When `dind-cache-main` falls back to `tar -cf - / | docker import` (for example, if registry or metadata access is blocked)**: GKE Image Streaming (`gcfs`) reports `st_nlink = 1` for every file, preventing `tar` from deduplicating hardlinks and writing all **301 GiB** into `/var/lib/docker`. At ~`60 MiB/s` sustained disk write throughput, writing 301 GiB takes ~85 minutes.
 
-When running `orca-bench/orca-bench-verified` (and specifically `701e915cf705cdf6`), configure the following environment kwargs so the Pod does not get evicted for ephemeral-storage pressure or time out during DinD initialization:
+When running `orca-bench` / `orca-bench-verified` (and specifically `701e915cf705cdf6`), configure the following environment kwargs so the Pod does not get evicted for ephemeral-storage pressure or time out during DinD initialization:
 
-- `--ek task_dind_storage_mb=701e915cf705cdf6=65536` when `dind-cache-main` uses `docker pull` on a node pool with enough boot-disk or Local SSD capacity for the ~`55 GiB` footprint.
+- `--ek task_dind_storage_mb=701e915cf705cdf6=65536` when `dind-cache-main` uses `docker pull` on a node pool with enough boot-disk or Local SSD capacity for the ~`55 GiB` footprint (and `--ek max_storage_request_mb=40960` if your default NAP node pools use 100 GB boot disks with ~`43.8 GiB` allocatable ephemeral-storage).
 - For the 301 GiB fallback path, either:
   - Set `--ek task_dind_storage_mb=701e915cf705cdf6=308224` (301 GiB) and run on nodes whose allocatable ephemeral storage can hold it.
   - Add `--ek scratch_volume_size=350Gi` to back `/var/lib/docker` with a per-Pod Persistent Disk. This moves the data off the node boot disk, but the `dind-engine` container still reserves node ephemeral storage equal to the estimate or the `task_dind_storage_mb` value. The setting applies to every Compose trial in the job, and it also backs Compose named volumes.
